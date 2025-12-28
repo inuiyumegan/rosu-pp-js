@@ -23,6 +23,9 @@ pub struct JsStrains {
     /// Strain peaks of the aim skill without sliders in osu!.
     #[wasm_bindgen(js_name = "aimNoSliders", readonly)]
     pub aim_no_sliders: Option<Vec<f64>>,
+    /// Relax in the aim skill in osu!.
+    #[wasm_bindgen(readonly)]
+    pub relax: Option<Vec<f64>>,
     /// Strain peaks of the speed skill in osu!.
     #[wasm_bindgen(readonly)]
     pub speed: Option<Vec<f64>>,
@@ -58,6 +61,7 @@ impl From<Strains> for JsStrains {
             Strains::Osu(OsuStrains {
                 aim,
                 aim_no_sliders,
+                relax,
                 speed,
                 flashlight,
             }) => Self {
@@ -65,6 +69,7 @@ impl From<Strains> for JsStrains {
                 section_len: OsuStrains::SECTION_LEN,
                 aim: Some(aim),
                 aim_no_sliders: Some(aim_no_sliders),
+                relax: Some(relax),
                 speed: Some(speed),
                 flashlight: Some(flashlight),
                 ..Self::default()
