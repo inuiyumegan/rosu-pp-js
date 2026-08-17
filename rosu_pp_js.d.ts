@@ -953,3 +953,137 @@ export class Strains {
    */
   readonly strains: Float64Array | undefined;
 }
+/**
+ * The result of a sunny mania difficulty calculation.
+ */
+export class SunnyManiaDifficultyAttributes {
+  private constructor();
+  /**
+  ** Return copy of self without private attributes.
+  */
+  toJSON(): Object;
+  /**
+  * Return stringified version of self.
+  */
+  toString(): string;
+  free(): void;
+  /**
+   * The final star rating.
+   */
+  readonly stars: number;
+  /**
+   * The variety measure of the map.
+   */
+  readonly variety: number;
+  /**
+   * The accuracy scalar `0.5 * spikiness + 0.5 * switches`.
+   */
+  readonly accScalar: number;
+  /**
+   * How much the difficulty spikes within the map.
+   */
+  readonly spikiness: number;
+  /**
+   * How much the playstyle switches between jack and stream-like patterns.
+   */
+  readonly switches: number;
+  /**
+   * The GREAT hit window used for the calculation (incl. mods).
+   */
+  readonly greatHitWindow: number;
+  /**
+   * The max combo of the map.
+   */
+  readonly maxCombo: number;
+  /**
+   * The amount of hit objects taken into account.
+   */
+  readonly nObjects: number;
+}
+/**
+ * The result of a sunny mania performance calculation.
+ */
+export class SunnyManiaPerformanceAttributes {
+  private constructor();
+  /**
+  ** Return copy of self without private attributes.
+  */
+  toJSON(): Object;
+  /**
+  * Return stringified version of self.
+  */
+  toString(): string;
+  free(): void;
+  /**
+   * The total performance points.
+   */
+  readonly pp: number;
+  /**
+   * The difficulty portion of the PP.
+   */
+  readonly ppDifficulty: number;
+  /**
+   * The variety multiplier applied to the difficulty portion.
+   */
+  readonly varietyMultiplier: number;
+  /**
+   * The accuracy multiplier applied to the difficulty portion.
+   */
+  readonly accMultiplier: number;
+  /**
+   * The length multiplier applied to the difficulty portion.
+   */
+  readonly lengthMultiplier: number;
+}
+/**
+ * Builder for a sunny mania difficulty calculation.
+ *
+ * The sunny algorithm is the Star-Rating-Rebirth SR calculation by
+ * [Crz]sunnyxxy as integrated on the `author-port` branch of
+ * `vernonlim/osu`. In contrast to the regular mania difficulty, the EZ and HR
+ * mods affect the star rating through the GREAT hit window (EZ widens the
+ * window by 1.4, HR shrinks it by 1.4).
+ */
+export class SunnyManiaDifficulty {
+  free(): void;
+  /**
+   * Create a new sunny mania difficulty calculator.
+   */
+  constructor(args?: DifficultyArgs | null);
+  /**
+   * Perform the sunny mania difficulty calculation.
+   */
+  calculate(map: Beatmap): SunnyManiaDifficultyAttributes;
+  set mods(value: Object | null | undefined);
+  set lazer(value: boolean | null | undefined);
+  set clockRate(value: number | null | undefined);
+  set passedObjects(value: number | null | undefined);
+}
+/**
+ * Builder for a sunny mania performance calculation.
+ */
+export class SunnyManiaPerformance {
+  free(): void;
+  /**
+   * Create a new sunny mania performance calculator.
+   */
+  constructor(args?: PerformanceArgs | null);
+  /**
+   * Perform the sunny mania performance calculation.
+   *
+   * The argument must either be the attributes of a previous sunny mania
+   * difficulty calculation or a beatmap.
+   */
+  calculate(value: SunnyManiaDifficultyAttributes | Beatmap): SunnyManiaPerformanceAttributes;
+  set mods(value: Object | null | undefined);
+  set lazer(value: boolean | null | undefined);
+  set clockRate(value: number | null | undefined);
+  set passedObjects(value: number | null | undefined);
+  set accuracy(value: number | null | undefined);
+  set nGeki(value: number | null | undefined);
+  set nKatu(value: number | null | undefined);
+  set n300(value: number | null | undefined);
+  set n100(value: number | null | undefined);
+  set n50(value: number | null | undefined);
+  set misses(value: number | null | undefined);
+}

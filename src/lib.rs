@@ -10,6 +10,8 @@ mod mods;
 mod performance;
 mod score_state;
 mod strains;
+mod sunny;
+mod sunny_mania;
 mod util;
 
 use self::error::{JsError, JsResult};
