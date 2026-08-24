@@ -418,7 +418,7 @@ fn tail(bound: f64, sigma: f64) -> f64 {
 /// Fractional error is below `1.2e-7` *everywhere*, including deep in the tail —
 /// unlike the more common Abramowitz & Stegun 7.1.26 form, whose error is
 /// absolute and therefore destroys the tail entirely.
-fn erfc(x: f64) -> f64 {
+pub(crate) fn erfc(x: f64) -> f64 {
     let z = x.abs();
     let t = 1.0 / (1.0 + 0.5 * z);
 

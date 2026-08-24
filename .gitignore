@@ -7,3 +7,7 @@ npm-debug.log*
 # Real score/beatmap data pulled from the live server for calibration.
 # Not redistributable, and not needed to build.
 local-fixtures/
+
+# The tools/ visualisers are Python; their venv and bytecode are not.
+**/__pycache__/
+.venv/

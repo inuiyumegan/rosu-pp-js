@@ -2454,6 +2454,528 @@ mod tests {
         summarise("NM", &nm_scalars);
     }
 
+    /// Not an assertion — the one real external check available on the surface.
+    ///
+    /// A score screenshot supplied an *Unstable Rate*, which is `10 * sigma` of the
+    /// player's hit errors. That is a direct measurement of the exact quantity the
+    /// surface otherwise has to infer from judgement counts alone, so it tests the
+    /// model against ground truth rather than against its own residuals — something
+    /// the tRPC fixtures in [`REAL_SCORES`] cannot do, since the API carries no UR.
+    ///
+    /// Note this works even though `sigma_ref` is unidentifiable
+    /// (`sigma_ref_only_sets_the_scale_of_skill`): the *implied sigma* at the fitted
+    /// skill is identified, because sigma is the only channel difficulty and skill
+    /// enter through. The gauge cancels.
+    ///
+    /// Run with `cargo test unstable_rate_check -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn unstable_rate_check() {
+        use crate::mania_accuracy::expected_counts;
+        use crate::mania_windows::ManiaJudgement;
+
+        // Yooh - Decoy [Rachel's Ruins "Buffed Ver."], played by Reflec with DT.
+        // OD7 4K non-convert, 3860 notes, no long notes. Counts read off the result
+        // screen; the 92.53% shown is ScoreV1 weighting (rainbow 300 counts as 300),
+        // which the counts reproduce as 92.54%.
+        let Some(map) = parse("local-fixtures/maps/4055699.osu") else {
+            println!("beatmap 4055699 absent; nothing to check");
+            return;
+        };
+
+        let measured_ur = 498.40;
+        let measured_sigma = measured_ur / 10.0;
+        let mean_error = 34.25;
+
+        let state = SunnyScoreState {
+            n320: 1542,
+            n300: 1595,
+            n200: 603,
+            n100: 91,
+            n50: 15,
+            misses: 14,
+        };
+        let counts = [
+            state.n320,
+            state.n300,
+            state.n200,
+            state.n100,
+            state.n50,
+            state.misses,
+        ];
+        let total = state.total_hits();
+
+        // Classic (stable) scoring: the screenshot is osu!stable ScoreV1.
+        let mods = GameMods::default();
+        let attrs = calculate(&map, &mods, 1.5, Some(false), None).unwrap();
+
+        let units = [JudgementUnit::repeated(attrs.stars, f64::from(total))];
+        let model = ErrorModel::default();
+        let fit = fit_with_quality(&counts, &units, &attrs.hit_windows, &model);
+
+        let windows = attrs.hit_windows;
+        println!(
+            "map: OD {} convert {} | {total} notes | stars {:.2} (DT 1.5x, classic)",
+            map.od, map.is_convert, attrs.stars
+        );
+        println!(
+            "windows: perfect {:.1} great {:.1} good {:.1} ok {:.1} meh {:.1} miss {:.1}",
+            windows.perfect,
+            windows.great,
+            windows.good,
+            windows.ok,
+            windows.meh,
+            windows.miss
+        );
+
+        let implied_sigma = model.sigma(attrs.stars, fit.skill);
+
+        println!(
+            "\nfitted skill {:.3} (ratio {:.3} of stars) -> implied sigma {:.2} ms",
+            fit.skill,
+            fit.skill / attrs.stars,
+            implied_sigma
+        );
+        println!(
+            "measured: UR {measured_ur:.2} -> sigma {measured_sigma:.2} ms  \
+             (mean error {mean_error:.2} ms)",
+        );
+        println!(
+            "ratio implied/measured = {:.3}",
+            implied_sigma / measured_sigma
+        );
+
+        // The mixture has two widths; the single number comparable to a measured UR is
+        // the mixture's own standard deviation, not the core width. For a zero-mean
+        // two-component mixture, variance = (1-w)*s^2 + w*(k*s)^2.
+        let weight = model.lapse_weight;
+        let ratio = model.lapse_ratio;
+        let mixture_sigma =
+            implied_sigma * ((1.0 - weight) + weight * ratio * ratio).sqrt();
+
+        println!(
+            "mixture sigma (both components) = {mixture_sigma:.2} ms  \
+             -> UR {:.1}, ratio to measured {:.3}",
+            mixture_sigma * 10.0,
+            mixture_sigma / measured_sigma
+        );
+
+        // Cross-check that does not involve the model at all: what sigma does the
+        // observed PERFECT rate alone imply, for a plain normal? P(|e| < w) = share
+        // inverts to sigma = w / z where z is the normal quantile. If this lands near
+        // the fit's sigma but far from the measured UR, then the UR and the judgement
+        // counts disagree with each other, and the model is siding with the counts.
+        let perfect_share = f64::from(state.n320) / f64::from(total - state.misses);
+        // z such that P(|Z| < z) = share, by bisection on the standard normal.
+        let mut lo = 1e-6;
+        let mut hi = 10.0;
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            // P(|Z| < mid) = 1 - erfc(mid / sqrt(2))
+            let inside = 1.0 - crate::mania_accuracy::erfc(mid / std::f64::consts::SQRT_2);
+            if inside < perfect_share {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let z = 0.5 * (lo + hi);
+        let sigma_from_320 = windows.perfect / z;
+
+        println!(
+            "\nmodel-free check: {:.1}% of hit notes inside the {:.1} ms PERFECT window\n\
+             implies sigma {:.2} ms for a plain normal (z = {z:.4})",
+            perfect_share * 100.0,
+            windows.perfect,
+            sigma_from_320
+        );
+
+        // The same inversion in the real-time frame, in case the client reports UR in
+        // real milliseconds rather than map milliseconds. Under DT the two differ by
+        // the clock rate, and it is worth showing both since the conclusion should not
+        // rest on a convention.
+        println!(
+            "if the UR is real-time rather than map-time, the measured sigma is \
+             {:.2} ms in map time instead",
+            measured_sigma * 1.5
+        );
+
+        // Observed vs predicted band shares, conditioned on the note being hit.
+        let expected = expected_counts(&units, &windows, &model, fit.skill);
+        let observed_timing = f64::from(total - state.misses);
+        let expected_timing = expected.total() - expected.get(ManiaJudgement::Miss);
+
+        println!("\n{:>10} {:>10} {:>10}", "judgement", "observed", "predicted");
+
+        for (label, judgement, observed) in [
+            ("320", ManiaJudgement::Perfect, state.n320),
+            ("300", ManiaJudgement::Great, state.n300),
+            ("200", ManiaJudgement::Good, state.n200),
+            ("100", ManiaJudgement::Ok, state.n100),
+            ("50", ManiaJudgement::Meh, state.n50),
+        ] {
+            println!(
+                "{label:>10} {:>10.4} {:>10.4}",
+                f64::from(observed) / observed_timing,
+                expected.get(judgement) / expected_timing
+            );
+        }
+
+        println!(
+            "\nmisses: observed {} predicted {:.1}",
+            state.misses,
+            expected.get(ManiaJudgement::Miss) / expected.total() * f64::from(total)
+        );
+        println!(
+            "g_timing {:.1} plausible {} identifiable {}",
+            fit.g_timing,
+            fit.is_plausible(),
+            fit.is_identifiable()
+        );
+
+        // What it prices at.
+        let perf = calculate_performance(&attrs, &mods, state);
+        println!(
+            "\npp {:.1} | window_scalar {:.4} | custom_accuracy {:.3}%",
+            perf.pp,
+            perf.window_scalar,
+            custom_accuracy(state) * 100.0
+        );
+    }
+
+    /// Not an assertion — dumps the surface to CSV under `target/surface/` so it can
+    /// be plotted. Three files, each a different slice of the same object:
+    ///
+    /// - `grid.csv`: 305-weighted accuracy over (difficulty, skill) at
+    ///   [`REFERENCE_WINDOWS`]. This *is* the surface.
+    /// - `bands.csv`: the five timing-band shares plus miss rate against skill at one
+    ///   fixed difficulty — the mechanism the surface is built from.
+    /// - `windows.csv`: accuracy against skill at one difficulty for several window
+    ///   sets, which is what [`window_scalar`] reads horizontally.
+    ///
+    /// Run with `cargo test surface_dump -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "writes CSV for plotting rather than asserting"]
+    fn surface_dump() {
+        use crate::mania_accuracy::expected_counts;
+        use crate::mania_windows::{windows_from_great, ManiaJudgement};
+        use std::fmt::Write as _;
+
+        let model = ErrorModel::default();
+        let dir = std::path::Path::new("target/surface");
+        std::fs::create_dir_all(dir).unwrap();
+
+        // Log-spaced in both axes: skill spans orders of magnitude and difficulty is
+        // multiplicative in `sigma`, so a linear grid would waste most of its rows.
+        let geom = |low: f64, high: f64, steps: usize| -> Vec<f64> {
+            (0..steps)
+                .map(|i| {
+                    let t = i as f64 / (steps - 1) as f64;
+                    low * (high / low).powf(t)
+                })
+                .collect()
+        };
+
+        let difficulties = geom(2.0, 20.0, 121);
+        let skills = geom(0.5, 60.0, 161);
+
+        let mut grid = String::from("difficulty,skill,accuracy,miss_rate\n");
+
+        for &difficulty in &difficulties {
+            for &skill in &skills {
+                let units = [JudgementUnit::new(difficulty)];
+                let expected = expected_counts(&units, &REFERENCE_WINDOWS, &model, skill);
+                writeln!(
+                    grid,
+                    "{difficulty},{skill},{},{}",
+                    expected.custom_accuracy(),
+                    expected.get(ManiaJudgement::Miss) / expected.total()
+                )
+                .unwrap();
+            }
+        }
+
+        std::fs::write(dir.join("grid.csv"), grid).unwrap();
+
+        // One difficulty, chosen to be the Decoy score's so the plots line up with the
+        // pricing reports.
+        let difficulty = 13.774;
+        let mut bands = String::from("skill,sigma,n320,n300,n200,n100,n50,miss,accuracy\n");
+
+        for &skill in &skills {
+            let units = [JudgementUnit::new(difficulty)];
+            let expected = expected_counts(&units, &REFERENCE_WINDOWS, &model, skill);
+            let total = expected.total();
+            let share = |judgement| expected.get(judgement) / total;
+
+            writeln!(
+                bands,
+                "{skill},{},{},{},{},{},{},{},{}",
+                model.sigma(difficulty, skill),
+                share(ManiaJudgement::Perfect),
+                share(ManiaJudgement::Great),
+                share(ManiaJudgement::Good),
+                share(ManiaJudgement::Ok),
+                share(ManiaJudgement::Meh),
+                share(ManiaJudgement::Miss),
+                expected.custom_accuracy()
+            )
+            .unwrap();
+        }
+
+        std::fs::write(dir.join("bands.csv"), bands).unwrap();
+
+        // The same slice under different windows. Named by GREAT window since that is
+        // the single parameter the rest are derived from.
+        let window_sets = [
+            ("HR OD7 DT", 30.5_f64),
+            ("reference OD8", 40.5),
+            ("OD7 DT", 43.0),
+            ("EZ OD7 DT", 60.3),
+        ];
+
+        let mut windows_csv = String::from("label,great,skill,accuracy\n");
+
+        for (label, great) in window_sets {
+            let windows = if (great - 40.5).abs() < 1e-9 {
+                REFERENCE_WINDOWS
+            } else {
+                windows_from_great(great)
+            };
+
+            for &skill in &skills {
+                let units = [JudgementUnit::new(difficulty)];
+                let accuracy = expected_counts(&units, &windows, &model, skill).custom_accuracy();
+                writeln!(windows_csv, "{label},{great},{skill},{accuracy}").unwrap();
+            }
+        }
+
+        std::fs::write(dir.join("windows.csv"), windows_csv).unwrap();
+
+        println!("wrote {} (grid {} x {})", dir.display(), difficulties.len(), skills.len());
+    }
+
+    /// Not an assertion — dumps `target/surface/od_grid.csv`: every judgement band's
+    /// share over (OD, skill), with and without `EZ`, for plotting as 3D surfaces.
+    ///
+    /// OD is the interesting third axis because mania's classic scheme treats it
+    /// unevenly — GREAT and below shift by `3 * (10 - od)` ms while PERFECT is pinned
+    /// at a flat 16 ms. So the 320 surface should be *flat* in OD and the others
+    /// should tilt, and `EZ` should be the only thing that ever moves 320. Both
+    /// scoring schemes are dumped since lazer interpolates PERFECT over OD instead.
+    ///
+    /// The difficulty the OD/skill grid is taken at defaults to the Decoy score's
+    /// 13.77 stars so the dump reproduces without any setup, but `SURFACE_MAP` points
+    /// it at a real beatmap instead (its rated difficulty under `SURFACE_CLOCK_RATE`
+    /// is used), and `SURFACE_STARS` sets the number directly. `tools/mania_surface.py`
+    /// passes these through so any map can be inspected.
+    ///
+    /// Run with `cargo test od_surface_dump -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "writes CSV for plotting rather than asserting"]
+    fn od_surface_dump() {
+        use crate::mania_accuracy::expected_counts;
+        use crate::mania_windows::{hit_windows, ManiaJudgement};
+        use std::fmt::Write as _;
+
+        let model = ErrorModel::default();
+        let dir = std::path::Path::new("target/surface");
+        std::fs::create_dir_all(dir).unwrap();
+
+        let env = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
+        let clock_rate = env("SURFACE_CLOCK_RATE")
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(1.0);
+
+        // Where the slice is taken. A real map wins over an explicit star value, which
+        // wins over the Decoy default.
+        let (difficulty, source) = if let Some(path) = env("SURFACE_MAP") {
+            let map = parse(&path).unwrap_or_else(|| panic!("cannot parse {path}"));
+            let attrs = calculate(&map, &GameMods::default(), clock_rate, Some(true), None)
+                .unwrap_or_else(|| panic!("{path} is not a mania map"));
+
+            (attrs.stars, path)
+        } else if let Some(stars) = env("SURFACE_STARS").and_then(|v| v.parse::<f64>().ok()) {
+            (stars, "SURFACE_STARS".to_owned())
+        } else {
+            (13.774, "default (Decoy DT)".to_owned())
+        };
+
+        println!("slice at {difficulty:.3} stars from {source} (clock rate {clock_rate})");
+        std::fs::write(
+            dir.join("meta.csv"),
+            format!("difficulty,clock_rate,source\n{difficulty},{clock_rate},{source}\n"),
+        )
+        .unwrap();
+
+        let ods: Vec<f64> = (0..=100).map(|i| f64::from(i) / 10.0).collect();
+        let skills: Vec<f64> = (0..161)
+            .map(|i| {
+                let t = i as f64 / 160.0;
+                0.5 * (60.0 / 0.5_f64).powf(t)
+            })
+            .collect();
+
+        let mut with_ez = LazerMods::new();
+        single_mod(&mut with_ez, GameMod::EasyMania(Default::default()));
+
+        let mut out = String::from(
+            "scheme,mod,od,skill,great,perfect,sigma,n320,n300,n200,n100,n50,miss,accuracy\n",
+        );
+
+        for (scheme, classic) in [("classic", true), ("lazer", false)] {
+            for (mod_label, mods) in [("NM", GameMods::default()), ("EZ", with_ez.clone())] {
+                for &od in &ods {
+                    // A bare non-convert map at this OD; only `od`/`is_convert` reach
+                    // the window construction. Converts are deliberately not swept:
+                    // their classic scheme keys off a single `round(od) > 4` threshold,
+                    // so an OD axis would be two flat plateaus rather than a surface.
+                    let mut map = Beatmap::default();
+                    map.mode = GameMode::Mania;
+                    map.od = od as f32;
+
+                    let windows = hit_windows(&map, &mods, clock_rate, classic);
+
+                    for &skill in &skills {
+                        let units = [JudgementUnit::new(difficulty)];
+                        let expected = expected_counts(&units, &windows, &model, skill);
+                        let total = expected.total();
+                        let share = |judgement| expected.get(judgement) / total;
+
+                        writeln!(
+                            out,
+                            "{scheme},{mod_label},{od},{skill},{},{},{},{},{},{},{},{},{},{}",
+                            windows.great,
+                            windows.perfect,
+                            model.sigma(difficulty, skill),
+                            share(ManiaJudgement::Perfect),
+                            share(ManiaJudgement::Great),
+                            share(ManiaJudgement::Good),
+                            share(ManiaJudgement::Ok),
+                            share(ManiaJudgement::Meh),
+                            share(ManiaJudgement::Miss),
+                            expected.custom_accuracy()
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+        }
+
+        std::fs::write(dir.join("od_grid.csv"), out).unwrap();
+        println!(
+            "wrote od_grid.csv ({} od x {} skill x 2 schemes x 2 mod states)",
+            ods.len(),
+            skills.len()
+        );
+    }
+
+    /// Not an assertion — prices one real score with and without EZ, holding the
+    /// judgement counts fixed.
+    ///
+    /// Holding counts fixed is the whole point: it asks "what is this exact
+    /// performance worth if it had been produced through wider windows", which is
+    /// the question a mod multiplier answers by fiat and the surface answers by
+    /// refitting skill. Nothing here inspects the mod list — EZ enters only by
+    /// widening [`ManiaHitWindows`], and the pp difference is whatever that
+    /// widening does to the fit.
+    ///
+    /// Run with `cargo test decoy_ez_comparison -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn decoy_ez_comparison() {
+        // Yooh - Decoy [Rachel's Ruins "Buffed Ver."], played by Reflec with DT.
+        let Some(map) = parse("local-fixtures/maps/4055699.osu") else {
+            println!("beatmap 4055699 absent; nothing to compare");
+            return;
+        };
+
+        let state = SunnyScoreState {
+            n320: 1542,
+            n300: 1595,
+            n200: 603,
+            n100: 91,
+            n50: 15,
+            misses: 14,
+        };
+        let counts = [
+            state.n320,
+            state.n300,
+            state.n200,
+            state.n100,
+            state.n50,
+            state.misses,
+        ];
+        let total = state.total_hits();
+        let units_for = |stars: f64| [JudgementUnit::repeated(stars, f64::from(total))];
+        let model = ErrorModel::default();
+
+        let mut with_ez = LazerMods::new();
+        single_mod(&mut with_ez, GameMod::EasyMania(Default::default()));
+
+        let mut rows = Vec::new();
+
+        for (label, mods) in [("DT", GameMods::default()), ("DT+EZ", with_ez)] {
+            // Classic (stable) scoring, DT 1.5x, as played.
+            let attrs = calculate(&map, &mods, 1.5, Some(false), None).unwrap();
+            let fit = fit_with_quality(&counts, &units_for(attrs.stars), &attrs.hit_windows, &model);
+            let perf = calculate_performance(&attrs, &mods, state);
+
+            rows.push((label, attrs, fit, perf));
+        }
+
+        println!(
+            "map: OD {} convert {} | {total} notes | counts 320:{} 300:{} 200:{} 100:{} 50:{} miss:{}",
+            map.od, map.is_convert, state.n320, state.n300, state.n200, state.n100, state.n50,
+            state.misses
+        );
+        println!("custom_accuracy {:.3}%\n", custom_accuracy(state) * 100.0);
+
+        println!(
+            "{:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+            "mods", "great", "perfect", "stars", "skill", "sigma", "g_tim"
+        );
+
+        for (label, attrs, fit, _) in &rows {
+            println!(
+                "{label:>7} {:>7.1} {:>7.1} {:>7.3} {:>7.3} {:>7.2} {:>7.1}",
+                attrs.hit_windows.great,
+                attrs.hit_windows.perfect,
+                attrs.stars,
+                fit.skill,
+                model.sigma(attrs.stars, fit.skill),
+                fit.g_timing
+            );
+        }
+
+        println!(
+            "\n{:>7} {:>10} {:>10} {:>10}",
+            "mods", "scalar", "pp_diff", "pp"
+        );
+
+        for (label, _, _, perf) in &rows {
+            println!(
+                "{label:>7} {:>10.4} {:>10.1} {:>10.1}",
+                perf.window_scalar, perf.pp_difficulty, perf.pp
+            );
+        }
+
+        let (_, _, _, nm) = &rows[0];
+        let (_, _, _, ez) = &rows[1];
+
+        println!(
+            "\nEZ prices at {:.4}x the no-mod pp ({:.1} -> {:.1}, {:+.1})",
+            ez.pp / nm.pp,
+            nm.pp,
+            ez.pp,
+            ez.pp - nm.pp
+        );
+        println!(
+            "of which the window scalar contributes {:.4}x",
+            ez.window_scalar / nm.window_scalar
+        );
+    }
+
     /// Not an assertion — a report on *where* the fit misses. Prints each real
     /// score's observed timing-band shares next to what the fitted surface
     /// predicts, so the shape of the residual can be read directly instead of
