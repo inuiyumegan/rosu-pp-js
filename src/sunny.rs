@@ -21,6 +21,9 @@ use rosu_pp::model::{
     mode::GameMode,
 };
 
+use crate::mania_accuracy::{fit_with_quality, ErrorModel, JudgementUnit};
+use crate::mania_windows::{hit_windows, ManiaHitWindows};
+
 /// A single mania note (or hold-note) extracted from a beatmap.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Note {
@@ -50,6 +53,13 @@ pub struct SunnyManiaDifficultyAttributes {
     pub switches: f64,
     /// The GREAT hit window used for the calculation (incl. mods).
     pub great_hit_window: f64,
+    /// The full judgement window set the score will be graded against.
+    ///
+    /// Mods are already folded in, which is what lets the performance stage price
+    /// a mod without knowing it was used: `EZ` widens every window here, so the
+    /// same judgement counts imply a lower skill and earn less. See
+    /// [`compute_difficulty_value`].
+    pub hit_windows: ManiaHitWindows,
     /// The max combo of the map.
     pub max_combo: u32,
     /// The amount of hit objects taken into account.
@@ -69,6 +79,12 @@ pub struct SunnyManiaPerformanceAttributes {
     pub acc_multiplier: f64,
     /// The length multiplier applied to the difficulty portion.
     pub length_multiplier: f64,
+    /// How much the judgement windows in effect changed the score's value.
+    ///
+    /// Below 1 when the score was graded through windows wider than the OD 8
+    /// reference, which is how `EZ` is priced without a mod-specific factor. Exactly
+    /// 1 only when there was nothing to measure. See [`window_scalar`].
+    pub window_scalar: f64,
 }
 
 /// Score state required for the performance calculation.
@@ -108,6 +124,7 @@ pub fn calculate(
     let great_hit_window = get_hit_window_300(map, clock_rate, has_hr, has_ez);
     let hit_leniency = hit_leniency_from_window(great_hit_window);
     let classic = is_classic(lazer, mods);
+    let windows = hit_windows(map, mods, clock_rate, classic);
 
     let take = passed_objects.unwrap_or(u32::MAX) as usize;
     let objects = map.hit_objects.iter().take(take);
@@ -128,6 +145,7 @@ pub fn calculate(
         spikiness: params.spikiness,
         switches: params.switches,
         great_hit_window,
+        hit_windows: windows,
         max_combo,
         n_objects: data.notes.len(),
     })
@@ -139,18 +157,18 @@ pub fn calculate_performance(
     mods: &GameMods,
     state: SunnyScoreState,
 ) -> SunnyManiaPerformanceAttributes {
+    // NF still gets a flat factor: failing is a scoring matter that the timing
+    // surface says nothing about, so there is nothing for it to price. EZ has no
+    // factor here on purpose — see `compute_difficulty_value`.
     let mut multiplier = 1.0;
 
     if has_mod(mods, "NF") {
         multiplier *= 0.75;
     }
 
-    if has_mod(mods, "EZ") {
-        multiplier *= 0.90;
-    }
-
     let score_accuracy = custom_accuracy(state);
-    let difficulty_value = compute_difficulty_value(attrs.stars, score_accuracy);
+    let window_scalar = window_scalar(attrs, state);
+    let difficulty_value = compute_difficulty_value(attrs.stars, score_accuracy, window_scalar);
     let variety_multiplier = variety_multiplier(attrs.variety);
     let acc_multiplier = acc_multiplier(score_accuracy, attrs.acc_scalar);
     let length_multiplier = length_multiplier(attrs.n_objects as f64, attrs.stars);
@@ -167,7 +185,82 @@ pub fn calculate_performance(
         variety_multiplier,
         acc_multiplier,
         length_multiplier,
+        window_scalar,
     }
+}
+
+/// The reference window set that [`window_scalar`] is measured against: OD 8
+/// classic non-convert, the modal mania OD. The choice only fixes where the scalar
+/// equals 1, not the size of its response.
+///
+/// A literal because it must be `const`; `reference_windows_match_od8_no_mod` pins
+/// it against [`hit_windows`] so the two cannot drift.
+const REFERENCE_WINDOWS: ManiaHitWindows = ManiaHitWindows {
+    perfect: 16.5,
+    great: 40.5,
+    good: 73.5,
+    ok: 103.5,
+    meh: 127.5,
+    miss: 164.5,
+};
+
+/// How much the windows a score was played under change what it is worth.
+///
+/// This is where mods get priced, and it is the whole point of widening the windows
+/// *before* grading the score. The same judgement counts are fitted twice: once
+/// against the windows actually in effect, once against [`REFERENCE_WINDOWS`]. A
+/// player who delivers a given 320 count through wider `EZ` windows demonstrably
+/// hit less precisely, so the first fit returns a lower skill and the ratio falls
+/// below 1. Nothing here inspects the mod list.
+///
+/// Deliberately *not* gated on [`ManiaFitQuality::is_plausible`]. The absolute fit is
+/// still imperfect on many real scores even after the error model was given a proper
+/// tail, but that error is largely common to both fits and so divides out of the
+/// ratio. Gating on it made pricing bimodal: whichever scores happened to fit got
+/// priced and the rest silently kept their unmodified value, which is a worse failure
+/// than a slightly mis-sized adjustment. `is_plausible` stays useful for calibration,
+/// where the absolute fit is the thing under test.
+///
+/// Worth knowing how little the shape calibration moved this: replacing the single
+/// normal with the fitted two-component mixture halved mean `g_timing` across the 20
+/// real scores (101.6 to 51.6) while the mean `EZ` scalar shifted only from 0.8256 to
+/// 0.8273. That is the design working as intended — the scalar is a ratio of two fits
+/// that share a shape error, so it is far more robust than the absolute fit is. It
+/// also means the mod response is set by `skill_exponent` and the windows, not by the
+/// tail, and it is why the shape could be fitted without disturbing pricing.
+///
+/// Returns 1.0 only when there is nothing to measure: an empty score, or a fit that
+/// did not produce a usable positive skill on both sides.
+fn window_scalar(attrs: &SunnyManiaDifficultyAttributes, state: SunnyScoreState) -> f64 {
+    let total = state.total_hits();
+
+    if total == 0 || attrs.n_objects == 0 || attrs.stars <= 0.0 {
+        return 1.0;
+    }
+
+    let counts = [
+        state.n320,
+        state.n300,
+        state.n200,
+        state.n100,
+        state.n50,
+        state.misses,
+    ];
+
+    // Uniform local difficulty for now: every note carries the map's star rating.
+    // Per-note difficulty replaces this, and is why the response is currently the
+    // same on every map.
+    let units = [JudgementUnit::repeated(attrs.stars, f64::from(total))];
+    let model = ErrorModel::default();
+
+    let played = fit_with_quality(&counts, &units, &attrs.hit_windows, &model);
+    let reference = fit_with_quality(&counts, &units, &REFERENCE_WINDOWS, &model);
+
+    if played.skill <= 0.0 || reference.skill <= 0.0 {
+        return 1.0;
+    }
+
+    played.skill / reference.skill
 }
 
 // ---------------------------------------------------------------------------
@@ -1444,10 +1537,18 @@ fn performance_proportion(acc: f64) -> f64 {
     }
 }
 
-fn compute_difficulty_value(stars: f64, score_accuracy: f64) -> f64 {
+/// The difficulty portion of pp.
+///
+/// `window_scalar` carries the judgement-window effect, which is what removes the
+/// need for per-mod factors here: it is derived by grading the score against the
+/// windows that were actually in effect, so `EZ` is priced without being named.
+/// It enters through the same `^2.2` as the star rating because both describe how
+/// hard the score was to produce, so a 1% shift in either should be worth the same.
+fn compute_difficulty_value(stars: f64, score_accuracy: f64, window_scalar: f64) -> f64 {
     let proportion = performance_proportion(score_accuracy);
+    let effective_stars = f64::max(stars - 0.15, 0.05) * window_scalar.max(0.0);
 
-    9.8 * f64::powf(f64::max(stars - 0.15, 0.05), 2.2) * proportion
+    9.8 * f64::powf(effective_stars.max(0.05), 2.2) * proportion
 }
 
 /// Multiplier based on the map's variety, in the range `[0.945, 1.055]`.
@@ -1493,6 +1594,34 @@ mod tests {
     fn parse(path: &str) -> Option<Beatmap> {
         let bytes = std::fs::read(path).ok()?;
         Beatmap::from_bytes(&bytes).ok()
+    }
+
+    /// A synthetic 4k map: `notes` evenly spaced notes cycling across columns.
+    ///
+    /// The reference `.osu` files the older tests use live at absolute Windows
+    /// paths and are unavailable here, so those tests silently skip. Anything that
+    /// must actually run needs a map built in memory.
+    fn synthetic_map(od: f32, notes: usize, spacing: f64) -> Beatmap {
+        let mut map = Beatmap::default();
+        map.mode = GameMode::Mania;
+        map.od = od;
+        map.cs = 4.0;
+        map.is_convert = false;
+
+        map.hit_objects = (0..notes)
+            .map(|idx| HitObject {
+                pos: rosu_pp::model::hit_object::Pos {
+                    // Column from x position: lazer maps x to a column index by
+                    // `x * columns / 512`.
+                    x: (idx % 4) as f32 * 128.0 + 64.0,
+                    y: 192.0,
+                },
+                start_time: idx as f64 * spacing,
+                kind: HitObjectKind::Circle,
+            })
+            .collect();
+
+        map
     }
 
     /// The Python reference (Star-Rating-Rebirth) uses the OD-based hit
@@ -1591,17 +1720,825 @@ mod tests {
         assert!(perf.length_multiplier > 0.0 && perf.length_multiplier < 1.1);
         assert!((perf.pp - perf.pp_difficulty * perf.variety_multiplier * perf.acc_multiplier * perf.length_multiplier).abs() < 1e-6);
 
-        // NF reduces the pp
+        // NF keeps its flat factor: failing is a scoring matter the timing surface
+        // says nothing about.
         let mut nf_mods = LazerMods::new();
         single_mod(&mut nf_mods, GameMod::NoFailMania(Default::default()));
         let perf_nf = calculate_performance(&attrs, &nf_mods, state);
         assert!((perf_nf.pp - perf.pp * 0.75).abs() < 1e-6);
+    }
 
-        // EZ reduces the pp
+    /// The core of the design: `EZ` is priced by grading the score against the
+    /// windows it was played under, not by a mod-specific factor. The same
+    /// judgement counts through wider windows imply less precision, so they are
+    /// worth less — and `calculate_performance` never looks up `EZ` to do it.
+    #[test]
+    fn ez_is_priced_by_the_windows_not_a_multiplier() {
+        let map = synthetic_map(8.0, 900, 125.0);
+        let nm_mods = GameMods::default();
+
         let mut ez_mods = LazerMods::new();
         single_mod(&mut ez_mods, GameMod::EasyMania(Default::default()));
-        let perf_ez = calculate_performance(&attrs, &ez_mods, state);
-        assert!((perf_ez.pp - perf.pp * 0.90).abs() < 1e-6);
+
+        let nm = calculate(&map, &nm_mods, 1.0, Some(true), None).unwrap();
+        let ez = calculate(&map, &ez_mods, 1.0, Some(true), None).unwrap();
+
+        // EZ must actually widen the windows, otherwise the rest proves nothing.
+        assert!(
+            ez.hit_windows.great > nm.hit_windows.great,
+            "EZ should widen GREAT: {} vs {}",
+            ez.hit_windows.great,
+            nm.hit_windows.great
+        );
+        assert!(
+            ez.hit_windows.perfect > nm.hit_windows.perfect,
+            "EZ is the only thing that moves PERFECT: {} vs {}",
+            ez.hit_windows.perfect,
+            nm.hit_windows.perfect
+        );
+
+        // One observed score, both window sets. Not an SS: a saturated fit carries
+        // no information about precision, so the score has to leave some headroom.
+        let notes = nm.n_objects as u32;
+        let n320 = notes * 92 / 100;
+        let state = SunnyScoreState {
+            n320,
+            n300: notes - n320,
+            ..Default::default()
+        };
+
+        let perf_nm = calculate_performance(&nm, &nm_mods, state);
+        let perf_ez = calculate_performance(&ez, &ez_mods, state);
+
+        assert!(
+            perf_ez.window_scalar < 1.0,
+            "wider windows should discount the score, got {}",
+            perf_ez.window_scalar
+        );
+
+        assert!(
+            perf_ez.pp < perf_nm.pp,
+            "the same counts through EZ windows should be worth less: {} vs {}",
+            perf_ez.pp,
+            perf_nm.pp
+        );
+
+        // And the discount is the windows, not a hidden factor: passing NM windows
+        // with the EZ mod list set gives the NM value back.
+        let mislabelled = calculate_performance(&nm, &ez_mods, state);
+
+        assert!(
+            (mislabelled.pp - perf_nm.pp).abs() < 1e-9,
+            "pp should depend on the windows, not the mod list: {} vs {}",
+            mislabelled.pp,
+            perf_nm.pp
+        );
+    }
+
+    /// HR is the mirror image and needs no separate rule: it narrows the windows,
+    /// so the same counts imply *more* precision and are worth more.
+    #[test]
+    fn hr_is_rewarded_by_the_same_mechanism() {
+        let map = synthetic_map(8.0, 900, 125.0);
+        let nm_mods = GameMods::default();
+
+        let mut hr_mods = LazerMods::new();
+        single_mod(&mut hr_mods, GameMod::HardRockMania(Default::default()));
+
+        let nm = calculate(&map, &nm_mods, 1.0, Some(true), None).unwrap();
+        let hr = calculate(&map, &hr_mods, 1.0, Some(true), None).unwrap();
+
+        let notes = nm.n_objects as u32;
+        let n320 = notes * 92 / 100;
+        let state = SunnyScoreState {
+            n320,
+            n300: notes - n320,
+            ..Default::default()
+        };
+
+        let perf_hr = calculate_performance(&hr, &hr_mods, state);
+
+        assert!(
+            perf_hr.window_scalar > 1.0,
+            "narrower windows should reward the score, got {}",
+            perf_hr.window_scalar
+        );
+    }
+
+    /// [`REFERENCE_WINDOWS`] has to be a hand-written literal to stay `const`, so it
+    /// can silently disagree with what [`hit_windows`] actually produces. It did:
+    /// GOOD/OK were written +36/+66 from GREAT when the classic non-convert scheme
+    /// offsets them by +33/+63, which priced an OD 8 no-mod score at 1.0072 instead
+    /// of exactly 1.
+    #[test]
+    fn reference_windows_match_od8_no_mod() {
+        let map = synthetic_map(8.0, 100, 200.0);
+        let mods = GameMods::default();
+
+        let generated = hit_windows(&map, &mods, 1.0, true);
+
+        assert_eq!(
+            generated, REFERENCE_WINDOWS,
+            "reference set drifted from the OD 8 classic non-convert windows"
+        );
+    }
+
+    /// A score played on exactly the reference windows must be priced at 1: the two
+    /// fits are then the same fit. Guards the scalar against picking up an offset
+    /// from anything other than the windows.
+    #[test]
+    fn a_reference_od_no_mod_score_is_priced_at_one() {
+        let map = synthetic_map(8.0, 2000, 120.0);
+        let mods = GameMods::default();
+        let attrs = calculate(&map, &mods, 1.0, Some(true), None).unwrap();
+
+        let state = SunnyScoreState {
+            n320: 1400,
+            n300: 480,
+            n200: 90,
+            n100: 20,
+            n50: 5,
+            misses: 5,
+        };
+
+        let perf = calculate_performance(&attrs, &mods, state);
+
+        assert!(
+            (perf.window_scalar - 1.0).abs() < 1e-6,
+            "reference windows must be neutral, got {}",
+            perf.window_scalar
+        );
+    }
+
+    /// The one case with nothing to measure. Everything else gets priced, however
+    /// badly the model fits — see [`window_scalar`].
+    #[test]
+    fn an_empty_score_has_no_windows_to_price() {
+        let map = synthetic_map(8.0, 900, 125.0);
+        let mods = GameMods::default();
+        let attrs = calculate(&map, &mods, 1.0, Some(true), None).unwrap();
+
+        let empty = calculate_performance(&attrs, &mods, SunnyScoreState::default());
+
+        assert_eq!(empty.window_scalar, 1.0, "an empty score has nothing to fit");
+    }
+
+    /// Some real scores still fit poorly even with a calibrated tail, so pricing must
+    /// not depend on fit quality: gating on it left most `EZ` scores at their
+    /// unmodified value, which is the bug this pins against returning.
+    ///
+    /// The counts are a real score from the live server (map 4229780), the worst fit
+    /// in that set both before and after the error model gained its lapse component —
+    /// `g_timing` went from 688 to 100, an enormous improvement that still leaves it
+    /// implausible, which is precisely why this test is about pricing rather than fit.
+    /// They are graded through `EZ` windows here to check that pricing happens; the
+    /// original play was no-mod.
+    #[test]
+    fn an_implausible_fit_is_still_priced() {
+        let map = synthetic_map(8.0, 3635, 90.0);
+        let mut ez_mods = LazerMods::new();
+        single_mod(&mut ez_mods, GameMod::EasyMania(Default::default()));
+        let attrs = calculate(&map, &ez_mods, 1.5, Some(true), None).unwrap();
+
+        let state = SunnyScoreState {
+            n320: 2459,
+            n300: 963,
+            n200: 144,
+            n100: 56,
+            n50: 13,
+            misses: 0,
+        };
+
+        let counts = [
+            state.n320,
+            state.n300,
+            state.n200,
+            state.n100,
+            state.n50,
+            state.misses,
+        ];
+        let units = [JudgementUnit::repeated(
+            attrs.stars,
+            f64::from(state.total_hits()),
+        )];
+        let fit = fit_with_quality(&counts, &units, &attrs.hit_windows, &ErrorModel::default());
+
+        assert!(
+            !fit.is_plausible(),
+            "fixture should be an implausible fit, got g_timing={}",
+            fit.g_timing
+        );
+
+        let perf = calculate_performance(&attrs, &ez_mods, state);
+
+        assert!(
+            perf.window_scalar < 0.95,
+            "an implausible fit must still be priced by its windows, got {}",
+            perf.window_scalar
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Real-score comparison
+    // -----------------------------------------------------------------------
+
+    /// One real score from the live server, with the pp it was awarded there.
+    struct Row {
+        map: &'static str,
+        n320: u32,
+        n300: u32,
+        n200: u32,
+        n100: u32,
+        n50: u32,
+        miss: u32,
+        live_pp: f64,
+        live_acc: f64,
+        mods: &'static str,
+    }
+
+    /// The top scores of uid 10107, an `EZ` pp exploiter, fetched from the ppy-sb
+    /// tRPC API. Beatmaps live alongside in `local-fixtures/maps/`; both are
+    /// gitignored, so this report skips when they are absent.
+    const REAL_SCORES: &[Row] = &[
+        Row { map: "4633018", n320: 1987, n300: 1710, n200: 593, n100: 20, n50: 8, miss: 138, live_pp: 1379.012, live_acc: 91.241, mods: "EZ+DT" },
+        Row { map: "5583718", n320: 1399, n300: 980, n200: 324, n100: 46, n50: 5, miss: 13, live_pp: 1356.142, live_acc: 94.368, mods: "EZ+DT" },
+        Row { map: "3663002", n320: 1975, n300: 1863, n200: 591, n100: 34, n50: 0, miss: 210, live_pp: 1313.038, live_acc: 90.01, mods: "EZ+DT" },
+        Row { map: "4870605", n320: 1436, n300: 1194, n200: 600, n100: 35, n50: 0, miss: 42, live_pp: 1279.841, live_acc: 91.181, mods: "EZ+DT" },
+        Row { map: "4870608", n320: 2590, n300: 2266, n200: 928, n100: 132, n50: 30, miss: 50, live_pp: 1240.625, live_acc: 92.123, mods: "EZ+DT" },
+        Row { map: "3583718", n320: 1359, n300: 1458, n200: 783, n100: 52, n50: 3, miss: 65, live_pp: 1199.563, live_acc: 89.357, mods: "EZ+DT" },
+        Row { map: "5583724", n320: 1323, n300: 1366, n200: 550, n100: 102, n50: 29, miss: 17, live_pp: 1183.49, live_acc: 91.364, mods: "EZ+DT" },
+        Row { map: "4459721", n320: 1306, n300: 1502, n200: 648, n100: 34, n50: 0, miss: 71, live_pp: 1095.582, live_acc: 90.408, mods: "EZ+DT" },
+        Row { map: "4459716", n320: 1240, n300: 1120, n200: 486, n100: 93, n50: 1, miss: 18, live_pp: 1094.649, live_acc: 91.791, mods: "EZ+DT" },
+        Row { map: "4807505", n320: 2407, n300: 1825, n200: 761, n100: 128, n50: 35, miss: 54, live_pp: 1065.901, live_acc: 91.897, mods: "EZ+DT" },
+        Row { map: "5583717", n320: 1095, n300: 1149, n200: 544, n100: 34, n50: 1, miss: 105, live_pp: 1028.791, live_acc: 88.565, mods: "EZ+DT" },
+        Row { map: "4870609", n320: 1048, n300: 940, n200: 326, n100: 17, n50: 0, miss: 49, live_pp: 984.332, live_acc: 92.098, mods: "EZ+DT" },
+        Row { map: "4459712", n320: 1415, n300: 1016, n200: 393, n100: 47, n50: 7, miss: 13, live_pp: 965.078, live_acc: 93.733, mods: "EZ+DT" },
+        Row { map: "4459715", n320: 1203, n300: 1536, n200: 779, n100: 37, n50: 0, miss: 65, live_pp: 945.481, live_acc: 89.414, mods: "EZ+DT" },
+        Row { map: "4459717", n320: 1213, n300: 1138, n200: 583, n100: 38, n50: 4, miss: 38, live_pp: 920.466, live_acc: 90.503, mods: "EZ+DT" },
+        Row { map: "4706643", n320: 882, n300: 538, n200: 195, n100: 48, n50: 1, miss: 19, live_pp: 895.026, live_acc: 93.058, mods: "EZ+DT" },
+        Row { map: "4459723", n320: 940, n300: 953, n200: 410, n100: 30, n50: 0, miss: 47, live_pp: 852.64, live_acc: 90.591, mods: "EZ+DT" },
+        Row { map: "4229780", n320: 2459, n300: 963, n200: 144, n100: 56, n50: 13, miss: 82, live_pp: 722.134, live_acc: 95.207, mods: "" },
+        Row { map: "3477077", n320: 1482, n300: 637, n200: 84, n100: 12, n50: 3, miss: 42, live_pp: 707.994, live_acc: 96.438, mods: "" },
+        Row { map: "3477076", n320: 1587, n300: 598, n200: 66, n100: 8, n50: 1, miss: 16, live_pp: 672.317, live_acc: 98.059, mods: "" },
+    ];
+
+    /// One fixture reduced to what the surface needs: the windows it was played
+    /// under, its star rating, and its judgement counts.
+    struct LoadedScore {
+        map: &'static str,
+        mods: &'static str,
+        stars: f64,
+        windows: ManiaHitWindows,
+        counts: [u32; 6],
+    }
+
+    /// Load every fixture that is present on disk. Returns empty when the gitignored
+    /// fixture directory is absent, which is how the reports skip cleanly.
+    fn load_real_scores() -> Vec<LoadedScore> {
+        let mut loaded = Vec::new();
+
+        for row in REAL_SCORES {
+            let path = format!("local-fixtures/maps/{}.osu", row.map);
+            let Some(map) = parse(&path) else {
+                continue;
+            };
+
+            let mut mods = LazerMods::new();
+            if row.mods.contains("EZ") {
+                single_mod(&mut mods, GameMod::EasyMania(Default::default()));
+            }
+            let clock_rate = if row.mods.contains("DT") { 1.5 } else { 1.0 };
+
+            let Some(attrs) = calculate(&map, &mods, clock_rate, Some(true), None) else {
+                continue;
+            };
+
+            loaded.push(LoadedScore {
+                map: row.map,
+                mods: row.mods,
+                stars: attrs.stars,
+                windows: attrs.hit_windows,
+                counts: [row.n320, row.n300, row.n200, row.n100, row.n50, row.miss],
+            });
+        }
+
+        loaded
+    }
+
+    /// Mean `g_timing` across the loaded scores under a candidate model.
+    ///
+    /// The mean is the right pooling here precisely because `g_timing` does not grow
+    /// with map length — every score contributes on the same scale regardless of note
+    /// count, so averaging weights each score equally rather than letting the
+    /// six-thousand-note maps dominate.
+    fn mean_g_timing(scores: &[LoadedScore], model: &ErrorModel) -> f64 {
+        if scores.is_empty() {
+            return f64::INFINITY;
+        }
+
+        let mut total = 0.0;
+
+        for score in scores {
+            let units = [JudgementUnit::repeated(
+                score.stars,
+                f64::from(score.counts.iter().sum::<u32>()),
+            )];
+            let fit = fit_with_quality(&score.counts, &units, &score.windows, model);
+
+            if !fit.g_timing.is_finite() {
+                return f64::INFINITY;
+            }
+
+            total += fit.g_timing;
+        }
+
+        total / scores.len() as f64
+    }
+
+    /// Not an assertion — the calibration itself. Searches `sigma_ref`,
+    /// `lapse_weight` and `lapse_ratio` for the combination that best explains the 20
+    /// real scores, holding `skill_exponent` and `difficulty_floor` fixed.
+    ///
+    /// Those two are held deliberately. The fixture set is one player whose fitted
+    /// skill sits at 0.96-1.72x the star rating on every map, and `skill_exponent` is
+    /// only identified by *variation* in that ratio — at a ratio of 1, `sigma` equals
+    /// `sigma_ref` whatever the exponent is, so the two are nearly jointly
+    /// unidentified here. Fitting the exponent on this data would mostly absorb one
+    /// player's idiosyncrasy while silently resetting the entire mod response, since
+    /// it alone sets how the scalar answers a window change.
+    ///
+    /// Run with `cargo test calibration_search -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn calibration_search() {
+        let scores = load_real_scores();
+
+        if scores.is_empty() {
+            println!("no fixtures present; nothing to calibrate");
+            return;
+        }
+
+        let baseline = ErrorModel::default();
+
+        // The single normal this work replaced, kept as the comparison point so the
+        // improvement stays visible now that the mixture *is* the default.
+        let single_normal = ErrorModel {
+            lapse_weight: 0.0,
+            ..baseline
+        };
+
+        println!(
+            "single normal:   mean g_timing={:.2}",
+            mean_g_timing(&scores, &single_normal)
+        );
+        println!(
+            "current default: lapse_weight={:.4} lapse_ratio={:.3} mean g_timing={:.2}",
+            baseline.lapse_weight,
+            baseline.lapse_ratio,
+            mean_g_timing(&scores, &baseline)
+        );
+
+        // `sigma_ref` is deliberately not searched. It is structurally
+        // unidentifiable, not merely weakly identified: it sets the unit skill is
+        // measured in, and skill is refit per score, so any change in `sigma_ref` is
+        // absorbed exactly by the fitted skill and no observable moves at all. The
+        // sweep further down demonstrates this — `g_timing` is identical to four
+        // decimals across a 16x range, with skill scaling as
+        // `sigma_ref^(1/skill_exponent)`. It stays at its existing value as a gauge
+        // choice, which also keeps fitted skill roughly on the star-rating scale.
+        //
+        // The real fit is therefore two-dimensional, over the shape parameters only.
+        // Search from the single normal rather than from the current default, so the
+        // result does not depend on the answer already being baked into the defaults.
+        let mut best = single_normal;
+        let mut best_score = mean_g_timing(&scores, &single_normal);
+
+        let mut weight = 0.0;
+        while weight <= 0.60 {
+            let mut ratio = 1.5;
+            while ratio <= 20.0 {
+                let candidate = ErrorModel {
+                    lapse_weight: weight,
+                    lapse_ratio: ratio,
+                    ..baseline
+                };
+                let value = mean_g_timing(&scores, &candidate);
+
+                if value < best_score {
+                    best_score = value;
+                    best = candidate;
+                }
+
+                ratio += 0.25;
+            }
+            weight += 0.005;
+        }
+
+        println!(
+            "grid best: lapse_weight={:.4} lapse_ratio={:.2} mean g_timing={:.2}",
+            best.lapse_weight, best.lapse_ratio, best_score
+        );
+
+        // Coordinate descent with a shrinking step, refining the grid winner.
+        let mut step = [0.0025, 0.125];
+
+        for _ in 0..60 {
+            for (axis, &size) in step.iter().enumerate() {
+                for direction in [-1.0, 1.0] {
+                    let mut candidate = best;
+                    let delta = size * direction;
+
+                    if axis == 0 {
+                        candidate.lapse_weight = (best.lapse_weight + delta).clamp(0.0, 0.95);
+                    } else {
+                        candidate.lapse_ratio = (best.lapse_ratio + delta).max(1.0);
+                    }
+
+                    let value = mean_g_timing(&scores, &candidate);
+
+                    if value < best_score {
+                        best_score = value;
+                        best = candidate;
+                    }
+                }
+            }
+
+            for entry in &mut step {
+                *entry *= 0.75;
+            }
+        }
+
+        println!(
+            "refined:   lapse_weight={:.4} lapse_ratio={:.3} mean g_timing={:.2}",
+            best.lapse_weight, best.lapse_ratio, best_score
+        );
+
+        // Profile `lapse_ratio`: at each fixed ratio, re-optimise the other two and
+        // report the best achievable objective. A flat profile means the ratio is not
+        // separately identified by this data and the value chosen inside the flat
+        // region is arbitrary — which is worth knowing before treating any single
+        // triple as "the" calibration.
+        println!("\nprofile over lapse_ratio (others re-optimised at each point):");
+        println!(
+            "{:>7} {:>10} {:>10} {:>10}",
+            "ratio", "weight", "g_timing", "ez_scalar"
+        );
+
+        for &ratio in &[3.0, 3.5, 4.0, 4.25, 4.5, 4.75, 5.0, 5.5, 6.0, 10.0, 20.0] {
+            let mut local = ErrorModel {
+                lapse_ratio: ratio,
+                ..best
+            };
+            let mut local_score = mean_g_timing(&scores, &local);
+            let mut local_step = 0.05;
+
+            for _ in 0..50 {
+                for direction in [-1.0, 1.0] {
+                    let mut candidate = local;
+                    candidate.lapse_weight =
+                        (local.lapse_weight + local_step * direction).clamp(0.0, 0.95);
+
+                    let value = mean_g_timing(&scores, &candidate);
+
+                    if value < local_score {
+                        local_score = value;
+                        local = candidate;
+                    }
+                }
+
+                local_step *= 0.8;
+            }
+
+            // The EZ scalar at this point, so the profile shows whether the flat
+            // region is also flat in the quantity that actually reaches pp.
+            let mut ez_here = Vec::new();
+
+            for score in &scores {
+                if !score.mods.contains("EZ") {
+                    continue;
+                }
+
+                let units = [JudgementUnit::repeated(
+                    score.stars,
+                    f64::from(score.counts.iter().sum::<u32>()),
+                )];
+                let played = fit_with_quality(&score.counts, &units, &score.windows, &local);
+                let reference = fit_with_quality(&score.counts, &units, &REFERENCE_WINDOWS, &local);
+
+                if played.skill > 0.0 && reference.skill > 0.0 {
+                    ez_here.push(played.skill / reference.skill);
+                }
+            }
+
+            let ez_mean = ez_here.iter().sum::<f64>() / ez_here.len().max(1) as f64;
+
+            println!(
+                "{ratio:>7.1} {:>10.4} {local_score:>10.2} {ez_mean:>10.4}",
+                local.lapse_weight
+            );
+        }
+
+        // Is `sigma_ref` identified at all? The profile above wanders it over 7.5-12.6
+        // while the objective moves in the third decimal, which suggests not. Sweep it
+        // alone, holding the shape fixed, and print the fitted skill alongside.
+        println!("\nsigma_ref sweep at fixed shape (skill of the first score shown):");
+        println!("{:>10} {:>10} {:>12}", "sigma_ref", "g_timing", "skill[0]");
+
+        for &sigma_ref in &[4.5, 9.0, 18.0, 36.0, 72.0] {
+            let candidate = ErrorModel { sigma_ref, ..best };
+            let first = &scores[0];
+            let units = [JudgementUnit::repeated(
+                first.stars,
+                f64::from(first.counts.iter().sum::<u32>()),
+            )];
+            let fit = fit_with_quality(&first.counts, &units, &first.windows, &candidate);
+
+            println!(
+                "{sigma_ref:>10.2} {:>10.4} {:>12.4}",
+                mean_g_timing(&scores, &candidate),
+                fit.skill
+            );
+        }
+
+        // What the calibrated shape does to the thing under test: the window scalar,
+        // and so the mod response. Reported rather than asserted — there is no pp
+        // target for EZ, the figure is an output of the calibration.
+        let mut ez = Vec::new();
+        let mut nm = Vec::new();
+
+        println!(
+            "\n{:>9} {:>7} {:>7} {:>9} {:>9}",
+            "map", "mods", "scalar", "g_before", "g_after"
+        );
+
+        for score in &scores {
+            let units = [JudgementUnit::repeated(
+                score.stars,
+                f64::from(score.counts.iter().sum::<u32>()),
+            )];
+
+            let before = fit_with_quality(&score.counts, &units, &score.windows, &single_normal);
+            let after = fit_with_quality(&score.counts, &units, &score.windows, &best);
+            let reference = fit_with_quality(&score.counts, &units, &REFERENCE_WINDOWS, &best);
+
+            let scalar = if after.skill > 0.0 && reference.skill > 0.0 {
+                after.skill / reference.skill
+            } else {
+                1.0
+            };
+
+            println!(
+                "{:>9} {:>7} {:>7.4} {:>9.1} {:>9.1}",
+                score.map,
+                if score.mods.is_empty() { "NM" } else { score.mods },
+                scalar,
+                before.g_timing,
+                after.g_timing,
+            );
+
+            if score.mods.contains("EZ") {
+                ez.push(scalar);
+            } else {
+                nm.push(scalar);
+            }
+        }
+
+        let summarise = |label: &str, values: &[f64]| {
+            if values.is_empty() {
+                return;
+            }
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            // pp moves as the scalar to the ~1.1 power through
+            // `compute_difficulty_value`; reported as the ratio itself here since the
+            // pp mapping is the report above's job.
+            println!("{label}: n={} mean scalar {mean:.4}", values.len());
+        };
+
+        println!();
+        summarise("EZ", &ez);
+        summarise("NM", &nm);
+    }
+
+    /// Not an assertion — a report. Prices every real score through the current
+    /// pipeline and prints the window scalar next to what the live server paid, so
+    /// the mod response can be read off real data rather than synthetics.
+    ///
+    /// Run with `cargo test real_score_report -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn real_score_report() {
+        let mut priced = 0usize;
+        let mut ez_scalars = Vec::new();
+        let mut nm_scalars = Vec::new();
+
+        println!(
+            "{:>9} {:>7} {:>4} {:>4} {:>6} {:>7} {:>8} {:>8} {:>7} {:>7} {:>9} {:>8}",
+            "map",
+            "mods",
+            "od",
+            "cvt",
+            "stars",
+            "acc%",
+            "livePP",
+            "ourPP",
+            "scalar",
+            "ppRatio",
+            "g_timing",
+            "plaus"
+        );
+
+        for row in REAL_SCORES {
+            let path = format!("local-fixtures/maps/{}.osu", row.map);
+            let Some(map) = parse(&path) else {
+                println!("{:>9} missing beatmap", row.map);
+                continue;
+            };
+
+            let has_ez = row.mods.contains("EZ");
+            let has_dt = row.mods.contains("DT");
+
+            let mut mods = LazerMods::new();
+            if has_ez {
+                single_mod(&mut mods, GameMod::EasyMania(Default::default()));
+            }
+            let clock_rate = if has_dt { 1.5 } else { 1.0 };
+
+            let Some(attrs) = calculate(&map, &mods, clock_rate, Some(true), None) else {
+                println!("{:>9} no difficulty attributes", row.map);
+                continue;
+            };
+
+            let state = SunnyScoreState {
+                n320: row.n320,
+                n300: row.n300,
+                n200: row.n200,
+                n100: row.n100,
+                n50: row.n50,
+                misses: row.miss,
+            };
+
+            let perf = calculate_performance(&attrs, &mods, state);
+
+            let counts = [
+                state.n320,
+                state.n300,
+                state.n200,
+                state.n100,
+                state.n50,
+                state.misses,
+            ];
+            let units = [JudgementUnit::repeated(
+                attrs.stars,
+                f64::from(state.total_hits()),
+            )];
+            let fit =
+                fit_with_quality(&counts, &units, &attrs.hit_windows, &ErrorModel::default());
+
+            // What the same score would be worth with the scalar switched off, so
+            // the window effect can be read directly in pp rather than in skill.
+            let unpriced = compute_difficulty_value(attrs.stars, custom_accuracy(state), 1.0);
+            let pp_ratio = if unpriced > 0.0 {
+                compute_difficulty_value(attrs.stars, custom_accuracy(state), perf.window_scalar)
+                    / unpriced
+            } else {
+                1.0
+            };
+
+            println!(
+                "{:>9} {:>7} {:>4.1} {:>4} {:>6.2} {:>7.3} {:>8.1} {:>8.1} {:>7.4} {:>7.4} {:>9.1} {:>8}",
+                row.map,
+                if row.mods.is_empty() { "NM" } else { row.mods },
+                map.od,
+                map.is_convert,
+                attrs.stars,
+                row.live_acc,
+                row.live_pp,
+                perf.pp,
+                perf.window_scalar,
+                pp_ratio,
+                fit.g_timing,
+                fit.is_plausible()
+            );
+
+            priced += 1;
+            if has_ez {
+                ez_scalars.push((perf.window_scalar, pp_ratio));
+            } else {
+                nm_scalars.push((perf.window_scalar, pp_ratio));
+            }
+        }
+
+        if priced == 0 {
+            println!("no fixtures present; nothing to report");
+            return;
+        }
+
+        let summarise = |label: &str, values: &[(f64, f64)]| {
+            if values.is_empty() {
+                return;
+            }
+            let n = values.len() as f64;
+            let mean_scalar = values.iter().map(|v| v.0).sum::<f64>() / n;
+            let mean_pp = values.iter().map(|v| v.1).sum::<f64>() / n;
+            let min = values.iter().map(|v| v.0).fold(f64::INFINITY, f64::min);
+            let max = values.iter().map(|v| v.0).fold(f64::NEG_INFINITY, f64::max);
+            println!(
+                "{label}: n={} mean scalar {mean_scalar:.4} ({min:.4}..{max:.4})  \
+                 mean pp ratio {mean_pp:.4}",
+                values.len()
+            );
+        };
+
+        println!();
+        summarise("EZ", &ez_scalars);
+        summarise("NM", &nm_scalars);
+    }
+
+    /// Not an assertion — a report on *where* the fit misses. Prints each real
+    /// score's observed timing-band shares next to what the fitted surface
+    /// predicts, so the shape of the residual can be read directly instead of
+    /// being inferred from a single `g_timing` number.
+    ///
+    /// Run with `cargo test residual_shape_report -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn residual_shape_report() {
+        use crate::mania_accuracy::expected_counts;
+        use crate::mania_windows::ManiaJudgement;
+
+        println!(
+            "{:>9} {:>7} {:>6} {:>6} {:>7} {:>39} {:>39}",
+            "map",
+            "mods",
+            "stars",
+            "skill",
+            "g_tim",
+            "observed 320/300/200/100/50",
+            "predicted 320/300/200/100/50"
+        );
+
+        for row in REAL_SCORES {
+            let path = format!("local-fixtures/maps/{}.osu", row.map);
+            let Some(map) = parse(&path) else {
+                continue;
+            };
+
+            let mut mods = LazerMods::new();
+            if row.mods.contains("EZ") {
+                single_mod(&mut mods, GameMod::EasyMania(Default::default()));
+            }
+            let clock_rate = if row.mods.contains("DT") { 1.5 } else { 1.0 };
+
+            let Some(attrs) = calculate(&map, &mods, clock_rate, Some(true), None) else {
+                continue;
+            };
+
+            let counts = [row.n320, row.n300, row.n200, row.n100, row.n50, row.miss];
+            let total: u32 = counts.iter().sum();
+            let units = [JudgementUnit::repeated(attrs.stars, f64::from(total))];
+            let model = ErrorModel::default();
+            let fit = fit_with_quality(&counts, &units, &attrs.hit_windows, &model);
+            let expected = expected_counts(&units, &attrs.hit_windows, &model, fit.skill);
+
+            // Both sides conditioned on the note having been hit, which is the
+            // space the fit actually works in.
+            let observed_timing = f64::from(total - row.miss);
+            let expected_timing = expected.total() - expected.get(ManiaJudgement::Miss);
+
+            let fmt = |shares: [f64; 5]| {
+                shares
+                    .iter()
+                    .map(|share| format!("{share:>7.4}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+
+            let observed_shares = [
+                f64::from(row.n320) / observed_timing,
+                f64::from(row.n300) / observed_timing,
+                f64::from(row.n200) / observed_timing,
+                f64::from(row.n100) / observed_timing,
+                f64::from(row.n50) / observed_timing,
+            ];
+            let predicted_shares = [
+                expected.get(ManiaJudgement::Perfect) / expected_timing,
+                expected.get(ManiaJudgement::Great) / expected_timing,
+                expected.get(ManiaJudgement::Good) / expected_timing,
+                expected.get(ManiaJudgement::Ok) / expected_timing,
+                expected.get(ManiaJudgement::Meh) / expected_timing,
+            ];
+
+            println!(
+                "{:>9} {:>7} {:>6.2} {:>6.2} {:>7.1} {} {}",
+                row.map,
+                if row.mods.is_empty() { "NM" } else { row.mods },
+                attrs.stars,
+                fit.skill,
+                fit.g_timing,
+                fmt(observed_shares),
+                fmt(predicted_shares),
+            );
+        }
     }
 
     #[test]

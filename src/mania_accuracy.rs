@@ -107,8 +107,8 @@
 //! loses 66% of its estimated skill under a fitted miss channel and 9.5% under
 //! conditioning, while clean scores recover their generating skill just as accurately
 //! either way. It is also self-consistent: the model no longer insists on
-//! ~`n * slip_rate` misses for a score that has none, which is what almost every SS
-//! actually looks like.
+//! misses for a score that has none, which is what almost every SS actually looks
+//! like.
 //!
 //! None of this loses the misses. They are fully accounted for on the scoring side,
 //! where they belong — they lower accuracy directly and break combo. What they no
@@ -117,12 +117,14 @@
 //! matter, handled by SR and by accuracy; the surface's job is the timing spread.
 //!
 //! [`ErrorModel::slip_rate`] therefore only affects [`expected_counts`] — forward
-//! prediction for a population, not inference about one score. Set it to zero for a
-//! pure timing prediction. At the default it shifts the *mean* PERFECT count to
-//! `n * (1 - slip_rate)`, which is why [`ExpectedCounts::custom_accuracy`] tops out
-//! just below 1.0; that is a property of the average run, not a cap on any individual
-//! score. Read in count form: on 1300 notes it expects ~6.5 misses and puts a genuine
-//! 1300/1300 at ~0.15% — unlikely, finite, and fully scoreable.
+//! prediction for a population, not inference about one score — and it is **zero by
+//! default**, so predicted misses come only from the timing distribution crossing
+//! the MISS boundary. Two consequences, both wanted. An SS is the ordinary
+//! prediction for a player comfortably above the map rather than an exponentially
+//! unlikely one, and predicted misses respond to the miss window: widening it under
+//! EZ moves probability mass back into MEH, so EZ predicts *fewer* misses. Under a
+//! flat additive rate neither held — the rate is window-independent by construction,
+//! and it made an SS on 6358 notes a `1.4e-14` event.
 //!
 //! ## What conditioning costs
 //!
@@ -187,13 +189,48 @@
 //!
 //! # Calibration
 //!
-//! [`ErrorModel`]'s four constants are the only free parameters, and they are
-//! estimates rather than fitted values. They need calibrating against real
-//! scores before the output can be trusted. [`log_likelihood`] is public for
-//! exactly this purpose.
+//! [`ErrorModel`] is where every free parameter lives. [`log_likelihood`] is public
+//! so it can be fitted; the harness is `sunny::tests::calibration_search`, run
+//! against 20 real scores from a live server.
+//!
+//! **The error distribution is a two-component normal mixture, not a single normal.**
+//! That was forced by the data rather than chosen. Fitting a lone normal to real
+//! scores leaves a residual with a consistent signature: the observed PERFECT share
+//! runs *above* prediction while the observed OK and MEH shares also run above it — a
+//! sharper core and a fatter tail simultaneously. One normal has a single width and
+//! must trade one against the other, so it splits the difference and misses at both
+//! ends, worst on the cleanest scores. On the most extreme fixture it underpredicted
+//! the OK share by 19x and MEH by 90x, for a `g_timing` of 688. Adding the lapse
+//! component ([`ErrorModel::lapse_weight`], [`ErrorModel::lapse_ratio`]) cut mean
+//! `g_timing` across the set from 101.6 to 51.6, and that same score from 688 to 100.
+//!
+//! **`sigma_ref` is a gauge parameter and cannot be calibrated.** It sets the unit
+//! skill is expressed in, and skill is refit for every score, so a change in
+//! `sigma_ref` is absorbed exactly by the fitted skill and no observable moves at all:
+//! sweeping it over a 16x range leaves `g_timing` identical to four decimals while
+//! skill scales as `sigma_ref^(1/skill_exponent)`. It is fixed at 18.0 as a
+//! convention, chosen so fitted skill lands roughly on the star-rating scale.
+//! `sigma_ref_only_sets_the_scale_of_skill` pins this. The corollary matters for
+//! pricing: since the window scalar is a *ratio* of two fitted skills, it is invariant
+//! to the choice.
+//!
+//! **`skill_exponent` and `difficulty_floor` are held, not fitted.** `skill_exponent`
+//! is identified only by variation in the skill-to-difficulty ratio, and the fixture
+//! set is one player sitting at 0.96-1.72x the star rating on every map — at a ratio
+//! of 1, `sigma` equals `sigma_ref` whatever the exponent is, so the two are close to
+//! jointly unidentified on this data. Since `skill_exponent` alone determines how the
+//! scalar answers a window change, fitting it here would reset the entire mod response
+//! on the strength of one player's idiosyncrasy. It needs a spread of skill levels.
+//!
+//! So the calibrated quantities are the two shape parameters, and what they are fitted
+//! to is the *shape* of the residual — the absolute quality of the fit, which is why
+//! [`FitQuality::is_plausible`] is the right objective here even though it is the wrong
+//! gate for pricing.
 
-// Nothing consumes this module yet; it is built alongside the window set as the
-// replacement for the output-side accuracy multiplier. Remove once wired up.
+// The fitting path is wired into `sunny::window_scalar`. Several forward-prediction
+// helpers are not yet consumed by it — they are used by the tests and by the
+// calibration work still to come, so the module keeps a narrow allowance rather than
+// deleting API the fit will need.
 #![allow(dead_code)]
 
 use crate::mania_windows::{ManiaHitWindows, ManiaJudgement};
@@ -209,20 +246,52 @@ pub struct ErrorModel {
     pub skill_exponent: f64,
     /// Added to local difficulty so that easy patterns are not perfectly free.
     pub difficulty_floor: f64,
+    /// The share of notes hit from the wide "lapse" component rather than the
+    /// narrow "locked in" one.
+    ///
+    /// Together with [`Self::lapse_ratio`] this makes the error distribution a
+    /// two-component normal mixture rather than a single normal. A single normal
+    /// provably cannot describe real scores: measured against 20 live scores, the
+    /// observed 320 share runs *above* what a fitted normal predicts while the
+    /// observed 100 and 50 shares run above it too — a sharper core and a fatter
+    /// tail at the same time. One normal has a single width and must trade one for
+    /// the other, so it splits the difference and misses at both ends. On the
+    /// worst-fitting no-mod score it underpredicted the 100 share by 19x.
+    ///
+    /// The mixture separates the two: the core width sets the 320 bulk, while this
+    /// weight and the ratio set the tail independently.
+    ///
+    /// Physically it is the difference between notes hit in the groove and notes hit
+    /// while recovering — reading ahead, resetting a hand, coming out of a pattern
+    /// change. Unlike [`Self::slip_rate`], which it partly replaces in spirit, this
+    /// channel still passes through the hit windows, so it responds to them: a wider
+    /// `EZ` window catches lapsed notes that a narrow one would not.
+    pub lapse_weight: f64,
+    /// How much wider the lapse component is than the core, as a multiple.
+    ///
+    /// Clamped to at least 1.0 — the lapse component is the wide one by definition,
+    /// and letting it go narrower would make the two components trade places and the
+    /// fit bimodal.
+    pub lapse_ratio: f64,
     /// The per-note probability of a lapse unrelated to timing precision: a
     /// misread, a slipped finger, a dropped input.
     ///
-    /// Only affects [`expected_counts`] and the distribution it comes from — the
-    /// fitting path conditions misses away entirely, so this does not influence
-    /// [`skill_for_counts`]. Set it to zero for a pure timing prediction: at that
-    /// setting the model predicts *no* misses for any competent score, which is
-    /// what an SS actually looks like, and misses appear only where the error
-    /// spread genuinely reaches past the MEH window.
+    /// **Zero by default.** Misses are meant to come from the timing distribution
+    /// reaching past the MISS boundary, which makes them respond to the things
+    /// that should move them: a wider miss window under EZ predicts fewer, and a
+    /// difficulty spike predicts more. A flat additive rate responds to neither.
     ///
-    /// Kept nonzero by default only because a prediction of exactly zero misses is
-    /// a poor description of a large population of real scores, where dropped
-    /// inputs happen at some low rate regardless of skill. It is a population
-    /// average, not a claim about any one score.
+    /// It is also the wrong functional form for long maps. Independent per-note
+    /// lapses make a clean score decay exponentially with length: at `0.005` an SS
+    /// on 1300 notes is `0.995^1300` ≈ 0.15%, and on 6358 notes ≈ `1.4e-14`. SS
+    /// scores on six-thousand-note maps exist and are not one-in-70-trillion
+    /// events, so the length scaling, not just the constant, was wrong.
+    ///
+    /// Only affects [`expected_counts`] and the distribution it comes from — the
+    /// fitting path conditions misses away entirely, so this never influenced
+    /// [`skill_for_counts`]. Set it nonzero only to model a population-average
+    /// dropped-input rate, and read the result as a population statement rather
+    /// than a claim about any one score.
     pub slip_rate: f64,
 }
 
@@ -232,7 +301,9 @@ impl Default for ErrorModel {
             sigma_ref: 18.0,
             skill_exponent: 1.7,
             difficulty_floor: 0.6,
-            slip_rate: 0.005,
+            lapse_weight: 0.034,
+            lapse_ratio: 4.4,
+            slip_rate: 0.0,
         }
     }
 }
@@ -253,6 +324,28 @@ impl ErrorModel {
         let ratio = (difficulty.max(0.0) + self.difficulty_floor) / skill;
 
         self.sigma_ref * ratio.powf(self.skill_exponent)
+    }
+
+    /// The probability that the error on a single note exceeds `bound` in absolute
+    /// value, under the two-component mixture.
+    ///
+    /// This is the only place the mixture is applied. Both components share the same
+    /// [`Self::sigma`] scale — the lapse one widened by [`Self::lapse_ratio`] — so a
+    /// change in skill moves the whole distribution together and the *shape* stays
+    /// fixed. That separation is what lets the shape be calibrated once against real
+    /// scores while skill remains the only per-score free quantity.
+    fn exceedance(&self, bound: f64, sigma: f64) -> f64 {
+        let weight = self.lapse_weight.clamp(0.0, 1.0);
+
+        if weight <= 0.0 {
+            return tail(bound, sigma);
+        }
+
+        // The lapse component is the wide one by definition; a ratio below 1 would
+        // swap the roles and give the fit two equivalent optima.
+        let ratio = self.lapse_ratio.max(1.0);
+
+        (1.0 - weight) * tail(bound, sigma) + weight * tail(bound, sigma * ratio)
     }
 }
 
@@ -364,7 +457,7 @@ pub fn judgement_probabilities(
 
     for judgement in ManiaJudgement::ALL {
         let (_, upper) = windows.band(judgement);
-        let outside = tail(upper, sigma).min(remaining);
+        let outside = model.exceedance(upper, sigma).min(remaining);
         // Bands are nested, so each judgement claims the mass that falls inside
         // its window but outside every tighter one. Differencing tails rather
         // than cumulatives keeps the sub-PERFECT judgements accurate at high
@@ -374,17 +467,16 @@ pub fn judgement_probabilities(
         remaining = outside;
     }
 
-    // Mix in the lapse channel: a small chance the note is dropped for reasons
-    // unrelated to timing precision. One distribution, used for both prediction
-    // and fitting.
+    // Optionally mix in the lapse channel. Zero at the default, so the miss
+    // probability above is entirely the timing distribution's tail past the MISS
+    // boundary — which is what makes it respond to the miss window and to local
+    // difficulty rather than sitting at a flat `n * slip_rate`.
     //
-    // Note what this does and does not mean. Per note, `1 - slip_rate` of the mass
-    // stays where the timing model put it, so the *mean* PERFECT count over `n`
-    // notes is `n * (1 - slip_rate)` — never quite `n`. That is a statement about
-    // the average run, not a ceiling on any individual score: an all-PERFECT score
-    // has probability `(1 - slip_rate)^n`, which is small but perfectly finite, and
-    // the likelihood handles it without special-casing. Read the surface in count
-    // form and there is nothing unreachable here.
+    // When set nonzero it is a population average and should be read as one: per
+    // note `1 - slip_rate` of the mass stays where the timing model put it, so the
+    // mean PERFECT count over `n` notes is `n * (1 - slip_rate)`, and an all-PERFECT
+    // score costs a factor of `(1 - slip_rate)^n`. That factor is what made the
+    // nonzero default untenable on long maps.
     let slip = model.slip_rate.clamp(0.0, 1.0);
 
     if slip > 0.0 {
@@ -1069,49 +1161,44 @@ mod tests {
     }
 
     #[test]
-    fn timing_precision_saturates_but_the_slip_channel_remains() {
+    fn timing_precision_saturates_into_a_clean_ss() {
         let windows = od9_windows();
         let model = ErrorModel::default();
         let notes = 200;
         let units = uniform_units(5.0, notes);
 
-        // Two separate effects, easy to conflate. Past ~20 skill units on an OD9
-        // map, sigma is small enough that the chance of missing the 16.5ms PERFECT
-        // window underflows f64 — so *timing* stops distinguishing scores. What is
-        // left is the slip channel, which does not vanish with skill.
+        // Past ~20 skill units on an OD9 map, sigma is small enough that the chance
+        // of missing the 16.5ms PERFECT window underflows f64, so timing stops
+        // distinguishing scores. With no lapse channel there is nothing left behind
+        // it: the limit is a clean SS rather than `n * (1 - slip_rate)`.
         let below = expected_counts(&units, &windows, &model, 18.0);
         let above = expected_counts(&units, &windows, &model, 40.0);
 
         assert!(above.get(ManiaJudgement::Perfect) > below.get(ManiaJudgement::Perfect));
 
-        // In count form: the mean PERFECT count converges on `n * (1 - slip_rate)`,
-        // with the residue sitting in misses. This is the average run, not a cap on
-        // an individual score.
-        let expected_perfect = notes as f64 * (1.0 - model.slip_rate);
-
         assert!(
-            (above.get(ManiaJudgement::Perfect) - expected_perfect).abs() < 1e-6,
-            "expected {expected_perfect} PERFECTs on average, got {}",
+            (above.get(ManiaJudgement::Perfect) - notes as f64).abs() < 1e-6,
+            "expected all {notes} notes PERFECT, got {}",
             above.get(ManiaJudgement::Perfect)
         );
         assert!(
-            (above.get(ManiaJudgement::Miss) - notes as f64 * model.slip_rate).abs() < 1e-6,
-            "the residue should be misses, got {}",
+            above.get(ManiaJudgement::Miss) < 1e-9,
+            "a saturated score should predict no misses, got {}",
             above.get(ManiaJudgement::Miss)
         );
     }
 
     #[test]
-    fn an_all_perfect_score_is_unlikely_but_not_impossible() {
+    fn an_all_perfect_score_is_an_ordinary_prediction() {
         let windows = od9_windows();
         let model = ErrorModel::default();
         let notes = 1300;
         let units = uniform_units(5.0, notes);
 
-        // The point the count form makes clear. A genuine 1300/1300 has probability
-        // `(1 - slip_rate)^1300`, around 0.15% — small, but finite. Its likelihood
-        // must be a real number at some skill, otherwise the most common shape of a
-        // top score would be unscoreable.
+        // An SS is the most common shape of a top score, so it has to be scoreable
+        // and it should not be exotic. Under the old flat lapse channel it cost a
+        // factor of `0.995^1300` ≈ 0.15%; with misses coming from the timing tail it
+        // is simply what a player above the map is expected to do.
         let all_perfect = [notes as u32, 0, 0, 0, 0, 0];
 
         let skill = skill_for_counts(&all_perfect, &units, &windows, &model);
@@ -1565,12 +1652,23 @@ mod tests {
             weak.get(ManiaJudgement::Miss)
         );
 
-        // A competent player does not, at any map length — so every miss in a good
-        // score comes from outside the timing model.
+        // A player comfortably above the difficulty does not, at any map length — so
+        // every miss in such a score comes from outside the timing model.
+        //
+        // The threshold is a skill *ratio* rather than an absolute skill, and the
+        // margin is wider than it was under a single normal. The calibrated mixture
+        // has a lapse component 4.4x the core width, so it keeps predicting a small
+        // number of misses through the region where a lone normal had already cut off:
+        // at difficulty 5 on 1000 notes it gives ~6.6 misses at ratio 1.0 and ~2.6 at
+        // 1.2, reaching 0.13 only by ratio 1.6. That is the shape the real scores
+        // demanded — see the module docs — and it is more honest besides, since a
+        // player at their limit does drop notes. The claim that survives is the one
+        // conditioning actually rests on: once a player is clear of the difficulty,
+        // timing stops explaining misses.
         for &notes in &[500usize, 1300, 5000] {
             let units = uniform_units(5.0, notes);
 
-            for &skill in &[4.0, 6.0, 8.0] {
+            for &skill in &[10.0, 15.0, 20.0] {
                 let counts = expected_counts(&units, &windows, &timing_only, skill);
 
                 assert!(
@@ -1579,6 +1677,100 @@ mod tests {
                     counts.get(ManiaJudgement::Miss)
                 );
             }
+        }
+    }
+
+    /// The mixture's tail is what lets one skill value produce a sharp 320 bulk and a
+    /// populated 100/50 tail at once. A single normal cannot, and that failure is
+    /// exactly what the 20 real scores showed.
+    ///
+    /// Pins the property rather than the constants: whatever the calibration settles
+    /// on, turning the lapse component off must make the far tail thinner while the
+    /// core gets no sharper.
+    #[test]
+    fn the_lapse_component_thickens_the_tail_without_blunting_the_core() {
+        let windows = od9_windows();
+        let units = uniform_units(5.0, 2000);
+
+        let mixture = ErrorModel::default();
+        let single = ErrorModel {
+            lapse_weight: 0.0,
+            ..mixture
+        };
+
+        // Compared at equal sigma, i.e. the same core width, so the difference is the
+        // tail alone rather than a rescaling.
+        let skill = 7.5;
+        let with_lapse = expected_counts(&units, &windows, &mixture, skill);
+        let without = expected_counts(&units, &windows, &single, skill);
+
+        assert!(
+            with_lapse.get(ManiaJudgement::Meh) > 4.0 * without.get(ManiaJudgement::Meh),
+            "the lapse component should populate the far tail: {} vs {}",
+            with_lapse.get(ManiaJudgement::Meh),
+            without.get(ManiaJudgement::Meh)
+        );
+
+        assert!(
+            with_lapse.get(ManiaJudgement::Perfect) < without.get(ManiaJudgement::Perfect),
+            "moving mass into the tail must come out of the core"
+        );
+
+        // The point of the exercise: at a *fitted* skill the mixture reproduces both
+        // ends better than a normal can. Take counts the mixture itself generates,
+        // round them to a real score, and confirm the mixture explains it better.
+        let counts = with_lapse.round_to_hits(2000);
+
+        let mixture_fit = fit_with_quality(&counts, &units, &windows, &mixture);
+        let single_fit = fit_with_quality(&counts, &units, &windows, &single);
+
+        assert!(
+            mixture_fit.g_timing < single_fit.g_timing,
+            "the generating model should fit its own output better: {} vs {}",
+            mixture_fit.g_timing,
+            single_fit.g_timing
+        );
+    }
+
+    /// `sigma_ref` is a gauge parameter, not a calibratable one: it fixes the units
+    /// skill is measured in and nothing observable depends on it, because skill is
+    /// refit per score and absorbs it exactly.
+    ///
+    /// This is why the calibration in `sunny::tests::calibration_search` searches the
+    /// two shape parameters only. Discovered by sweeping it over a 16x range and
+    /// watching `g_timing` stay identical to four decimals.
+    #[test]
+    fn sigma_ref_only_sets_the_scale_of_skill() {
+        let windows = od9_windows();
+        let units = uniform_units(5.0, 1500);
+        let counts = [700u32, 550, 200, 40, 8, 2];
+
+        let base = ErrorModel::default();
+        let baseline = fit_with_quality(&counts, &units, &windows, &base);
+
+        for &factor in &[0.25, 0.5, 2.0, 4.0] {
+            let scaled = ErrorModel {
+                sigma_ref: base.sigma_ref * factor,
+                ..base
+            };
+            let fit = fit_with_quality(&counts, &units, &windows, &scaled);
+
+            assert!(
+                (fit.g_timing - baseline.g_timing).abs() < 1e-6,
+                "sigma_ref {factor}x changed the fit quality: {} vs {}",
+                fit.g_timing,
+                baseline.g_timing
+            );
+
+            // Skill absorbs it as `factor^(1/skill_exponent)`, which is what makes the
+            // window scalar — a ratio of two skills — invariant to the choice.
+            let predicted = baseline.skill * factor.powf(1.0 / base.skill_exponent);
+
+            assert!(
+                (fit.skill / predicted - 1.0).abs() < 1e-3,
+                "skill should scale as factor^(1/skill_exponent): got {} expected {predicted}",
+                fit.skill
+            );
         }
     }
 
@@ -1819,47 +2011,72 @@ mod tests {
             "an SS should not report the bracket edge, got {skill}"
         );
 
-        // Asserted in count form: at the reported skill, essentially every note is
-        // expected to be a PERFECT apart from the slip residue. Checking the
-        // accuracy mean instead would fail for the wrong reason, since that mean is
-        // bounded by `1 - slip_rate`.
+        // Asserted in count form: at the reported skill essentially every note is
+        // expected to be a PERFECT. With the slip channel at zero there is no
+        // residue to allow for, so the shortfall should be numerically negligible.
         let counts = expected_counts(&units, &windows, &model, skill);
         let shortfall = notes as f64 - counts.get(ManiaJudgement::Perfect);
-        let slip_residue = notes as f64 * model.slip_rate;
 
         assert!(
-            shortfall <= slip_residue + 1e-6,
-            "the reported skill should leave only the slip residue unaccounted for: \
-             shortfall {shortfall} vs residue {slip_residue}"
+            shortfall < 1e-6,
+            "the reported skill should leave nothing unaccounted for, shortfall {shortfall}"
         );
     }
 
+    /// An SS must be the ordinary prediction for a player above the map, not an
+    /// exponentially unlikely one. The flat lapse channel failed this on length: at
+    /// `0.005` it put an SS on 6358 notes at `1.4e-14` and predicted 32 misses for a
+    /// score that had none.
     #[test]
-    fn extreme_skill_leaves_only_the_slip_residue() {
+    fn a_clean_score_predicts_no_misses_at_any_length() {
         let windows = od9_windows();
-        let notes = 100;
-
-        // With no slip channel the mean does reach a true 100%, which confirms the
-        // timing model itself has no ceiling — the shortfall at default settings is
-        // entirely the lapse term, not a limitation of the error distribution.
-        let no_slip = ErrorModel {
-            slip_rate: 0.0,
-            ..ErrorModel::default()
-        };
-        let units = uniform_units(5.0, notes);
-        let accuracy = expected_counts(&units, &windows, &no_slip, 5000.0).custom_accuracy();
-
-        assert_eq!(accuracy, 1.0, "the timing model should have no ceiling, got {accuracy}");
-
-        // With the default slip rate the mean sits just below, by exactly the
-        // residue and no more.
         let model = ErrorModel::default();
-        let counts = expected_counts(&units, &windows, &model, 5000.0);
+
+        assert_eq!(model.slip_rate, 0.0, "misses should come from the timing tail");
+
+        for &notes in &[100, 1300, 6358] {
+            let units = uniform_units(5.0, notes);
+            let counts = expected_counts(&units, &windows, &model, 5000.0);
+
+            assert!(
+                counts.get(ManiaJudgement::Miss) < 1e-9,
+                "{notes} notes predicted {} misses for a comfortable player",
+                counts.get(ManiaJudgement::Miss)
+            );
+
+            assert_eq!(
+                counts.custom_accuracy(),
+                1.0,
+                "an SS should be reachable in the mean at {notes} notes"
+            );
+        }
+    }
+
+    /// The property the flat channel could not have: a wider MISS window moves mass
+    /// back out of MISS, so EZ predicts strictly fewer misses than NM at equal skill.
+    #[test]
+    fn a_wider_miss_window_predicts_fewer_misses() {
+        let model = ErrorModel::default();
+        let units = uniform_units(5.0, 1000);
+
+        // Skill low enough that the timing tail genuinely reaches past MEH, which is
+        // the only regime where the miss count carries information.
+        let skill = 2.0;
+
+        let plain = od9_windows();
+        let widened = od9_ez_windows();
+
+        let plain_misses = expected_counts(&units, &plain, &model, skill).get(ManiaJudgement::Miss);
+        let eased = expected_counts(&units, &widened, &model, skill).get(ManiaJudgement::Miss);
 
         assert!(
-            (counts.get(ManiaJudgement::Miss) - notes as f64 * model.slip_rate).abs() < 1e-9,
-            "expected only the slip residue in misses, got {}",
-            counts.get(ManiaJudgement::Miss)
+            plain_misses > 0.0,
+            "the probe skill should produce timing misses, got {plain_misses}"
+        );
+
+        assert!(
+            eased < plain_misses,
+            "widening the miss window should reduce predicted misses: {eased} vs {plain_misses}"
         );
     }
 

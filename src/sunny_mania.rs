@@ -51,6 +51,11 @@ pub struct JsSunnyManiaDifficultyAttributes {
     /// The mods used for the calculation, kept for the performance calc.
     #[serde(skip)]
     pub(crate) mods: rosu_mods::GameMods,
+    /// The judgement windows the score will be graded against, kept for the
+    /// performance calc. Not exposed to JS: it is an implementation detail of how
+    /// mods are priced, and it is recomputed when absent.
+    #[serde(skip)]
+    pub(crate) hit_windows: crate::mania_windows::ManiaHitWindows,
 }
 
 impl From<SunnyManiaDifficultyAttributes> for JsSunnyManiaDifficultyAttributes {
@@ -65,6 +70,7 @@ impl From<SunnyManiaDifficultyAttributes> for JsSunnyManiaDifficultyAttributes {
             max_combo: attrs.max_combo,
             n_objects: attrs.n_objects as u32,
             mods: GameMods::default(),
+            hit_windows: attrs.hit_windows,
         }
     }
 }
@@ -93,6 +99,12 @@ pub struct JsSunnyManiaPerformanceAttributes {
     /// The length multiplier applied to the difficulty portion.
     #[wasm_bindgen(js_name = "lengthMultiplier", readonly)]
     pub length_multiplier: f64,
+    /// How much the judgement windows in effect changed the score's value.
+    ///
+    /// Below 1 when the score was graded through windows wider than the OD 8
+    /// reference, which is how `EZ` is priced without a mod-specific factor.
+    #[wasm_bindgen(js_name = "windowScalar", readonly)]
+    pub window_scalar: f64,
 }
 
 impl From<sunny::SunnyManiaPerformanceAttributes> for JsSunnyManiaPerformanceAttributes {
@@ -103,6 +115,7 @@ impl From<sunny::SunnyManiaPerformanceAttributes> for JsSunnyManiaPerformanceAtt
             variety_multiplier: attrs.variety_multiplier,
             acc_multiplier: attrs.acc_multiplier,
             length_multiplier: attrs.length_multiplier,
+            window_scalar: attrs.window_scalar,
         }
     }
 }
@@ -228,6 +241,16 @@ impl JsSunnyManiaPerformance {
                 self.args.mods.clone()
             };
 
+            // Attributes that came back through JS lose the window set, since it is
+            // not part of the public shape. Rebuild it from the OD-equivalent of the
+            // GREAT window that *is* carried, so a cached-attributes call prices mods
+            // the same as a from-beatmap one.
+            let hit_windows = if js_attrs.hit_windows == Default::default() {
+                crate::mania_windows::windows_from_great(js_attrs.great_hit_window)
+            } else {
+                js_attrs.hit_windows
+            };
+
             let attrs = SunnyManiaDifficultyAttributes {
                 stars: js_attrs.stars,
                 variety: js_attrs.variety,
@@ -235,6 +258,7 @@ impl JsSunnyManiaPerformance {
                 spikiness: js_attrs.spikiness,
                 switches: js_attrs.switches,
                 great_hit_window: js_attrs.great_hit_window,
+                hit_windows,
                 max_combo: js_attrs.max_combo,
                 n_objects: js_attrs.n_objects as usize,
             };
