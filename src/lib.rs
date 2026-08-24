@@ -5,6 +5,8 @@ mod deserializer;
 mod difficulty;
 mod error;
 mod gradual;
+mod mania_accuracy;
+mod mania_windows;
 mod mode;
 mod mods;
 mod performance;
