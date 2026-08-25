@@ -3297,6 +3297,172 @@ mod tests {
         }
     }
 
+    /// Not an assertion — a report. Sweeps [`ErrorModel::sigma_floor`] over the
+    /// physically motivated 1-5 ms band and prints what each value does to fit
+    /// quality *and* to pricing, on the same 20 real scores as
+    /// [`real_score_report`].
+    ///
+    /// The band comes from the client rather than from a fit: osu! judges at 1000
+    /// ticks per second, so 1 ms is a hard physical floor on the timing anyone can
+    /// resolve, and keyboard scan plus OS scheduling jitter add a few ms on top of
+    /// it. That argument is independent of the replay measurement, which is what
+    /// makes it worth testing — the replay-derived 10 ms is refuted by judgement
+    /// counts (see the `sigma_floor` docs and
+    /// `a_sigma_floor_would_forbid_scores_that_exist`) but a value in this band is
+    /// not.
+    ///
+    /// Two things are being separated here. Fit quality asks whether the floor
+    /// describes the counts better; pricing asks whether it changes any pp. They
+    /// are different questions, and the answers turn out to be "not at all" and
+    /// "yes, slightly", which is the least convenient pair.
+    ///
+    /// The result: `mean_g_timing` is *bit-identical* at 51.552835 across the whole
+    /// 0-10 ms sweep, so the judgement counts of these 20 scores cannot see the
+    /// floor at any value. It is unfittable here for the same reason `sigma_ref` is
+    /// unfittable anywhere — see the comment in the body for the quadrature
+    /// arithmetic. Meanwhile the EZ window scalar slides 0.8273 to 0.8123 and total
+    /// pp falls 2.7% at 10 ms. Within the 1-5 ms band the pricing effect is
+    /// -0.03% to -0.69%, small but not nil.
+    ///
+    /// Run with `cargo test sigma_floor_sweep -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn sigma_floor_sweep() {
+        let scores = load_real_scores();
+
+        if scores.is_empty() {
+            println!("no fixtures present; nothing to sweep");
+            return;
+        }
+
+        // The window scalar with the model's floor overridden. Mirrors
+        // `window_scalar`, which takes the default model and so cannot be pointed at
+        // a candidate.
+        let scalar_with = |score: &LoadedScore, model: &ErrorModel| {
+            let total: u32 = score.counts.iter().sum();
+            if total == 0 || score.stars <= 0.0 {
+                return 1.0;
+            }
+            let units = [JudgementUnit::repeated(score.stars, f64::from(total))];
+            let played = fit_with_quality(&score.counts, &units, &score.windows, model);
+            let reference =
+                fit_with_quality(&score.counts, &units, &REFERENCE_WINDOWS, model);
+            if played.skill <= 0.0 || reference.skill <= 0.0 {
+                return 1.0;
+            }
+            played.skill / reference.skill
+        };
+
+        // `mean_g` is printed to six decimals deliberately. The floor is very nearly
+        // a gauge parameter on this data — the fit absorbs it into skill almost
+        // exactly, the way it absorbs `sigma_ref` perfectly — and only that many
+        // digits show the residual movement at all.
+        println!(
+            "{:>6} {:>13} {:>9} {:>8} {:>8} {:>9} {:>9} {:>8}",
+            "floor", "mean_g", "median_g", "plaus", "EZ_scal", "NM_scal", "totalPP", "dPP%"
+        );
+
+        let mut baseline_pp = 0.0;
+
+        for floor in [0.0, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 10.0] {
+            let model = ErrorModel {
+                sigma_floor: floor,
+                ..ErrorModel::default()
+            };
+
+            let mut gs = Vec::new();
+            let mut ez = Vec::new();
+            let mut nm = Vec::new();
+            let mut total_pp = 0.0;
+
+            for score in &scores {
+                let total: u32 = score.counts.iter().sum();
+                let units = [JudgementUnit::repeated(score.stars, f64::from(total))];
+                let fit =
+                    fit_with_quality(&score.counts, &units, &score.windows, &model);
+                gs.push(fit.g_timing);
+
+                let scalar = scalar_with(score, &model);
+                if score.mods.contains("EZ") {
+                    ez.push(scalar);
+                } else {
+                    nm.push(scalar);
+                }
+
+                let state = SunnyScoreState {
+                    n320: score.counts[0],
+                    n300: score.counts[1],
+                    n200: score.counts[2],
+                    n100: score.counts[3],
+                    n50: score.counts[4],
+                    misses: score.counts[5],
+                };
+
+                // Everything except the scalar is floor-independent, so recomposing
+                // the difficulty value is enough to see the pp effect.
+                total_pp +=
+                    compute_difficulty_value(score.stars, custom_accuracy(state), scalar);
+            }
+
+            if baseline_pp == 0.0 {
+                baseline_pp = total_pp;
+            }
+
+            gs.sort_by(f64::total_cmp);
+            let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+
+            println!(
+                "{floor:>6.1} {:>13.6} {:>9.1} {:>8} {:>8.4} {:>9.4} {:>9.1} {:>+8.2}",
+                mean(&gs),
+                gs[gs.len() / 2],
+                gs.iter().filter(|g| **g < 30.0).count(),
+                mean(&ez),
+                mean(&nm),
+                total_pp,
+                100.0 * (total_pp / baseline_pp - 1.0),
+            );
+        }
+
+        // Why `mean_g` does not move: the counts pin *sigma*, and the fit is free to
+        // move skill, so a floor is absorbed by shrinking the skill term to keep
+        // `hypot(floor, skill_term)` where the counts want it. At a 16 ms sigma a 2 ms
+        // floor needs the skill term to fall to 15.875 ms — a 0.78% change, which
+        // skill^-1.7 supplies exactly. The floor only becomes visible once the skill
+        // term is itself small (a 2 ms floor inflates a 2 ms skill term by 41%), which
+        // is the saturating regime the ladder's `acc between 88 and 99.5` filter
+        // excludes by construction.
+        //
+        // The scalar moves anyway, and that asymmetry is the whole problem. It is a
+        // ratio of skills fitted at two *different* window sets, hence two different
+        // sigmas, and quadrature is nonlinear — the two skills do not scale by a
+        // common factor, so the ratio shifts even though every `g_timing` is
+        // unchanged. A floor is therefore unconstrained by this data while still
+        // repricing it, which is a worse position than either fitting it or leaving
+        // it out.
+
+        // The ceiling a floor imposes, which is the constraint that killed 10 ms.
+        // Independent of skill: it is what the model allows at infinite skill.
+        println!("\nmax reachable 320 share at infinite skill (OD8, 16ms PERFECT):");
+        let windows = crate::mania_windows::windows_from_great(40.0);
+        for floor in [0.0, 1.0, 2.0, 3.0, 5.0, 10.0] {
+            let model = ErrorModel {
+                sigma_floor: floor,
+                ..ErrorModel::default()
+            };
+            let units = [JudgementUnit::repeated(2.0, 1506.0)];
+            let counts = crate::mania_accuracy::expected_counts(
+                &units, &windows, &model, 1.0e4,
+            );
+            let share =
+                counts.get(crate::mania_windows::ManiaJudgement::Perfect) / 1506.0;
+            println!(
+                "  {floor:>4.1} ms -> {:>7.3}%  ({:>6.2} of 1506 notes forced off 320)",
+                share * 100.0,
+                1506.0 * (1.0 - share)
+            );
+        }
+    }
+
     #[test]
     fn classic_flag_uses_head_only_density() {
         let Some(map) = parse(MAP_1638954) else {

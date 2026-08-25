@@ -59,6 +59,19 @@ The TSV's `pp` column is the **live ppy.sb figure, from an older algorithm than 
 so treat a ratio against it as the gap between two algorithms rather than as error in
 this one.
 
+To see what a candidate `sigma_floor` would do — to fit quality and to pricing, which
+turn out to be different questions:
+
+```sh
+cargo test --release sigma_floor_sweep -- --ignored --nocapture --exact sunny::tests::sigma_floor_sweep
+```
+
+Read the two halves against each other. `mean_g` is bit-identical across the whole
+0-10 ms sweep, because the counts pin sigma and the fit absorbs any small floor into
+skill; the window scalar moves anyway, because it is a ratio of skills at two different
+sigmas and quadrature is nonlinear. The lower table is the binding constraint: a
+1506-note all-320 score allows about 2 ms and rules out 5.
+
 ## Setup
 
 ```sh

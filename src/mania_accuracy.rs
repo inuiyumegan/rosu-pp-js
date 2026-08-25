@@ -268,10 +268,12 @@ pub struct ErrorModel {
     /// player's skill exceeds the difficulty. Added in quadrature to the
     /// skill-driven term, so sigma is `hypot(sigma_floor, skill_term)`.
     ///
-    /// **Zero by default, and the reason is a genuine conflict between two
-    /// measurements.** Replays say this should be about 10 ms; judgement counts say
-    /// it cannot exceed 1.5 ms. Counts win, because they are what the model is
-    /// calibrated against and they cover the regime that decides the question.
+    /// **Zero by default for two independent reasons.** A large floor (the ~10 ms the
+    /// replays measure) is refuted outright by judgement counts, which cap it near
+    /// 2 ms. A small floor in the physically defensible 1-5 ms band survives that
+    /// test but is *unidentifiable* on the counts — the fit absorbs it into skill
+    /// exactly — while still moving the window scalar, and so pp. Both arguments are
+    /// laid out below.
     ///
     /// The replay evidence is not weak. Across 270 scores and 9 players spanning the
     /// top 6-20% and the 75-88th percentile of the ladder, on maps from 2.3 to 10.0
@@ -295,6 +297,29 @@ pub struct ErrorModel {
     /// audio offset within a map is the untested candidate, since a whole-map sd
     /// absorbs drift that no per-note model should. Until that is settled this stays
     /// zero rather than pricing scores on the disputed number.
+    ///
+    /// **A physically motivated 1-5 ms was tested separately and also stays off, for
+    /// a different reason.** The argument for it does not depend on the replays at
+    /// all: osu! judges at 1000 ticks per second, so 1 ms is a hard limit on the
+    /// timing anyone can resolve, and keyboard scan plus OS scheduling jitter add a
+    /// few ms above that. Both objections to 10 ms were checked against this band and
+    /// neither disposes of it — the counts allow up to about 2 ms
+    /// (`the_counts_bound_a_floor_near_two_milliseconds`), and de-quantising the
+    /// replays barely moves them, since subtracting a measured 14 ms frame gap in
+    /// quadrature takes mean spread from 20.51 to only 20.09 ms.
+    ///
+    /// What rules the band out is identifiability. Sweeping the floor over 0-10 ms
+    /// leaves mean `g_timing` on the 20-score fixture set *bit-identical* at
+    /// 51.552835, because the counts pin sigma while the fit is free to move skill:
+    /// a 2 ms floor at a 16 ms sigma just needs the skill term to shrink 0.78%, which
+    /// `skill^-1.7` supplies exactly. So the counts cannot see a small floor at all,
+    /// making it as unfittable as [`Self::sigma_ref`]. The window scalar moves
+    /// regardless — EZ slides 0.8273 to 0.8123 over that sweep — because it is a
+    /// ratio of skills fitted at two different sigmas and quadrature is nonlinear.
+    /// A parameter no data constrains that still reprices every score is worse than
+    /// one that is merely wrong, so it stays at zero. `sunny::tests::sigma_floor_sweep`
+    /// is the harness. Settling it needs saturating scores, where the skill term is
+    /// small enough for the floor to dominate.
     ///
     /// **Units, if it is ever set.** A replay measures the sd of the whole mixture;
     /// this is the width of the *core* component. They differ by
@@ -1260,6 +1285,64 @@ mod tests {
         assert!(
             share > 1.0 - 1e-9,
             "with no floor an all-320 score must be reachable, got {share}"
+        );
+    }
+
+    /// Where the counts actually place the ceiling, as opposed to merely rejecting
+    /// 10 ms.
+    ///
+    /// The physical argument for a small floor is sound and independent of the
+    /// replays: osu! judges at 1000 ticks per second, so 1 ms is a hard limit on the
+    /// timing anyone can resolve, and keyboard scan plus OS scheduling jitter add a
+    /// few ms above it. That reasoning suggests 1-5 ms. This pins how much of that
+    /// band the all-320 score leaves open: 1 ms costs 0.01 of 1506 notes and is
+    /// invisible, while 5 ms costs 25 notes and is refuted outright. The boundary
+    /// sits near 2 ms.
+    ///
+    /// Kept separate from [`a_sigma_floor_would_forbid_scores_that_exist`] because
+    /// that test guards the default; this one records the bound, so a future floor
+    /// has a number to respect rather than having to rediscover it.
+    #[test]
+    fn the_counts_bound_a_floor_near_two_milliseconds() {
+        let windows = od9_windows();
+        let skill = 1.0e4;
+        let units = uniform_units(2.0, 1506);
+
+        let forced_off_320 = |floor: f64| {
+            let model = ErrorModel {
+                sigma_floor: floor,
+                ..Default::default()
+            };
+            let share = expected_counts(&units, &windows, &model, skill)
+                .get(ManiaJudgement::Perfect)
+                / 1506.0;
+            1506.0 * (1.0 - share)
+        };
+
+        // A 1 ms floor is consistent with the score: it displaces a hundredth of a
+        // note, so the observation cannot argue against the physical limit itself.
+        assert!(
+            forced_off_320(1.0) < 0.1,
+            "1ms should be invisible to a 1506-note SS, got {} notes",
+            forced_off_320(1.0)
+        );
+
+        // By 5 ms it is not survivable — tens of notes would have to have missed the
+        // window, and none did.
+        assert!(
+            forced_off_320(5.0) > 20.0,
+            "5ms should be clearly refuted, got {} notes",
+            forced_off_320(5.0)
+        );
+
+        // Monotone in between, so "the bound" is a single crossing rather than a
+        // region, and 2 ms is where it starts costing whole notes.
+        assert!(forced_off_320(2.0) > forced_off_320(1.0));
+        assert!(forced_off_320(3.0) > forced_off_320(2.0));
+        assert!(
+            forced_off_320(2.0) > 1.0 && forced_off_320(2.0) < 10.0,
+            "2ms is the boundary case, got {} notes",
+            forced_off_320(2.0)
         );
     }
 
