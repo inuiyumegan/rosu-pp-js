@@ -3477,4 +3477,412 @@ mod tests {
         // plays because of the density weighting.
         assert!(stable.stars > 0.0 && lazer.stars > 0.0);
     }
+
+    /// A row of `local-fixtures/multiuser.tsv`: one real score from the prod tRPC
+    /// API, carrying enough to name the beatmap in a report as well as price it.
+    struct MultiRow {
+        uid: String,
+        map_id: String,
+        mods: String,
+        live_stars: f64,
+        keys: u32,
+        counts: [u32; 6],
+        acc: f64,
+        live_pp: f64,
+        title: String,
+        version: String,
+    }
+
+    /// One priced score: what the surface makes of a [`MultiRow`].
+    struct MultiPriced {
+        row: MultiRow,
+        stars: f64,
+        od: f32,
+        is_convert: bool,
+        before_pp: f64,
+        after_pp: f64,
+        scalar: f64,
+        skill: f64,
+        g_timing: f64,
+        plausible: bool,
+        notes: u32,
+    }
+
+    /// Reproduces the pre-change pp for one score: the flat `EZ` `0.90` that
+    /// `calculate_performance` used to apply, and no window scalar.
+    ///
+    /// Kept here rather than behind a flag in the shipping code because the old
+    /// behaviour is not something the calculator should still be able to do — the
+    /// report needs it only as a baseline to diff against. Mirrors `2c2e8a1`'s
+    /// `calculate_performance` exactly: same multiplier stack, `window_scalar` of 1.
+    fn pp_before_change(
+        attrs: &SunnyManiaDifficultyAttributes,
+        mods: &GameMods,
+        state: SunnyScoreState,
+    ) -> f64 {
+        let mut multiplier = 1.0;
+        if has_mod(mods, "NF") {
+            multiplier *= 0.75;
+        }
+        if has_mod(mods, "EZ") {
+            multiplier *= 0.90;
+        }
+
+        let score_accuracy = custom_accuracy(state);
+
+        compute_difficulty_value(attrs.stars, score_accuracy, 1.0)
+            * multiplier
+            * variety_multiplier(attrs.variety)
+            * acc_multiplier(score_accuracy, attrs.acc_scalar)
+            * length_multiplier(attrs.n_objects as f64, attrs.stars)
+    }
+
+    /// Builds the mod state for a report row from its mod-name string.
+    ///
+    /// Only mods that reach the sunny path are translated: `EZ` and `HR` scale the
+    /// windows, `NF` carries the flat factor, and `DT`/`NC`/`HT` are a clock rate
+    /// rather than a `GameMod`. `V2` and `MR` are deliberately ignored — mirror does
+    /// not change difficulty in this calculator and ScoreV2 only changes the score
+    /// number, not the judgements the surface reads.
+    fn mods_for(names: &str) -> (LazerMods, f64) {
+        let mut mods = LazerMods::new();
+        if names.contains("EZ") {
+            single_mod(&mut mods, GameMod::EasyMania(Default::default()));
+        }
+        if names.contains("HR") {
+            single_mod(&mut mods, GameMod::HardRockMania(Default::default()));
+        }
+        if names.contains("NF") {
+            single_mod(&mut mods, GameMod::NoFailMania(Default::default()));
+        }
+
+        let clock_rate = if names.contains("DT") || names.contains("NC") {
+            1.5
+        } else if names.contains("HT") {
+            0.75
+        } else {
+            1.0
+        };
+
+        (mods, clock_rate)
+    }
+
+    /// Reads `local-fixtures/multiuser.tsv` and prices every row twice.
+    fn load_multiuser() -> Vec<MultiPriced> {
+        let Ok(text) = std::fs::read_to_string("local-fixtures/multiuser.tsv") else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 18 || f[0] == "uid" {
+                continue;
+            }
+
+            let u = |s: &str| s.parse::<u32>().unwrap_or(0);
+            let row = MultiRow {
+                uid: f[0].to_owned(),
+                map_id: f[2].to_owned(),
+                mods: f[3].to_owned(),
+                live_stars: f[4].parse().unwrap_or(0.0),
+                keys: u(f[6]),
+                counts: [u(f[7]), u(f[8]), u(f[9]), u(f[10]), u(f[11]), u(f[12])],
+                acc: f[13].parse().unwrap_or(0.0),
+                live_pp: f[14].parse().unwrap_or(0.0),
+                title: f[16].to_owned(),
+                version: f[17].to_owned(),
+            };
+
+            let Some(map) = parse(&format!("local-fixtures/maps/{}.osu", row.map_id)) else {
+                continue;
+            };
+
+            let (mods, clock_rate) = mods_for(&row.mods);
+            let Some(attrs) = calculate(&map, &mods, clock_rate, Some(true), None) else {
+                continue;
+            };
+
+            let state = SunnyScoreState {
+                n320: row.counts[0],
+                n300: row.counts[1],
+                n200: row.counts[2],
+                n100: row.counts[3],
+                n50: row.counts[4],
+                misses: row.counts[5],
+            };
+
+            let perf = calculate_performance(&attrs, &mods, state);
+            let units = [JudgementUnit::repeated(
+                attrs.stars,
+                f64::from(state.total_hits()),
+            )];
+            let model = ErrorModel::default();
+            let fit = fit_with_quality(&row.counts, &units, &attrs.hit_windows, &model);
+
+            out.push(MultiPriced {
+                stars: attrs.stars,
+                od: map.od,
+                is_convert: map.is_convert,
+                before_pp: pp_before_change(&attrs, &mods, state),
+                after_pp: perf.pp,
+                scalar: perf.window_scalar,
+                skill: fit.skill,
+                g_timing: fit.g_timing,
+                plausible: fit.is_plausible(),
+                notes: state.total_hits(),
+                row,
+            });
+        }
+
+        out
+    }
+
+    /// Not an assertion — the cross-user report. Prices every score in
+    /// `local-fixtures/multiuser.tsv` under both the pre-change stack
+    /// ([`pp_before_change`]: flat `EZ` `0.90`, no window scalar) and the current one
+    /// (windows priced, no `EZ` factor), and prints them side by side.
+    ///
+    /// Why both are computed here rather than read from the API's `pp` column: live
+    /// ppy.sb runs sunny, but *a sunny predating this branch*, so its stored figure
+    /// differs from our "before" only by version drift in the difficulty calculation
+    /// itself. Recomputing the old multiplier stack against today's star ratings
+    /// isolates the change under test — the pp delta is then attributable to the
+    /// surface alone, with the live column left in as a cross-check on how far the
+    /// two sunny versions have otherwise moved.
+    ///
+    /// Usage:
+    /// `cargo test --release multiuser_report -- --ignored --nocapture --exact
+    /// sunny::tests::multiuser_report`
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn multiuser_report() {
+        use std::collections::BTreeMap;
+
+        let scores = load_multiuser();
+        if scores.is_empty() {
+            println!("no fixtures present (local-fixtures/multiuser.tsv); nothing to report");
+            return;
+        }
+
+        let mut by_uid: BTreeMap<&str, Vec<&MultiPriced>> = BTreeMap::new();
+        for s in &scores {
+            by_uid.entry(s.row.uid.as_str()).or_default().push(s);
+        }
+
+        for (uid, rows) in &by_uid {
+            let mut rows = rows.clone();
+            rows.sort_by(|a, b| b.after_pp.total_cmp(&a.after_pp));
+
+            println!("\n=== uid {uid} ({} scores)", rows.len());
+            println!(
+                "{:>8} {:>9} {:>4} {:>4} {:>4} {:>6} {:>6} {:>6} {:>26} {:>7} {:>8} {:>8} {:>8} {:>7} {:>7} {:>6} {:>5}",
+                "map", "mods", "k", "od", "cvt", "our*", "live*", "notes",
+                "320/300/200/100/50/miss", "acc%", "livePP", "beforePP", "afterPP",
+                "d%", "scalar", "skill", "plaus"
+            );
+
+            for r in &rows {
+                let delta = if r.before_pp > 0.0 {
+                    (r.after_pp / r.before_pp - 1.0) * 100.0
+                } else {
+                    0.0
+                };
+                let composition = format!(
+                    "{}/{}/{}/{}/{}/{}",
+                    r.row.counts[0],
+                    r.row.counts[1],
+                    r.row.counts[2],
+                    r.row.counts[3],
+                    r.row.counts[4],
+                    r.row.counts[5]
+                );
+                println!(
+                    "{:>8} {:>9} {:>4} {:>4} {:>4} {:>6.2} {:>6.2} {:>6} {:>26} {:>7.3} {:>8.1} {:>8.1} {:>8.1} {:>+7.2} {:>7.4} {:>6.2} {:>5}",
+                    r.row.map_id,
+                    r.row.mods,
+                    r.row.keys,
+                    r.od,
+                    r.is_convert,
+                    r.stars,
+                    r.row.live_stars,
+                    r.notes,
+                    composition,
+                    r.row.acc,
+                    r.row.live_pp,
+                    r.before_pp,
+                    r.after_pp,
+                    delta,
+                    r.scalar,
+                    r.skill,
+                    r.plausible
+                );
+            }
+
+            // Titles are printed separately: they are far too wide for the numeric
+            // table but are what makes a row identifiable to a human.
+            println!("  beatmaps:");
+            for r in rows.iter().take(8) {
+                println!(
+                    "    {:>8}  {} [{}]",
+                    r.row.map_id,
+                    truncate(&r.row.title, 52),
+                    truncate(&r.row.version, 34)
+                );
+            }
+            if rows.len() > 8 {
+                println!("    ... and {} more", rows.len() - 8);
+            }
+
+            summarise_group(&format!("uid {uid} total"), &rows);
+        }
+
+        let all: Vec<&MultiPriced> = scores.iter().collect();
+
+        println!("\n=== overall ({} scores, {} users)", all.len(), by_uid.len());
+        summarise_group("all", &all);
+
+        // Split by whether the mod set touches the hit windows. This is the axis the
+        // change acts on: EZ/HR scale the windows and so move the scalar, while
+        // DT/MR/V2/NF leave them at the map's own values and can only move through
+        // OD's distance from the OD-8 reference.
+        println!("\nby window-affecting mod:");
+        type Pred = fn(&&MultiPriced) -> bool;
+        for (label, pred) in [
+            ("EZ (windows widened)", (|r| r.row.mods.contains("EZ")) as Pred),
+            ("HR (windows narrowed)", |r| r.row.mods.contains("HR")),
+            ("no window mod", |r| {
+                !r.row.mods.contains("EZ") && !r.row.mods.contains("HR")
+            }),
+        ] {
+            let group: Vec<&MultiPriced> = all.iter().copied().filter(pred).collect();
+            summarise_group(label, &group);
+        }
+
+        // OD bands, for the no-window-mod scores only: there the scalar is OD alone,
+        // so this is the cleanest read on how much the OD-8 reference choice costs or
+        // pays an ordinary score.
+        println!("\nno-window-mod scores by OD (scalar is OD alone here):");
+        let plain: Vec<&MultiPriced> = all
+            .iter()
+            .copied()
+            .filter(|r| !r.row.mods.contains("EZ") && !r.row.mods.contains("HR"))
+            .collect();
+        for (lo, hi) in [(0.0, 7.0), (7.0, 7.9), (7.9, 8.1), (8.1, 8.9), (8.9, 11.0)] {
+            let band: Vec<&MultiPriced> = plain
+                .iter()
+                .copied()
+                .filter(|r| f64::from(r.od) >= lo && f64::from(r.od) < hi)
+                .collect();
+            if band.is_empty() {
+                continue;
+            }
+            let n = band.len() as f64;
+            let scalars: Vec<f64> = band.iter().map(|r| r.scalar).collect();
+            println!(
+                "  OD {lo:>4.1}-{hi:<4.1} n={:<4} mean scalar {:.4} ({:.4}..{:.4})  mean dPP {:+.2}%",
+                band.len(),
+                scalars.iter().sum::<f64>() / n,
+                scalars.iter().copied().fold(f64::INFINITY, f64::min),
+                scalars.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                band.iter()
+                    .map(|r| (r.after_pp / r.before_pp - 1.0) * 100.0)
+                    .sum::<f64>()
+                    / n
+            );
+        }
+
+        // Key count, which turns out to matter far more than it looks like it should.
+        // It is not that the surface treats 4k and 7k differently — it does not know
+        // the key count at all — but that the two populations chart at different OD,
+        // so a single OD reference lands very differently on each.
+        println!("\nby key count (the surface never reads keys; this is OD convention):");
+        for keys in [4u32, 5, 6, 7, 8, 9, 10] {
+            let band: Vec<&MultiPriced> =
+                all.iter().copied().filter(|r| r.row.keys == keys).collect();
+            if band.is_empty() {
+                continue;
+            }
+            let n = band.len() as f64;
+            let mean_od = band.iter().map(|r| f64::from(r.od)).sum::<f64>() / n;
+            summarise_group(&format!("{keys}k (mean OD {mean_od:.1})"), &band);
+        }
+
+        // Our star rating against the live server's, which is the other half of the
+        // gap between `beforePP` and the `livePP` column: the two sunny versions
+        // disagree on difficulty as well as on the multiplier stack.
+        let drift: Vec<f64> = all
+            .iter()
+            .filter(|r| r.row.live_stars > 0.0)
+            .map(|r| r.stars / r.row.live_stars)
+            .collect();
+        if !drift.is_empty() {
+            let n = drift.len() as f64;
+            let mut sorted = drift.clone();
+            sorted.sort_by(f64::total_cmp);
+            println!(
+                "\nstar rating ours/live: mean {:.4} median {:.4} range {:.3}..{:.3} (n={})",
+                drift.iter().sum::<f64>() / n,
+                sorted[sorted.len() / 2],
+                sorted[0],
+                sorted[sorted.len() - 1],
+                sorted.len()
+            );
+            println!(
+                "  (live runs a sunny predating this branch, so this is version drift in the \
+                 difficulty calc, not the change under test)"
+            );
+        }
+
+        let mut g: Vec<f64> = all.iter().map(|r| r.g_timing).collect();
+        g.sort_by(f64::total_cmp);
+        println!(
+            "\nfit quality: g_timing median {:.1} p90 {:.1}, plausible {}/{}",
+            g[g.len() / 2],
+            g[g.len() * 9 / 10],
+            all.iter().filter(|r| r.plausible).count(),
+            all.len()
+        );
+    }
+
+    /// Clip a title to `n` chars on a char boundary, since beatmap metadata is
+    /// routinely CJK and byte slicing would panic.
+    fn truncate(s: &str, n: usize) -> String {
+        if s.chars().count() <= n {
+            return s.to_owned();
+        }
+        s.chars().take(n.saturating_sub(1)).collect::<String>() + "…"
+    }
+
+    /// Mean before/after pp and scalar for a set of priced scores, plus what the same
+    /// set would look like as a weighted bonus-free pp total.
+    fn summarise_group(label: &str, rows: &[&MultiPriced]) {
+        if rows.is_empty() {
+            return;
+        }
+
+        let n = rows.len() as f64;
+        let before: f64 = rows.iter().map(|r| r.before_pp).sum();
+        let after: f64 = rows.iter().map(|r| r.after_pp).sum();
+        let mean_scalar = rows.iter().map(|r| r.scalar).sum::<f64>() / n;
+        let plausible = rows.iter().filter(|r| r.plausible).count();
+
+        // The per-score mean delta and the aggregate delta answer different
+        // questions: the first weights every score equally, the second weights by pp
+        // and so is what a player's top-play total actually moves by.
+        let mean_delta = rows
+            .iter()
+            .filter(|r| r.before_pp > 0.0)
+            .map(|r| (r.after_pp / r.before_pp - 1.0) * 100.0)
+            .sum::<f64>()
+            / n;
+
+        let n_rows = rows.len();
+        let sum_delta = (after / before - 1.0) * 100.0;
+        println!(
+            "  {label}: n={n_rows} mean scalar {mean_scalar:.4}  mean dPP {mean_delta:+.2}%  \
+             sum {before:.0} -> {after:.0} ({sum_delta:+.2}%)  plausible {plausible}/{n_rows}"
+        );
+    }
 }
