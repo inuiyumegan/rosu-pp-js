@@ -2643,6 +2643,49 @@ mod tests {
         );
     }
 
+    /// Not an assertion — prints sunny's own star rating for every map named in a
+    /// ladder TSV, so a fit against replay-measured sigma can use the difficulty the
+    /// model actually grades on.
+    ///
+    /// `tools/fetch_ladder.sh` selects on bancho.py's stored `maps.diff`, which is a
+    /// *different* difficulty calculation. That is fine for choosing a spread of maps
+    /// but wrong to regress against: the exponent in
+    /// `sigma = sigma_ref * ((d + floor)/skill)^skill_exponent` is only meaningful in
+    /// the units `d` is expressed in. Reads map ids from stdin, one per line.
+    ///
+    /// Run with
+    /// `cut -f4 local-fixtures/ladder.tsv | tail -n +2 | cargo test ladder_stars --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn ladder_stars() {
+        use std::io::BufRead as _;
+
+        println!("map_id,stars,od,keys,is_convert");
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            let id = line.trim();
+            if id.is_empty() || id == "mapid" {
+                continue;
+            }
+            let path = format!("local-fixtures/maps/{id}.osu");
+            let Some(map) = parse(&path) else {
+                eprintln!("skip {id}: cannot parse");
+                continue;
+            };
+            // No mods and rate 1.0: the ladder is deliberately no-mod/NF only, so the
+            // windows and note timings are the map's own.
+            let Some(attrs) = calculate(&map, &GameMods::default(), 1.0, Some(false), None) else {
+                eprintln!("skip {id}: not a mania map");
+                continue;
+            };
+            println!(
+                "{id},{:.4},{},{},{}",
+                attrs.stars, map.od, map.cs as u32, map.is_convert
+            );
+        }
+    }
+
     /// Not an assertion — dumps the surface to CSV under `target/surface/` so it can
     /// be plotted. Three files, each a different slice of the same object:
     ///

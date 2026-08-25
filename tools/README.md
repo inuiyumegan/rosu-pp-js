@@ -1,8 +1,41 @@
 # tools
 
-Visualisers for the osu!mania accuracy surface. Neither is part of the build; both
-read CSVs produced by `#[ignore]`d tests in `src/sunny.rs` and write into
-`target/surface/`, which is gitignored.
+Visualisers and measurement harnesses for the osu!mania accuracy surface. None are part
+of the build. The visualisers read CSVs produced by `#[ignore]`d tests in `src/sunny.rs`
+and write into `target/surface/`, which is gitignored.
+
+## Fixture fetchers
+
+Both write into `local-fixtures/` (gitignored — not redistributable, not needed to
+build) and need the bancho.py MySQL container reachable.
+
+- `fetch_batch.sh` — scores ranked by pp across players, with an EZ cohort and a no-mod
+  control. The set the mod response was measured on.
+- `fetch_ladder.sh` — *difficulty ladders*: many scores from one player inside one
+  quarter, stratified across star rating. `fetch_batch.sh` cannot fit sigma's difficulty
+  response because it returns roughly one score per player, and the error model has one
+  free skill each; a ladder holds skill roughly fixed while difficulty sweeps.
+
+```sh
+tools/fetch_ladder.sh 30                            # 4 default cohorts x 30 scores
+tools/fetch_ladder.sh 30 4616:2023:3                # userid:year:quarter
+tools/parse_replay.py --batch local-fixtures/ladder.tsv --json local-fixtures/ladder-errors.json
+```
+
+`parse_replay.py` turns `.osr` replays into per-note hit errors, which measures a
+player's timing sigma directly instead of inferring it from judgement counts. Its
+`--verify` mode recomputes judgements and diffs them against the server's stored counts;
+that is the correctness check on the whole pipeline. See the module docstring, which
+records which pairing rules were tested and rejected.
+
+Fit against sunny's own star ratings, not bancho's stored `maps.diff` — the two are
+different calculations (`log`-`log` slope 0.78), and an exponent is only meaningful in
+the units its difficulty is expressed in:
+
+```sh
+cut -f4 local-fixtures/ladder.tsv | tail -n +2 | sort -u \
+  | cargo test --release ladder_stars -- --ignored --nocapture --exact sunny::tests::ladder_stars
+```
 
 ## Setup
 
