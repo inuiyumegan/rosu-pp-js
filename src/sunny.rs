@@ -2686,6 +2686,197 @@ mod tests {
         }
     }
 
+    /// Prices every score in a ladder TSV and reports what the surface says about it.
+    ///
+    /// The point of difference from [`real_score_report`] is coverage: that set is 20
+    /// scores chosen to be EZ-heavy, all from strong players on 8-13 star maps, which
+    /// is the right shape for reading the mod response and the wrong shape for
+    /// checking whether the fit behaves across the population. This reads the ladder
+    /// fixtures instead — 270 no-mod scores, 9 players in two disjoint skill bands,
+    /// 2.3 to 10.0 stars — and groups by player so the skill estimate can be seen
+    /// tracking difficulty within one person rather than across a mixed field.
+    ///
+    /// The `pp` column in the TSV comes from the live ppy.sb server, which runs an
+    /// older algorithm and not sunny, so it is reported as context rather than as a
+    /// target: a ratio against it measures the gap between two algorithms and not the
+    /// error in this one.
+    ///
+    /// Usage:
+    /// `cargo test --release ladder_report -- --ignored --nocapture --exact
+    /// sunny::tests::ladder_report < local-fixtures/ladder.tsv`
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn ladder_report() {
+        use crate::mania_accuracy::skill_for_counts;
+        use std::collections::BTreeMap;
+        use std::io::BufRead as _;
+
+        struct Row {
+            stars: f64,
+            od: f32,
+            acc: f64,
+            live_pp: f64,
+            our_pp: f64,
+            skill: f64,
+            scalar: f64,
+            g_timing: f64,
+            plausible: bool,
+            notes: u32,
+        }
+
+        let mut by_player: BTreeMap<String, Vec<Row>> = BTreeMap::new();
+        let mut skipped = 0usize;
+
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            let fields: Vec<&str> = line.trim_end().split('\t').collect();
+            if fields.len() < 16 || fields[0] == "cohort" {
+                continue;
+            }
+
+            let parse_u32 = |s: &str| s.parse::<u32>().unwrap_or(0);
+            let state = SunnyScoreState {
+                n320: parse_u32(fields[10]),
+                n300: parse_u32(fields[11]),
+                n200: parse_u32(fields[12]),
+                n100: parse_u32(fields[13]),
+                n50: parse_u32(fields[14]),
+                misses: parse_u32(fields[15]),
+            };
+
+            let path = format!("local-fixtures/maps/{}.osu", fields[3]);
+            let Some(map) = parse(&path) else {
+                skipped += 1;
+                continue;
+            };
+            // The ladder is no-mod/NF only by construction, so no window or rate mods
+            // apply and the map's own timings are the right ones.
+            let Some(attrs) = calculate(&map, &GameMods::default(), 1.0, Some(false), None) else {
+                skipped += 1;
+                continue;
+            };
+
+            let perf = calculate_performance(&attrs, &GameMods::default(), state);
+            let counts = [
+                state.n320,
+                state.n300,
+                state.n200,
+                state.n100,
+                state.n50,
+                state.misses,
+            ];
+            let units = [JudgementUnit::repeated(
+                attrs.stars,
+                f64::from(state.total_hits()),
+            )];
+            let model = ErrorModel::default();
+            let fit = fit_with_quality(&counts, &units, &attrs.hit_windows, &model);
+
+            by_player.entry(fields[0].to_owned()).or_default().push(Row {
+                stars: attrs.stars,
+                od: map.od,
+                acc: fields[8].parse().unwrap_or(0.0),
+                live_pp: fields[9].parse().unwrap_or(0.0),
+                our_pp: perf.pp,
+                skill: skill_for_counts(&counts, &units, &attrs.hit_windows, &model),
+                scalar: perf.window_scalar,
+                g_timing: fit.g_timing,
+                plausible: fit.is_plausible(),
+                notes: state.total_hits(),
+            });
+        }
+
+        if by_player.is_empty() {
+            println!("no rows read; pipe a ladder TSV on stdin");
+            return;
+        }
+
+        let mut all: Vec<&Row> = Vec::new();
+
+        for (player, rows) in &by_player {
+            let mut rows: Vec<&Row> = rows.iter().collect();
+            rows.sort_by(|a, b| a.stars.total_cmp(&b.stars));
+
+            println!("\n=== player {player} ({} scores)", rows.len());
+            println!(
+                "{:>6} {:>4} {:>6} {:>7} {:>8} {:>8} {:>7} {:>7} {:>9} {:>6}",
+                "stars", "od", "notes", "acc%", "livePP", "ourPP", "skill", "sk/st", "g_timing",
+                "plaus"
+            );
+
+            // Every third row: the shape across difficulty is the point, and 30 lines
+            // per player would bury it.
+            for row in rows.iter().step_by(3) {
+                println!(
+                    "{:>6.2} {:>4.1} {:>6} {:>7.3} {:>8.1} {:>8.1} {:>7.2} {:>7.2} {:>9.1} {:>6}",
+                    row.stars,
+                    row.od,
+                    row.notes,
+                    row.acc,
+                    row.live_pp,
+                    row.our_pp,
+                    row.skill,
+                    row.skill / row.stars,
+                    row.g_timing,
+                    row.plausible
+                );
+            }
+
+            let mean = |f: &dyn Fn(&Row) -> f64| -> f64 {
+                rows.iter().map(|r| f(r)).sum::<f64>() / rows.len() as f64
+            };
+            println!(
+                "  mean skill {:.2}, mean skill/stars {:.2}, plausible {}/{}",
+                mean(&|r| r.skill),
+                mean(&|r| r.skill / r.stars),
+                rows.iter().filter(|r| r.plausible).count(),
+                rows.len()
+            );
+
+            all.extend(rows);
+        }
+
+        println!("\n=== overall ({} scores, {skipped} skipped)", all.len());
+
+        let scalars: Vec<f64> = all.iter().map(|r| r.scalar).collect();
+        let lo = scalars.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = scalars.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        println!(
+            "window scalar: {lo:.4}..{hi:.4} (no-mod, so departures from 1 are OD alone)"
+        );
+
+        let plausible = all.iter().filter(|r| r.plausible).count();
+        println!(
+            "plausible: {plausible}/{} ({:.0}%)",
+            all.len(),
+            100.0 * plausible as f64 / all.len() as f64
+        );
+
+        let mut g: Vec<f64> = all.iter().map(|r| r.g_timing).collect();
+        g.sort_by(f64::total_cmp);
+        println!(
+            "g_timing median {:.1}, p90 {:.1}",
+            g[g.len() / 2],
+            g[g.len() * 9 / 10]
+        );
+
+        // Does the fit place players consistently? Within one player, skill should be
+        // roughly flat across difficulty; a trend means the exponent is off.
+        println!("\nskill/stars by star band (flat = the exponent is right):");
+        for (lo, hi) in [(2.0, 4.0), (4.0, 6.0), (6.0, 8.0), (8.0, 11.0)] {
+            let band: Vec<&&Row> = all
+                .iter()
+                .filter(|r| r.stars >= lo && r.stars < hi)
+                .collect();
+            if band.is_empty() {
+                continue;
+            }
+            let ratio =
+                band.iter().map(|r| r.skill / r.stars).sum::<f64>() / band.len() as f64;
+            println!("  {lo:>4.1}-{hi:<4.1} n={:<4} mean skill/stars {ratio:.3}", band.len());
+        }
+    }
+
     /// Not an assertion — dumps the surface to CSV under `target/surface/` so it can
     /// be plotted. Three files, each a different slice of the same object:
     ///

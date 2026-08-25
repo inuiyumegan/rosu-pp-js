@@ -22,6 +22,16 @@ tools/fetch_ladder.sh 30 4616:2023:3                # userid:year:quarter
 tools/parse_replay.py --batch local-fixtures/ladder.tsv --json local-fixtures/ladder-errors.json
 ```
 
+`fetch_ladder.sh` always writes `local-fixtures/ladder.tsv`, so **fetching a second
+cohort overwrites the first** — rename the file after each run if you want more than one
+skill band. The TSV is reconstructable from a `--json` dump if it is lost, since that
+carries the count vector and the DB columns.
+
+Note that a ladder deliberately excludes saturating scores (`acc between 88 and 99.5`),
+which makes it the wrong set for anything about the clean end of the surface: see
+`ErrorModel::sigma_floor`, where a replay-measured floor turned out to be contradicted by
+the judgement counts of near-perfect scores the ladder never sampled.
+
 `parse_replay.py` turns `.osr` replays into per-note hit errors, which measures a
 player's timing sigma directly instead of inferring it from judgement counts. Its
 `--verify` mode recomputes judgements and diffs them against the server's stored counts;
@@ -36,6 +46,18 @@ the units its difficulty is expressed in:
 cut -f4 local-fixtures/ladder.tsv | tail -n +2 | sort -u \
   | cargo test --release ladder_stars -- --ignored --nocapture --exact sunny::tests::ladder_stars
 ```
+
+To see what the surface makes of a ladder — fitted skill, window scalar, fit quality,
+grouped per player and summarised by star band:
+
+```sh
+cat local-fixtures/ladder-*.tsv \
+  | cargo test --release ladder_report -- --ignored --nocapture --exact sunny::tests::ladder_report
+```
+
+The TSV's `pp` column is the **live ppy.sb figure, from an older algorithm than sunny**,
+so treat a ratio against it as the gap between two algorithms rather than as error in
+this one.
 
 ## Setup
 

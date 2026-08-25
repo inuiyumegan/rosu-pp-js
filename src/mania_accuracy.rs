@@ -222,6 +222,24 @@
 //! scalar answers a window change, fitting it here would reset the entire mod response
 //! on the strength of one player's idiosyncrasy. It needs a spread of skill levels.
 //!
+//! A wider set was since measured directly — 270 replays, 9 players, two disjoint
+//! skill bands, 2.3 to 10.0 stars — and it still does not pin the exponent. Profiling
+//! it against measured timing spread is nearly flat between 1.0 and 1.7 (RMS 2.30 vs
+//! 2.31 ms) once [`ErrorModel::sigma_floor`] is in place, and it is the floor rather
+//! than the exponent that the low-difficulty data actually constrains. Fitting the two
+//! together without a floor returns an exponent near 0.8, which is floor absorption:
+//! the flat easy end gets read as a weak power law. So the exponent stays at 1.7 and
+//! the honest statement is that this data bounds it loosely, not that it confirms it.
+//! Pinning it needs scores well past 10 stars, where the predicted spreads separate.
+//!
+//! **Replays are a cross-check, not the primary instrument.** Each one measures a
+//! single player-session, sampled at the client's frame rate — a 60 fps replay
+//! quantises every hit to ~17 ms bins, injecting `gap/sqrt(12)` ≈ 4.9 ms of noise
+//! that has to be removed in quadrature before a spread means anything. They are the
+//! right tool for testing what the counts-based fit infers, which is how both the
+//! floor and the sigma-dependent tail below were found. Judgement counts across many
+//! scores remain what the model is calibrated on.
+//!
 //! So the calibrated quantities are the two shape parameters, and what they are fitted
 //! to is the *shape* of the residual — the absolute quality of the fit, which is why
 //! [`FitQuality::is_plausible`] is the right objective here even though it is the wrong
@@ -246,6 +264,44 @@ pub struct ErrorModel {
     pub skill_exponent: f64,
     /// Added to local difficulty so that easy patterns are not perfectly free.
     pub difficulty_floor: f64,
+    /// The irreducible timing error, in ms, that remains no matter how far a
+    /// player's skill exceeds the difficulty. Added in quadrature to the
+    /// skill-driven term, so sigma is `hypot(sigma_floor, skill_term)`.
+    ///
+    /// **Zero by default, and the reason is a genuine conflict between two
+    /// measurements.** Replays say this should be about 10 ms; judgement counts say
+    /// it cannot exceed 1.5 ms. Counts win, because they are what the model is
+    /// calibrated against and they cover the regime that decides the question.
+    ///
+    /// The replay evidence is not weak. Across 270 scores and 9 players spanning the
+    /// top 6-20% and the 75-88th percentile of the ladder, on maps from 2.3 to 10.0
+    /// sunny stars, measured timing spread flattens out at the easy end exactly as a
+    /// floor predicts: holding [`Self::skill_exponent`] at 1.7, introducing a floor
+    /// cuts residual spread from 3.45 to 2.26 ms RMS, per-player fits land in a tight
+    /// 9.5-14.5 ms band while fitted skill ranges over 5.0-13.5, and quadrature fits
+    /// as well as a hard `max` (2.25 vs 2.22 ms) while staying differentiable.
+    ///
+    /// It is nonetheless refuted by counts. The PERFECT window is 16.5 ms at OD 8, so
+    /// a floor caps the achievable 320 share: at 10 ms no score can exceed 87%, and
+    /// even 1.5 ms is set by a real 1506-note score judged entirely 320. Inverting
+    /// the cleanest live no-mod scores through the mixture gives core sigma bounds of
+    /// 1.5-3.3 ms, an order of magnitude under the replay figure.
+    ///
+    /// The two datasets do not overlap, which is how both can be internally
+    /// consistent: the replay ladder was selected at `acc between 88 and 99.5`, so it
+    /// never sampled a saturating score, and a floor only binds where scores
+    /// saturate. Something inflates measured replay spread at the low end — frame
+    /// quantisation contributes ~4.9 ms at 60 fps but not the rest, and drifting
+    /// audio offset within a map is the untested candidate, since a whole-map sd
+    /// absorbs drift that no per-note model should. Until that is settled this stays
+    /// zero rather than pricing scores on the disputed number.
+    ///
+    /// **Units, if it is ever set.** A replay measures the sd of the whole mixture;
+    /// this is the width of the *core* component. They differ by
+    /// `sqrt((1 - lapse_weight) + lapse_weight * lapse_ratio^2)` ≈ 1.27 at the
+    /// default shape, so a measured 13 ms of spread means 10 ms here. Reading a
+    /// measured sd straight in would overstate it by 27%.
+    pub sigma_floor: f64,
     /// The share of notes hit from the wide "lapse" component rather than the
     /// narrow "locked in" one.
     ///
@@ -301,6 +357,7 @@ impl Default for ErrorModel {
             sigma_ref: 18.0,
             skill_exponent: 1.7,
             difficulty_floor: 0.6,
+            sigma_floor: 0.0,
             lapse_weight: 0.034,
             lapse_ratio: 4.4,
             slip_rate: 0.0,
@@ -322,8 +379,12 @@ impl ErrorModel {
         }
 
         let ratio = (difficulty.max(0.0) + self.difficulty_floor) / skill;
+        let skill_term = self.sigma_ref * ratio.powf(self.skill_exponent);
 
-        self.sigma_ref * ratio.powf(self.skill_exponent)
+        // Quadrature, not `max`: the floor is an independent noise source (input
+        // latency jitter, scan-out timing, the hand itself) so it adds in variance,
+        // and the smooth join keeps the curve differentiable for the fit.
+        self.sigma_floor.max(0.0).hypot(skill_term)
     }
 
     /// The probability that the error on a single note exceeds `bound` in absolute
@@ -1158,6 +1219,48 @@ mod tests {
 
             previous = accuracy;
         }
+    }
+
+    /// The floor is off by default and this is why: a real 1506-note score was judged
+    /// entirely 320, and any meaningful floor makes that impossible regardless of
+    /// skill. Guards the replay-measured 10 ms from being reintroduced as a default.
+    #[test]
+    fn a_sigma_floor_would_forbid_scores_that_exist() {
+        let windows = od9_windows();
+
+        assert_eq!(
+            ErrorModel::default().sigma_floor,
+            0.0,
+            "the floor must stay off until the replay/counts conflict is resolved"
+        );
+
+        // Skill far past anything a player reaches, so only the floor can limit the
+        // predicted 320 share.
+        let skill = 1.0e4;
+        let units = uniform_units(2.0, 1506);
+
+        let floored = ErrorModel {
+            sigma_floor: 10.0,
+            ..Default::default()
+        };
+        let share = expected_counts(&units, &windows, &floored, skill)
+            .get(ManiaJudgement::Perfect)
+            / 1506.0;
+
+        assert!(
+            share < 0.9,
+            "a 10ms floor should cap the 320 share well under an SS, got {share}"
+        );
+
+        // Without it the same score is reachable, which is what the counts require.
+        let share = expected_counts(&units, &windows, &ErrorModel::default(), skill)
+            .get(ManiaJudgement::Perfect)
+            / 1506.0;
+
+        assert!(
+            share > 1.0 - 1e-9,
+            "with no floor an all-320 score must be reachable, got {share}"
+        );
     }
 
     #[test]
