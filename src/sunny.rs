@@ -5870,6 +5870,35 @@ mod tests {
     /// slope may just be picking up difficulty misestimation in general rather than
     /// collision specifically.
     ///
+    /// Running those two univariate regressions side by side is not enough to settle
+    /// that, though: collision share and star rating both track map style (denser,
+    /// jack-heavy charts tend to run both higher collision and higher stars), so
+    /// whichever trend stars is really carrying will partly load onto the collision
+    /// coefficient when the two are fit separately, and vice versa. The fix is a
+    /// two-variable OLS on the same within-player-demeaned pool — x1 = collision share,
+    /// x2 = stars, y = skill, all demeaned against their own player's mean — solved by
+    /// hand via the 2x2 normal equations rather than a matrix library, the direct
+    /// generalisation of the univariate case's OLS-through-the-origin. It is printed
+    /// alongside the univariate numbers, for both (a) all scores and (b) the
+    /// no-window-mod subset, so the shift from univariate to joint is visible rather
+    /// than replacing the old numbers outright. The correlation between the two
+    /// demeaned regressors is printed with it, because that correlation is the real
+    /// diagnostic: if it is high, the joint fit cannot actually separate the two
+    /// effects, and both coefficients should be read as unstable rather than trusted at
+    /// face value just because the arithmetic produced a number.
+    ///
+    /// The stars trend is also worth characterising on its own, separately from
+    /// collision entirely. `sigma = sigma_ref * ((d + difficulty_floor) / skill)^
+    /// skill_exponent` means a mis-set `skill_exponent` will make fitted skill drift
+    /// with local difficulty *by construction*, for reasons that have nothing to do
+    /// with collisions — so a stars trend is exactly the symptom a wrong exponent would
+    /// produce. Below, the pooled skill-vs-stars relationship is broken out per player
+    /// and star-rating bin to see whether it is monotone or driven by one bin, and then
+    /// the no-window-mod joint regression is re-run under [`ErrorModel::default`] with
+    /// `skill_exponent` swept over 1.3-2.1 around the shipped 1.7, to see whether some
+    /// other exponent would flatten the stars coefficient toward zero on this fixture
+    /// set.
+    ///
     /// A second confound, caught only after the pooled estimate above was written: uid
     /// 10107 (documented at the `REAL_SCORES` fixture above as an "EZ pp exploiter") runs
     /// most of their scores under `EZ`, which multiplies hit windows — and therefore the
@@ -5913,6 +5942,12 @@ mod tests {
             /// which makes the no-mod `collision_share` an understatement (`EZ`) or
             /// overstatement (`HR`) of the score's true collision exposure.
             window_mod: bool,
+            /// The map id and raw judgement counts, kept only so the `skill_exponent`
+            /// sweep below can refit this score's skill under a non-default
+            /// `ErrorModel` without re-reading `local-fixtures/multiuser.tsv`.
+            map_id: String,
+            mods: String,
+            counts: [u32; 6],
         }
 
         let mut cache: HashMap<String, Option<GapShape>> = HashMap::new();
@@ -5937,7 +5972,25 @@ mod tests {
                 stars: s.stars,
                 skill: s.skill,
                 window_mod: s.row.mods.contains("EZ") || s.row.mods.contains("HR"),
+                map_id: s.row.map_id.clone(),
+                mods: s.row.mods.clone(),
+                counts: s.row.counts,
             });
+        }
+
+        // Refit a point's skill from scratch under `model` instead of the default used
+        // by `load_multiuser`. Re-parses the map and recomputes mods/attrs rather than
+        // reusing anything cached on `MultiPriced`, since that struct only ever holds
+        // the default-model fit. Mirrors `load_multiuser`'s own calculate -> units ->
+        // fit_with_quality pipeline exactly, so the only thing that changes is `model`.
+        fn refit_skill(point: &Point, model: &ErrorModel) -> Option<f64> {
+            let map = parse(&format!("local-fixtures/maps/{}.osu", point.map_id))?;
+            let (mods, clock_rate) = mods_for(&point.mods);
+            let attrs = calculate(&map, &mods, clock_rate, Some(false), None)?;
+            let total = point.counts.iter().sum::<u32>();
+            let units = judgement_units(&attrs, f64::from(total), model);
+            let fit = fit_with_quality(&point.counts, &units, &attrs.hit_windows, model);
+            (fit.skill > 0.0).then_some(fit.skill)
         }
 
         if points.is_empty() {
@@ -6000,6 +6053,94 @@ mod tests {
             Some((slope, se, t, n, n_players))
         }
 
+        struct JointFit {
+            b1: f64,
+            se1: f64,
+            t1: f64,
+            b2: f64,
+            se2: f64,
+            t2: f64,
+            /// Correlation between the demeaned regressors, `S12 / sqrt(S11 * S22)`.
+            /// The diagnostic that matters most: if this is large, `b1` and `b2`
+            /// cannot be trusted individually no matter how big their `t` looks,
+            /// because the two regressors barely vary independently once the
+            /// player mean is taken out.
+            corr: f64,
+            n: usize,
+            n_players: usize,
+        }
+
+        // Two-variable within-player (fixed-effects) OLS of `y` on `x1` and `x2`
+        // jointly, by demeaning each of the three series against its own player's mean
+        // and solving the pooled 2x2 normal equations by hand (see the doc comment
+        // above for why this is needed rather than the two univariate fits above).
+        // Takes `(x1, x2, y)` triples per player directly rather than `&Point`, so the
+        // `skill_exponent` sweep below can reuse it with refit skills as `y` without
+        // constructing throwaway `Point`s.
+        fn pooled_joint(by_uid: &BTreeMap<&str, Vec<(f64, f64, f64)>>) -> Option<JointFit> {
+            let mut demeaned: Vec<(f64, f64, f64)> = Vec::new();
+            let mut n_players = 0;
+
+            for rows in by_uid.values() {
+                if rows.len() < 2 {
+                    continue;
+                }
+                n_players += 1;
+
+                let n = rows.len() as f64;
+                let mean_x1 = rows.iter().map(|(x1, _, _)| x1).sum::<f64>() / n;
+                let mean_x2 = rows.iter().map(|(_, x2, _)| x2).sum::<f64>() / n;
+                let mean_y = rows.iter().map(|(_, _, y)| y).sum::<f64>() / n;
+
+                for (x1, x2, y) in rows {
+                    demeaned.push((x1 - mean_x1, x2 - mean_x2, y - mean_y));
+                }
+            }
+
+            let n = demeaned.len();
+            let s11: f64 = demeaned.iter().map(|(x1, _, _)| x1 * x1).sum();
+            let s22: f64 = demeaned.iter().map(|(_, x2, _)| x2 * x2).sum();
+            let s12: f64 = demeaned.iter().map(|(x1, x2, _)| x1 * x2).sum();
+            let s1y: f64 = demeaned.iter().map(|(x1, _, y)| x1 * y).sum();
+            let s2y: f64 = demeaned.iter().map(|(_, x2, y)| x2 * y).sum();
+
+            let det = s11 * s22 - s12 * s12;
+            if n == 0 || s11 <= 1e-9 || s22 <= 1e-9 || det.abs() <= 1e-9 {
+                return None;
+            }
+
+            let b1 = (s22 * s1y - s12 * s2y) / det;
+            let b2 = (s11 * s2y - s12 * s1y) / det;
+
+            let residual_df = n as isize - n_players as isize - 2;
+            if residual_df <= 0 {
+                return None;
+            }
+
+            let ss_res: f64 = demeaned
+                .iter()
+                .map(|(x1, x2, y)| (y - b1 * x1 - b2 * x2).powi(2))
+                .sum();
+            let s2 = ss_res / residual_df as f64;
+            let se1 = (s2 * s22 / det).sqrt();
+            let se2 = (s2 * s11 / det).sqrt();
+            let t1 = if se1 > 1e-12 { b1 / se1 } else { f64::INFINITY };
+            let t2 = if se2 > 1e-12 { b2 / se2 } else { f64::INFINITY };
+            let corr = s12 / (s11 * s22).sqrt();
+
+            Some(JointFit {
+                b1,
+                se1,
+                t1,
+                b2,
+                se2,
+                t2,
+                corr,
+                n,
+                n_players,
+            })
+        }
+
         let report_pooled = |label: &str, subset: &[&Point]| {
             if subset.is_empty() {
                 println!("  {label}: n=0, nothing to report");
@@ -6029,6 +6170,51 @@ mod tests {
                     100.0 * slope / mean_skill
                 ),
                 None => println!("    stars (control): not enough within-player spread"),
+            }
+            let joint_grouped: BTreeMap<&str, Vec<(f64, f64, f64)>> = grouped
+                .iter()
+                .map(|(&uid, rows)| {
+                    let triples = rows
+                        .iter()
+                        .map(|p| (p.collision_share, p.stars, p.skill))
+                        .collect();
+                    (uid, triples)
+                })
+                .collect();
+            match pooled_joint(&joint_grouped) {
+                Some(fit) => {
+                    println!(
+                        "    joint (collision + stars): n={:<4} n_players={}  \
+                         demeaned corr(collision, stars)={:+.3}",
+                        fit.n, fit.n_players, fit.corr
+                    );
+                    println!(
+                        "      collision: b1={:+.3}  ({:+.1}% per +100pp collision)  \
+                         se={:.3}  t={:+.2}",
+                        fit.b1,
+                        100.0 * fit.b1 / mean_skill,
+                        fit.se1,
+                        fit.t1
+                    );
+                    println!(
+                        "      stars:     b2={:+.3}  ({:+.1}% per +1 star)  se={:.3}  t={:+.2}",
+                        fit.b2,
+                        100.0 * fit.b2 / mean_skill,
+                        fit.se2,
+                        fit.t2
+                    );
+                    if fit.corr.abs() >= 0.7 {
+                        println!(
+                            "      warning: |corr| >= 0.7 — collision share and stars are too \
+                             entangled in this subset for the joint estimate to separate them; \
+                             read b1 and b2 as unstable, not as settled effects."
+                        );
+                    }
+                }
+                None => println!(
+                    "    joint (collision + stars): skipped — det near zero or not enough \
+                     within-player spread to solve the normal equations"
+                ),
             }
         };
 
@@ -6171,5 +6357,116 @@ mod tests {
              median {median:+.1}% per +100pp, {negative} negative vs {positive} positive.",
             sorted.len()
         );
+
+        // Characterising the stars trend on its own, as promised in the doc comment:
+        // a per-player, per-bin table first, to see whether it is monotone or driven
+        // by one bin, then a `skill_exponent` sweep to see whether the default 1.7 is
+        // what is producing it.
+        println!(
+            "\nFitted skill by star-rating bin, per player (all scores, no mod filter). \
+             A monotone climb across bins within a player is what a wrong \
+             `skill_exponent` predicts; a single outlier bin would point elsewhere."
+        );
+
+        let star_bins: [(&str, f64, f64); 5] = [
+            ("<5", f64::NEG_INFINITY, 5.0),
+            ("5-6", 5.0, 6.0),
+            ("6-7", 6.0, 7.0),
+            ("7-8", 7.0, 8.0),
+            (">=8", 8.0, f64::INFINITY),
+        ];
+
+        for (uid, rows) in &by_uid {
+            print!("  uid {uid:<8}");
+            for (label, lo, hi) in &star_bins {
+                let group: Vec<&&Point> = rows
+                    .iter()
+                    .filter(|p| p.stars >= *lo && p.stars < *hi)
+                    .collect();
+                if group.is_empty() {
+                    print!("  {label:>4}: n=0          ");
+                } else {
+                    let mean_skill =
+                        group.iter().map(|p| p.skill).sum::<f64>() / group.len() as f64;
+                    print!(
+                        "  {label:>4}: n={:<3} skill={mean_skill:6.2}",
+                        group.len()
+                    );
+                }
+            }
+            println!();
+        }
+
+        // `skill_exponent` sweep on the no-window-mod subset: refit every score's
+        // skill under each candidate exponent (all other `ErrorModel` fields left at
+        // their default) and re-run the joint regression, watching only the stars
+        // coefficient. If some exponent other than the shipped 1.7 drives it toward
+        // zero, that is this fixture set's evidence about the right value; if none do,
+        // or the sweep is flat, that is itself the finding.
+        println!(
+            "\nskill_exponent sweep (no-window-mod scores, joint regression, stars \
+             coefficient only):"
+        );
+
+        let mut best_exponent = None;
+        let mut best_abs_t = f64::INFINITY;
+
+        for exponent in [1.3, 1.5, 1.7, 1.9, 2.1] {
+            let model = ErrorModel {
+                skill_exponent: exponent,
+                ..Default::default()
+            };
+
+            let mut refit_by_uid: BTreeMap<&str, Vec<(f64, f64, f64)>> = BTreeMap::new();
+            let mut n_failed = 0;
+
+            for p in &no_window_mod {
+                match refit_skill(p, &model) {
+                    Some(skill) => refit_by_uid
+                        .entry(p.uid.as_str())
+                        .or_default()
+                        .push((p.collision_share, p.stars, skill)),
+                    None => n_failed += 1,
+                }
+            }
+
+            match pooled_joint(&refit_by_uid) {
+                Some(fit) => {
+                    println!(
+                        "  skill_exponent={exponent:.1}: n={:<4} n_players={}  \
+                         b2(stars)={:+.4}  se={:.4}  t={:+.2}{}",
+                        fit.n,
+                        fit.n_players,
+                        fit.b2,
+                        fit.se2,
+                        fit.t2,
+                        if n_failed > 0 {
+                            format!("  ({n_failed} refits failed)")
+                        } else {
+                            String::new()
+                        }
+                    );
+                    if fit.t2.abs() < best_abs_t {
+                        best_abs_t = fit.t2.abs();
+                        best_exponent = Some(exponent);
+                    }
+                }
+                None => println!(
+                    "  skill_exponent={exponent:.1}: joint regression skipped (det near zero \
+                     or not enough spread)"
+                ),
+            }
+        }
+
+        match best_exponent {
+            Some(exponent) => println!(
+                "\nOf {{1.3, 1.5, 1.7, 1.9, 2.1}}, skill_exponent={exponent:.1} drives the stars \
+                 coefficient closest to zero on this fixture set (|t|={best_abs_t:.2})."
+            ),
+            None => println!(
+                "\nno exponent in the sweep produced a joint fit; nothing to conclude about \
+                 skill_exponent from this fixture set."
+            ),
+        }
     }
 }
