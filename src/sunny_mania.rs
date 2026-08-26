@@ -71,6 +71,10 @@ pub struct JsSunnyManiaDifficultyAttributes {
     /// mods are priced, and it is recomputed when absent.
     #[serde(skip)]
     pub(crate) hit_windows: crate::mania_windows::ManiaHitWindows,
+    /// The map's windows with mods stripped, kept for the performance calc. Not exposed
+    /// for the same reason as [`Self::hit_windows`], and reconstructed the same way.
+    #[serde(skip)]
+    pub(crate) map_windows: crate::mania_windows::ManiaHitWindows,
 }
 
 impl From<SunnyManiaDifficultyAttributes> for JsSunnyManiaDifficultyAttributes {
@@ -88,6 +92,7 @@ impl From<SunnyManiaDifficultyAttributes> for JsSunnyManiaDifficultyAttributes {
             ln_duration_buckets: attrs.ln_duration_buckets,
             mods: GameMods::default(),
             hit_windows: attrs.hit_windows,
+            map_windows: attrs.map_windows,
         }
     }
 }
@@ -268,6 +273,17 @@ impl JsSunnyManiaPerformance {
                 js_attrs.hit_windows
             };
 
+            // Likewise the mod-stripped window set. `great_hit_window` already has the
+            // mod multiplier folded in, so undo it before inverting: EZ multiplied the
+            // GREAT window by 1.4 and HR divided by it.
+            let map_windows = if js_attrs.map_windows == Default::default() {
+                let unmodded = js_attrs.great_hit_window
+                    / crate::mania_windows::difficulty_multiplier(&mods);
+                crate::mania_windows::windows_from_great(unmodded)
+            } else {
+                js_attrs.map_windows
+            };
+
             let attrs = SunnyManiaDifficultyAttributes {
                 stars: js_attrs.stars,
                 variety: js_attrs.variety,
@@ -276,6 +292,7 @@ impl JsSunnyManiaPerformance {
                 switches: js_attrs.switches,
                 great_hit_window: js_attrs.great_hit_window,
                 hit_windows,
+                map_windows,
                 max_combo: js_attrs.max_combo,
                 n_objects: js_attrs.n_objects as usize,
                 n_long_notes: js_attrs.n_long_notes as usize,

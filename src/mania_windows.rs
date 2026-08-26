@@ -274,7 +274,7 @@ pub fn windows_from_great(great: f64) -> ManiaHitWindows {
 /// Mania is unusual here: neither mod touches OD. `HR` sets
 /// `DifficultyMultiplier = 1.4` and `EZ` sets `1 / 1.4`, applied to every
 /// window. Since lazer divides by this multiplier, `HR` narrows and `EZ` widens.
-fn difficulty_multiplier(mods: &GameMods) -> f64 {
+pub(crate) fn difficulty_multiplier(mods: &GameMods) -> f64 {
     if has_mod(mods, "HR") {
         1.4
     } else if has_mod(mods, "EZ") {

@@ -173,6 +173,14 @@ pub struct SunnyManiaDifficultyAttributes {
     ///
     /// A fixed-size array because these attributes are `Copy`.
     pub ln_duration_buckets: [usize; LN_DURATION_BUCKETS],
+    /// The map's own judgement windows with the window-affecting mods stripped.
+    ///
+    /// Identical to [`Self::hit_windows`] for a no-mod score, and narrower or wider than
+    /// it under `HR`/`EZ`. Carried so [`window_scalar`] can price a score against the
+    /// windows its own map would have given it, which confines the surface to pricing
+    /// *mods* rather than also pricing the map's OD. See `REFERENCE_WINDOWS` for what the
+    /// alternative costs.
+    pub map_windows: ManiaHitWindows,
     /// Whether long notes give a single combined judgement (ScoreV1 / classic)
     /// rather than separate head and release judgements (ScoreV2).
     ///
@@ -243,6 +251,13 @@ pub fn calculate(
     let classic = is_classic(lazer, mods);
     let windows = hit_windows(map, mods, clock_rate, classic);
 
+    // The same map judged without the window-affecting mods. Mods reach `hit_windows`
+    // only through its difficulty multiplier, so an empty mod set is exactly "this map's
+    // own windows". The clock rate stays as passed because the windows are rate-normalised
+    // anyway, and `classic` stays because it describes the scoring scheme rather than a
+    // mod's effect on leniency.
+    let map_windows = hit_windows(map, &GameMods::default(), clock_rate, classic);
+
     let take = passed_objects.unwrap_or(u32::MAX) as usize;
     let objects = map.hit_objects.iter().take(take);
 
@@ -263,6 +278,7 @@ pub fn calculate(
         switches: params.switches,
         great_hit_window,
         hit_windows: windows,
+        map_windows,
         max_combo,
         n_objects: data.notes.len(),
         n_long_notes: data.long_notes.len(),
@@ -352,6 +368,32 @@ const REFERENCE_WINDOWS: ManiaHitWindows = ManiaHitWindows {
 /// Returns 1.0 only when there is nothing to measure: an empty score, or a fit that
 /// did not produce a usable positive skill on both sides.
 ///
+/// The windows a score is priced *against*, which decides what the surface charges for.
+///
+/// Two choices, and they differ in what they claim OD means:
+///
+/// - **Fixed [`REFERENCE_WINDOWS`]** (OD 8) says a low-OD map is genuinely more lenient,
+///   so a score on it demonstrates less precision and should earn less. That claim is
+///   very hard to defend in mania, where OD is a charting convention rather than a
+///   difficulty setting: 7K charts in the fixture set average OD 4.8 against 4K's 8.2,
+///   and 7K LN maps average OD 4.2. Under this reference those maps lose 16.6% of their
+///   live pp for their OD alone.
+/// - **The map's own windows** ([`SunnyManiaDifficultyAttributes::map_windows`]) makes
+///   every no-mod score price at exactly 1.0 at any OD or keymode, confining the surface
+///   to pricing mods. It gives up the claim that OD itself earns pp — the weakest
+///   inference in the design — and with it the cross-keymode penalty.
+///
+/// Selected by `SUNNY_MAP_REFERENCE` so the two can be measured against the same
+/// fixtures in one build. Defaults to the fixed reference; see `multiuser_report` for
+/// what switching costs and earns.
+fn reference_windows(attrs: &SunnyManiaDifficultyAttributes) -> ManiaHitWindows {
+    if std::env::var_os("SUNNY_MAP_REFERENCE").is_some() {
+        attrs.map_windows
+    } else {
+        REFERENCE_WINDOWS
+    }
+}
+
 /// Whether `SUNNY_NO_LN_SPLIT` is set, which collapses the LN mixture back to a
 /// single population.
 ///
@@ -469,7 +511,7 @@ fn window_scalar(attrs: &SunnyManiaDifficultyAttributes, state: SunnyScoreState)
     let units = judgement_units(attrs, f64::from(total), &model);
 
     let played = fit_with_quality(&counts, &units, &attrs.hit_windows, &model);
-    let reference = fit_with_quality(&counts, &units, &REFERENCE_WINDOWS, &model);
+    let reference = fit_with_quality(&counts, &units, &reference_windows(attrs), &model);
 
     if played.skill <= 0.0 || reference.skill <= 0.0 {
         return 1.0;
@@ -4057,6 +4099,27 @@ mod tests {
                 &format!("{keys}k (mean OD {mean_od:.1}, LN {:.0}%)", 100.0 * mean_ln),
                 &band,
             );
+
+            // 7k's shortfall could be its low OD or its long notes, which the key-count
+            // grouping alone conflates. Splitting the band separates them: the rice-heavy
+            // rows carry OD only, the LN-heavy rows carry both.
+            if band.len() >= 8 {
+                for (sub, lo, hi) in [("  rice <30% LN", 0.0, 0.3), ("  LN >=30%", 0.3, 1.01)] {
+                    let inner: Vec<&MultiPriced> = band
+                        .iter()
+                        .copied()
+                        .filter(|r| r.ln_fraction >= lo && r.ln_fraction < hi)
+                        .collect();
+                    if inner.len() >= 3 {
+                        let mean_inner_od =
+                            inner.iter().map(|r| f64::from(r.od)).sum::<f64>() / inner.len() as f64;
+                        summarise_group(
+                            &format!("{sub} (mean OD {mean_inner_od:.1})"),
+                            &inner,
+                        );
+                    }
+                }
+            }
         }
 
         // Long-note share, which is the axis the LN mixture acts on and the thing key
@@ -4976,6 +5039,31 @@ mod tests {
         let mean_scalar = rows.iter().map(|r| r.scalar).sum::<f64>() / n;
         let plausible = rows.iter().filter(|r| r.plausible).count();
 
+        // Against the *live* server as well as against our own before-stack. These answer
+        // different questions and only the second one players can feel: `before_pp` is
+        // this branch's difficulty calc with the old multiplier stack, so it isolates the
+        // surface change, while `live_pp` is what a player actually sees today and
+        // therefore what any complaint about pp being too low is about. The two diverge
+        // because our star ratings have drifted from live's independently of this branch.
+        let with_live: Vec<&&MultiPriced> =
+            rows.iter().filter(|r| r.row.live_pp > 0.0).collect();
+        let live_note = if with_live.is_empty() {
+            String::new()
+        } else {
+            let live: f64 = with_live.iter().map(|r| r.row.live_pp).sum();
+            let after_live: f64 = with_live.iter().map(|r| r.after_pp).sum();
+            let mean_ratio = with_live
+                .iter()
+                .map(|r| r.after_pp / r.row.live_pp)
+                .sum::<f64>()
+                / with_live.len() as f64;
+            format!(
+                "  vs live: sum {:+.1}% mean {:+.1}%",
+                (after_live / live - 1.0) * 100.0,
+                (mean_ratio - 1.0) * 100.0
+            )
+        };
+
         // The per-score mean delta and the aggregate delta answer different
         // questions: the first weights every score equally, the second weights by pp
         // and so is what a player's top-play total actually moves by.
@@ -4998,7 +5086,7 @@ mod tests {
         println!(
             "  {label}: n={n_rows} mean scalar {mean_scalar:.4}  mean dPP {mean_delta:+.2}%  \
              sum {before:.0} -> {after:.0} ({sum_delta:+.2}%)  plausible {plausible}/{n_rows}  \
-             med g {median_g:.1}"
+             med g {median_g:.1}{live_note}"
         );
     }
 }
