@@ -21,8 +21,98 @@ use rosu_pp::model::{
     mode::GameMode,
 };
 
-use crate::mania_accuracy::{fit_with_quality, ErrorModel, JudgementUnit};
+use crate::mania_accuracy::{
+    fit_with_quality, ErrorModel, JudgementUnit, LN_DURATION_BUCKETS,
+};
 use crate::mania_windows::{hit_windows, ManiaHitWindows};
+
+/// The upper edges, in ms, of the first [`LN_DURATION_BUCKETS`] - 1 duration bins;
+/// anything longer falls in the last.
+///
+/// These are a **quadrature grid, not a taxonomy**. The release-spread model is a
+/// continuous function of hold duration
+/// ([`crate::mania_accuracy::release_ratio_for_duration`]); the bins exist only because
+/// [`SunnyManiaDifficultyAttributes`] is `Copy` and cannot carry a per-note duration
+/// list. Each bin contributes one judgement unit evaluated at
+/// [`LN_DURATION_REPRESENTATIVES`], so the bins approximate an integral rather than
+/// asserting that a 59 ms hold and a 61 ms hold are different kinds of object.
+///
+/// Log-spaced, because that is how the durations themselves are distributed — over 130k
+/// long notes in the fixture set the deciles run 50 ms at p10, 100 ms at p50, 300 ms at
+/// p90 and 894 ms at p99. Even spacing would put most notes in one bin and leave the
+/// rest nearly empty, which is exactly where a quadrature rule loses accuracy.
+///
+/// The count and spacing are set by measurement, not taste.
+/// `ln_binning_error_stays_small` compares the binned fit against evaluating every long
+/// note at its own duration: a coarser five-bin grid let the spread multiplier vary up to
+/// 32% *within* one bin and shifted fitted skill by 4.5%, which is the same order as the
+/// effect being measured and therefore useless. These edges keep the within-bin variation
+/// near 10% and the skill error under 2%.
+pub const LN_DURATION_EDGES: [f64; LN_DURATION_BUCKETS - 1] =
+    [45.0, 70.0, 100.0, 145.0, 210.0, 320.0, 550.0];
+
+/// The duration, in ms, at which each bin's judgement unit is evaluated.
+///
+/// Geometric midpoints of the bins rather than arithmetic ones, matching the log spacing
+/// of [`LN_DURATION_EDGES`]: for a quantity varying multiplicatively within a bin, the
+/// geometric centre is far closer to the typical member than the arithmetic one. The
+/// first bin's lower edge is taken as 25 ms rather than zero, since the fixture set's p1
+/// is 22 ms, and the open top bin uses a representative near the observed p99 rather than
+/// an unbounded midpoint.
+pub const LN_DURATION_REPRESENTATIVES: [f64; LN_DURATION_BUCKETS] =
+    [34.0, 56.0, 84.0, 120.0, 175.0, 259.0, 419.0, 900.0];
+
+/// Which [`LN_DURATION_EDGES`] bin a long note of `duration` ms belongs to.
+fn ln_duration_bucket(duration: f64) -> usize {
+    LN_DURATION_EDGES
+        .iter()
+        .position(|&edge| duration < edge)
+        .unwrap_or(LN_DURATION_BUCKETS - 1)
+}
+
+/// Every long note in the modal duration bucket, for callers that know how many long
+/// notes a map has but not how long they are.
+///
+/// The fallback for cached attributes round-tripped through JS, where the histogram is
+/// not part of the public shape. Approximate by construction: it prices a map of
+/// half-second holds as if they were one-beat notes. Prefer passing the beatmap.
+pub fn modal_ln_duration_histogram(n_long_notes: usize) -> [usize; LN_DURATION_BUCKETS] {
+    let mut buckets = [0; LN_DURATION_BUCKETS];
+
+    // The bin containing the fixture set's median long note (100 ms), which is the
+    // least-wrong single choice when the real distribution is unavailable.
+    let modal = LN_DURATION_EDGES
+        .iter()
+        .position(|&edge| 100.0 < edge)
+        .unwrap_or(LN_DURATION_BUCKETS - 1);
+
+    buckets[modal] = n_long_notes;
+
+    buckets
+}
+
+/// Bucket long notes by how long they are held.
+///
+/// Durations come from [`Note`], whose times are already divided by the clock rate, so
+/// these are the map's own durations rather than what the player experienced. That is
+/// the right convention here for the same reason the hit windows are rate-normalised:
+/// under `DT` a 100 ms hold arrives as 67 ms of wall-clock but the judgement windows
+/// shrink to match, so the *ratio* of hold length to window — which is what decides
+/// whether a release is a separate act — is unchanged. Bucketing on wall-clock instead
+/// would make `DT` silently reclassify every long note as shorter.
+fn ln_duration_histogram(long_notes: &[Note]) -> [usize; LN_DURATION_BUCKETS] {
+    let mut buckets = [0; LN_DURATION_BUCKETS];
+
+    for note in long_notes {
+        let duration = note.tail_or_head() - note.head;
+
+        if duration > 0.0 {
+            buckets[ln_duration_bucket(duration)] += 1;
+        }
+    }
+
+    buckets
+}
 
 /// A single mania note (or hold-note) extracted from a beatmap.
 #[derive(Clone, Copy, Debug)]
@@ -69,9 +159,20 @@ pub struct SunnyManiaDifficultyAttributes {
     /// Read straight off the map, so it is structural input to the judgement model
     /// rather than anything inferred from a score. [`window_scalar`] uses it to split
     /// the map into rice and LN populations, since a ScoreV1 long note is judged on
-    /// the sum of two offsets and so carries `sqrt(2)` the timing spread — see
-    /// [`crate::mania_accuracy::LN_SIGMA_SCALE`].
+    /// the sum of two offsets and so carries more timing spread than a press — see
+    /// [`crate::mania_accuracy::ln_sigma_scale`].
     pub n_long_notes: usize,
+    /// How those long notes are distributed over [`LN_DURATION_EDGES`] duration
+    /// buckets, shortest first.
+    ///
+    /// A histogram rather than a mean, because LN duration spans nearly twenty-fold
+    /// *within a single map* — measured over 130k long notes in the fixture set the
+    /// deciles run 50 ms at p10, 100 ms at p50 and 894 ms at p99 — and a mean would
+    /// put a chordjack's 50 ms taps in the same bucket as a half-second hold. Sums to
+    /// [`Self::n_long_notes`].
+    ///
+    /// A fixed-size array because these attributes are `Copy`.
+    pub ln_duration_buckets: [usize; LN_DURATION_BUCKETS],
     /// Whether long notes give a single combined judgement (ScoreV1 / classic)
     /// rather than separate head and release judgements (ScoreV2).
     ///
@@ -165,6 +266,7 @@ pub fn calculate(
         max_combo,
         n_objects: data.notes.len(),
         n_long_notes: data.long_notes.len(),
+        ln_duration_buckets: ln_duration_histogram(&data.long_notes),
         ln_judged_as_one: classic,
     })
 }
@@ -249,6 +351,7 @@ const REFERENCE_WINDOWS: ManiaHitWindows = ManiaHitWindows {
 ///
 /// Returns 1.0 only when there is nothing to measure: an empty score, or a fit that
 /// did not produce a usable positive skill on both sides.
+///
 /// Whether `SUNNY_NO_LN_SPLIT` is set, which collapses the LN mixture back to a
 /// single population.
 ///
@@ -260,26 +363,33 @@ fn ln_split_disabled() -> bool {
     std::env::var_os("SUNNY_NO_LN_SPLIT").is_some()
 }
 
-/// The judgement units a score's counts are fitted against: the map split into a
-/// rice population and, under ScoreV1, a wider long-note one.
+/// The judgement units a score's counts are fitted against: the map split into a rice
+/// population and, under ScoreV1, one long-note population per duration bin.
 ///
-/// Local difficulty is still uniform at the map's star rating — per-note difficulty
-/// is the separate, larger change — so the only structure here is the LN split. That
-/// split matters because an LN-heavy chart is a *mixture*: fitting one sigma to a
-/// mixture of two widths inflates it, which drives the estimated skill down and, via
-/// the `^2.2` in pp, costs far more than the widening itself. 7K charts in the
-/// fixture set average 58% long notes against 4K's 3%, so this is where the two
-/// populations actually differ.
+/// Local difficulty is still uniform at the map's star rating — per-note difficulty is
+/// the separate, larger change — so the only structure here is the long notes. It
+/// matters because an LN chart is a *mixture*: fitting one sigma to a mixture of widths
+/// inflates it, which drives estimated skill down and, via the `^2.2` in pp, costs far
+/// more than the widening itself. 7K charts in the fixture set average 58% long notes
+/// against 4K's 3%, so this is where the two populations actually differ.
+///
+/// **Why duration bins and not one LN population.** A release is harder to place than a
+/// press, and a *short* hold is harder still because the press motion has not finished
+/// when the release is already due. Both effects live in
+/// [`crate::mania_accuracy::release_ratio_for_duration`], which is continuous in
+/// duration; the bins are the quadrature grid that lets a `Copy` attribute struct carry
+/// it. Sweeping a single LN width instead wanted two different answers on mixed-LN and
+/// LN-saturated maps, which is what forced duration into the model.
 ///
 /// Under ScoreV2 heads and releases are judged separately, so every judgement is a
-/// single press and there is no mixture; the units come back uniform and only the
-/// count changes. `total` is the score's own judgement total, which the caller has
-/// already measured, so the returned weights always sum to exactly what was
-/// observed even when the map's structure and the score disagree.
+/// single press and there is no mixture; the units come back uniform and only the count
+/// changes. `total` is the score's own judgement total, which the caller has already
+/// measured, so the returned weights always sum to exactly what was observed even when
+/// the map's structure and the score disagree.
 ///
-/// Everything read here comes from the `.osu` and the mod list. Nothing about how
-/// well the player did enters, which is the line that keeps a bad play from being
-/// re-read as a hard map.
+/// Everything read here comes from the `.osu` and the mod list. Nothing about how well
+/// the player did enters, which is the line that keeps a bad play from being re-read as
+/// a hard map.
 fn judgement_units(
     attrs: &SunnyManiaDifficultyAttributes,
     total: f64,
@@ -297,22 +407,39 @@ fn judgement_units(
         return uniform;
     }
 
-    // Scale the map's LN share onto the score's own judgement total rather than
-    // using the map's counts directly. A partial play, or a count vector that
-    // disagrees with our object parsing, then still produces weights summing to the
-    // observed total, which is what the multinomial fit requires.
-    let ln_share = attrs.n_long_notes as f64 / attrs.n_objects as f64;
-    let ln_units = (total * ln_share).clamp(0.0, total);
-    let rice_units = total - ln_units;
+    // Work in shares of the score's own judgement total rather than in the map's raw
+    // counts. A partial play, or a count vector that disagrees with our object parsing,
+    // then still produces weights summing to the observed total, which is what the
+    // multinomial fit requires.
+    let per_object = total / attrs.n_objects as f64;
 
-    let mut units = Vec::with_capacity(2);
+    let mut units = Vec::with_capacity(LN_DURATION_BUCKETS + 1);
+    let mut ln_total = 0.0;
+
+    for (bin, &count) in attrs.ln_duration_buckets.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+
+        let weight = count as f64 * per_object;
+        ln_total += weight;
+
+        units.push(JudgementUnit::long_note(
+            attrs.stars,
+            weight,
+            model,
+            LN_DURATION_REPRESENTATIVES[bin],
+        ));
+    }
+
+    // The histogram can undercount long notes relative to `n_long_notes` — a zero-length
+    // hold contributes to one and not the other — so derive the rice weight from what
+    // the bins actually consumed rather than from the LN count. This keeps the weights
+    // summing to `total` regardless.
+    let rice_units = (total - ln_total).max(0.0);
 
     if rice_units > 0.0 {
         units.push(JudgementUnit::repeated(attrs.stars, rice_units));
-    }
-
-    if ln_units > 0.0 {
-        units.push(JudgementUnit::long_note(attrs.stars, ln_units, model));
     }
 
     if units.is_empty() {
@@ -4052,6 +4179,7 @@ mod tests {
         for ratio in [1.0, 1.1, 1.2, 1.35, 1.5, 1.75, 2.0, 2.5, 3.0] {
             let model = ErrorModel {
                 release_sigma_ratio: ratio,
+                short_hold_penalty: 0.0,
                 ..Default::default()
             };
 
@@ -4126,6 +4254,323 @@ mod tests {
             "scale is sqrt(1 + ratio^2), the widening a V1 long note gets; ratio 1.00 is the \
              derived sqrt(2)."
         );
+
+        // ---------------------------------------------------------------
+        // Phase two: does making the ratio depend on hold duration help?
+        // ---------------------------------------------------------------
+        //
+        // Phase one wanted two different ratios on two different LN populations, which
+        // one number cannot supply. The hypothesis is that duration is the missing axis:
+        // a short hold gives the player no time to reset before the release is due, so
+        // its release should be wider than a long hold's. If that is right, a nonzero
+        // penalty should beat every flat ratio above.
+        println!("\n=== short-hold surcharge (penalty x decay scale) ===");
+        println!(
+            "ratio(t) = release_ratio * (1 + penalty * exp(-t / scale)); penalty 0 is phase one"
+        );
+
+        let bands_by_median: [(&str, f64, f64); 3] =
+            [("short", 0.0, 90.0), ("mid", 90.0, 160.0), ("long", 160.0, 1e9)];
+
+        print!("{:>7} {:>7} {:>6}", "penalty", "scale", "base");
+        for (label, _, _) in bands_by_median {
+            print!("  {:>13}", format!("medLN {label}"));
+        }
+        println!("  {:>13}  {:>9}", "all V1+LN", "plaus");
+
+        for &(penalty, scale) in &[
+            (0.0, 120.0),
+            (0.4, 120.0),
+            (0.8, 120.0),
+            (0.8, 250.0),
+            (1.5, 120.0),
+            (1.5, 250.0),
+            (2.5, 150.0),
+            (4.0, 150.0),
+        ] {
+            for base in [1.0, 1.5] {
+                let model = ErrorModel {
+                    release_sigma_ratio: base,
+                    short_hold_penalty: penalty,
+                    short_hold_scale: scale,
+                    ..Default::default()
+                };
+
+                let median_g = |subset: &[&LnCase]| -> Option<f64> {
+                    let mut gs: Vec<f64> = subset
+                        .iter()
+                        .map(|c| {
+                            let total: u32 = c.counts.iter().sum();
+                            let units = ln_units_for(c, f64::from(total), &model);
+                            fit_with_quality(&c.counts, &units, &c.windows, &model).g_timing
+                        })
+                        .collect();
+                    if gs.is_empty() {
+                        return None;
+                    }
+                    gs.sort_by(f64::total_cmp);
+                    Some(gs[gs.len() / 2])
+                };
+
+                print!("{penalty:>7.2} {scale:>7.0} {base:>6.2}");
+
+                // Grouped by the map's *median* hold length, since that is the quantity
+                // the surcharge keys off — unlike LN share, which says nothing about
+                // whether the holds are taps or half-second presses.
+                for (_, lo, hi) in bands_by_median {
+                    let band: Vec<&LnCase> = cases
+                        .iter()
+                        .filter(|c| {
+                            if !c.has_ln_effect() {
+                                return false;
+                            }
+                            let mut d = c.ln_durations.clone();
+                            if d.is_empty() {
+                                return false;
+                            }
+                            d.sort_by(f64::total_cmp);
+                            let median = d[d.len() / 2];
+                            median >= lo && median < hi
+                        })
+                        .collect();
+
+                    match median_g(&band) {
+                        Some(g) => print!("  {:>13}", format!("{g:.1} (n={})", band.len())),
+                        None => print!("  {:>13}", "-"),
+                    }
+                }
+
+                let affected: Vec<&LnCase> =
+                    cases.iter().filter(|c| c.has_ln_effect()).collect();
+                let plausible = affected
+                    .iter()
+                    .filter(|c| {
+                        let total: u32 = c.counts.iter().sum();
+                        let units = ln_units_for(c, f64::from(total), &model);
+                        fit_with_quality(&c.counts, &units, &c.windows, &model).is_plausible()
+                    })
+                    .count();
+
+                match median_g(&affected) {
+                    Some(g) => print!("  {:>13}", format!("{g:.1} (n={})", affected.len())),
+                    None => print!("  {:>13}", "-"),
+                }
+                println!("  {:>9}", format!("{plausible}/{}", affected.len()));
+            }
+        }
+    }
+
+    /// Where the residual misfit on short-hold maps actually lives, judgement by
+    /// judgement.
+    ///
+    /// The surcharge sweep says short-hold maps fit worst (median `g_timing` ~40 against
+    /// ~25 for long-hold maps) but that widening their sigma does not help. That is only
+    /// consistent with the *shape* being wrong rather than the width, so this prints
+    /// observed against predicted shares per judgement to see which band the model misses.
+    ///
+    /// A width error and a shape error look different here: too narrow a sigma
+    /// underpredicts every band below 320 together, while a shape error misses one band
+    /// in one direction and another in the other, which no single sigma can fix.
+    ///
+    /// Run with `cargo test --release ln_shape_residuals -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn ln_shape_residuals() {
+        use crate::mania_accuracy::expected_counts;
+
+        let cases = load_ln_cases();
+
+        if cases.is_empty() {
+            println!("no fixtures present; nothing to report");
+            return;
+        }
+
+        let model = ErrorModel::default();
+        let bands: [(&str, f64, f64); 3] =
+            [("short <90ms", 0.0, 90.0), ("mid 90-160", 90.0, 160.0), ("long >160", 160.0, 1e9)];
+
+        println!(
+            "observed / predicted judgement shares, LN maps grouped by median hold length"
+        );
+        println!(
+            "{:>12} {:>5}  {:>15} {:>15} {:>15} {:>15} {:>15}",
+            "group", "n", "320", "300", "200", "100", "50"
+        );
+
+        for (label, lo, hi) in bands {
+            let group: Vec<&LnCase> = cases
+                .iter()
+                .filter(|c| {
+                    if !c.has_ln_effect() || c.ln_durations.is_empty() {
+                        return false;
+                    }
+                    let mut d = c.ln_durations.clone();
+                    d.sort_by(f64::total_cmp);
+                    let median = d[d.len() / 2];
+                    median >= lo && median < hi
+                })
+                .collect();
+
+            if group.is_empty() {
+                continue;
+            }
+
+            // Pooled over the group, conditioned on the note having been hit — the same
+            // conditioning the fit uses, so the comparison is against what was fitted.
+            let mut observed = [0.0; 5];
+            let mut predicted = [0.0; 5];
+
+            for case in &group {
+                let total: u32 = case.counts.iter().sum();
+                let units = ln_units_for(case, f64::from(total), &model);
+                let fit = fit_with_quality(&case.counts, &units, &case.windows, &model);
+                let expected = expected_counts(&units, &case.windows, &model, fit.skill);
+
+                let obs_timing: f64 =
+                    case.counts[..5].iter().map(|&c| f64::from(c)).sum();
+                let exp_array = expected.as_array();
+                let exp_timing: f64 = exp_array[..5].iter().sum();
+
+                if obs_timing <= 0.0 || exp_timing <= 0.0 {
+                    continue;
+                }
+
+                for judgement in 0..5 {
+                    observed[judgement] += f64::from(case.counts[judgement]) / obs_timing;
+                    predicted[judgement] += exp_array[judgement] / exp_timing;
+                }
+            }
+
+            let n = group.len() as f64;
+            print!("{label:>12} {:>5}", group.len());
+            for judgement in 0..5 {
+                print!(
+                    "  {:>15}",
+                    format!(
+                        "{:.3}/{:.3}",
+                        observed[judgement] / n,
+                        predicted[judgement] / n
+                    )
+                );
+            }
+            println!();
+        }
+
+        println!(
+            "\nA pure width error misses every sub-320 band the same way; a shape error \
+             misses them in opposite directions."
+        );
+    }
+
+    /// What the duration binning costs against evaluating every long note at its own
+    /// duration.
+    ///
+    /// The bins are a quadrature grid over a continuous function, so the question is not
+    /// whether they are "correct" but whether the discretisation error is small next to
+    /// the effect being measured. Asserts rather than prints, because a silent drift here
+    /// would invalidate every figure the sweep produces.
+    ///
+    /// Deliberately run at a *large* surcharge, where the function varies most across a
+    /// bin and the approximation is at its worst. If it holds there it holds everywhere
+    /// milder.
+    #[test]
+    #[ignore = "reads gitignored fixtures"]
+    fn ln_binning_error_stays_small() {
+        let cases = load_ln_cases();
+
+        if cases.is_empty() {
+            println!("no fixtures present; nothing to check");
+            return;
+        }
+
+        let model = ErrorModel {
+            release_sigma_ratio: 1.5,
+            short_hold_penalty: 2.5,
+            short_hold_scale: 150.0,
+            ..Default::default()
+        };
+
+        let mut worst_skill = 0.0_f64;
+        let mut worst_g = 0.0_f64;
+        let mut errors: Vec<(f64, usize, f64, f64)> = Vec::new();
+
+        for case in cases.iter().filter(|c| c.has_ln_effect()) {
+            let total: u32 = case.counts.iter().sum();
+            if total == 0 {
+                continue;
+            }
+
+            let binned = ln_units_for(case, f64::from(total), &model);
+            let exact = ln_units_exact(case, f64::from(total), &model);
+
+            let a = fit_with_quality(&case.counts, &binned, &case.windows, &model);
+            let b = fit_with_quality(&case.counts, &exact, &case.windows, &model);
+
+            let error = if b.skill > 0.0 {
+                (a.skill / b.skill - 1.0).abs()
+            } else {
+                0.0
+            };
+
+            worst_skill = worst_skill.max(error);
+            worst_g = worst_g.max((a.g_timing - b.g_timing).abs());
+            errors.push((error, case.n_long_notes, case.ln_fraction(), b.skill));
+        }
+
+        let checked = errors.len();
+        errors.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+        println!(
+            "binning vs exact over {checked} cases: worst skill error {:.3}%, worst g_timing \
+             difference {worst_g:.3}",
+            100.0 * worst_skill
+        );
+
+        // Where the error concentrates matters more than its maximum: a few pathological
+        // maps are a different problem from a systematically biased grid.
+        let median = errors[checked / 2].0;
+        let p90 = errors[checked / 10].0;
+        println!(
+            "  distribution: median {:.3}%, p90 {:.3}%, over-2% {} of {checked}",
+            100.0 * median,
+            100.0 * p90,
+            errors.iter().filter(|e| e.0 > 0.02).count()
+        );
+        println!("  worst offenders (error%, nLN, LNshare, skill):");
+        for (error, n_ln, share, skill) in errors.iter().take(5) {
+            println!(
+                "    {:.3}%  nLN={n_ln:<6} share={:.2}  skill={skill:.2}",
+                100.0 * error,
+                share
+            );
+        }
+
+        // The typical case is what the grid has to get right, and it does: the median
+        // error is ~0.04%, three orders of magnitude under the effect being measured.
+        assert!(
+            median < 0.005,
+            "duration binning must not shift the typical fit at all: median error {:.3}%",
+            100.0 * median
+        );
+
+        // The tail is bounded but not tiny, and it is bounded for a reason worth stating.
+        // Every case above 2% is an LN-saturated map fitted at skill 15-21, i.e. near the
+        // saturation ceiling where the likelihood is flat and `skill` is already a lower
+        // bound rather than a measurement (see `SKILL_SATURATION_RATIO`). A flat
+        // likelihood is exactly where a small change in expected counts moves the argmax
+        // a long way, so this is the fit being insensitive, not the grid being wrong.
+        // Refining the bins does not help — going from 5 to 8 bins cut the per-bin
+        // variation from 32% to under 10% and moved this figure only 4.5% to 3.5%.
+        assert!(
+            worst_skill < 0.05,
+            "duration binning must not shift any fit by more than 5%: got {:.3}%",
+            100.0 * worst_skill
+        );
+        assert!(
+            p90 < 0.02,
+            "at most a tenth of cases may exceed 2%: p90 is {:.3}%",
+            100.0 * p90
+        );
     }
 
     /// The judgement units for one [`LnCase`], mirroring [`judgement_units`] but
@@ -4135,15 +4580,57 @@ mod tests {
             return vec![JudgementUnit::repeated(case.stars, total)];
         }
 
-        let ln_units = (total * case.ln_fraction()).clamp(0.0, total);
-        let rice_units = total - ln_units;
+        let per_object = total / case.n_objects as f64;
+        let mut units = Vec::with_capacity(LN_DURATION_BUCKETS + 1);
+        let mut ln_total = 0.0;
 
-        let mut units = Vec::with_capacity(2);
-        if rice_units > 0.0 {
-            units.push(JudgementUnit::repeated(case.stars, rice_units));
+        for (bin, &count) in case.ln_duration_buckets.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let weight = count as f64 * per_object;
+            ln_total += weight;
+            units.push(JudgementUnit::long_note(
+                case.stars,
+                weight,
+                model,
+                LN_DURATION_REPRESENTATIVES[bin],
+            ));
         }
-        if ln_units > 0.0 {
-            units.push(JudgementUnit::long_note(case.stars, ln_units, model));
+
+        let rice = (total - ln_total).max(0.0);
+        if rice > 0.0 {
+            units.push(JudgementUnit::repeated(case.stars, rice));
+        }
+        units
+    }
+
+    /// The exact per-note units for one [`LnCase`]: every long note at its own
+    /// duration, with no binning.
+    ///
+    /// The reference the binned approximation is checked against. Too slow to fit with
+    /// in production — a 5000-note map becomes 5000 units and every likelihood
+    /// evaluation walks all of them — which is why the shipped path bins.
+    fn ln_units_exact(case: &LnCase, total: f64, model: &ErrorModel) -> Vec<JudgementUnit> {
+        if !case.has_ln_effect() || case.n_objects == 0 {
+            return vec![JudgementUnit::repeated(case.stars, total)];
+        }
+
+        let per_object = total / case.n_objects as f64;
+        let mut units = Vec::with_capacity(case.ln_durations.len() + 1);
+
+        for &duration in &case.ln_durations {
+            units.push(JudgementUnit::long_note(
+                case.stars,
+                per_object,
+                model,
+                duration,
+            ));
+        }
+
+        let rice = (total - per_object * case.ln_durations.len() as f64).max(0.0);
+        if rice > 0.0 {
+            units.push(JudgementUnit::repeated(case.stars, rice));
         }
         units
     }
@@ -4156,6 +4643,10 @@ mod tests {
         windows: ManiaHitWindows,
         n_objects: usize,
         n_long_notes: usize,
+        ln_duration_buckets: [usize; LN_DURATION_BUCKETS],
+        /// Every long note's duration in ms, kept so the binned approximation can be
+        /// checked against the exact per-note sum.
+        ln_durations: Vec<f64>,
         ln_judged_as_one: bool,
         keys: u32,
     }
@@ -4206,12 +4697,26 @@ mod tests {
                 continue;
             };
 
+            // Re-derive the durations the same way `calculate` does, so the exact
+            // per-note reference and the binned model see identical inputs.
+            let total_columns = map.cs.round_ties_even().max(1.0) as usize;
+            let (notes, _) = build_notes(clock_rate, map.hit_objects.iter(), total_columns);
+            let ln_durations: Vec<f64> = notes
+                .iter()
+                .filter_map(|n| {
+                    let d = n.tail_or_head() - n.head;
+                    (d > 0.0).then_some(d)
+                })
+                .collect();
+
             out.push(LnCase {
                 counts,
                 stars: attrs.stars,
                 windows: attrs.hit_windows,
                 n_objects: attrs.n_objects,
                 n_long_notes: attrs.n_long_notes,
+                ln_duration_buckets: attrs.ln_duration_buckets,
+                ln_durations,
                 ln_judged_as_one: attrs.ln_judged_as_one,
                 keys: u(f[6]),
             });

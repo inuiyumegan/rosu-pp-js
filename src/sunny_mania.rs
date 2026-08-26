@@ -55,6 +55,14 @@ pub struct JsSunnyManiaDifficultyAttributes {
     /// spread than a plain note and an LN-heavy map is a mixture of the two.
     #[wasm_bindgen(js_name = "nLongNotes", readonly)]
     pub n_long_notes: u32,
+    /// The long-note duration histogram, kept for the performance calc.
+    ///
+    /// Not exposed to JS for the same reason as [`Self::hit_windows`]: it is an
+    /// implementation detail of how long notes are priced, and `wasm_bindgen` cannot
+    /// carry a fixed-size array as a field anyway. Reconstructed when absent — see the
+    /// performance path, which explains what that costs.
+    #[serde(skip)]
+    pub(crate) ln_duration_buckets: [usize; crate::mania_accuracy::LN_DURATION_BUCKETS],
     /// The mods used for the calculation, kept for the performance calc.
     #[serde(skip)]
     pub(crate) mods: rosu_mods::GameMods,
@@ -77,6 +85,7 @@ impl From<SunnyManiaDifficultyAttributes> for JsSunnyManiaDifficultyAttributes {
             max_combo: attrs.max_combo,
             n_objects: attrs.n_objects as u32,
             n_long_notes: attrs.n_long_notes as u32,
+            ln_duration_buckets: attrs.ln_duration_buckets,
             mods: GameMods::default(),
             hit_windows: attrs.hit_windows,
         }
@@ -270,6 +279,18 @@ impl JsSunnyManiaPerformance {
                 max_combo: js_attrs.max_combo,
                 n_objects: js_attrs.n_objects as usize,
                 n_long_notes: js_attrs.n_long_notes as usize,
+                // The histogram survives a Rust-side clone but not a JS round-trip,
+                // where it is `serde(skip)` and comes back zeroed. An all-zero
+                // histogram on a map that has long notes means "lost", not "no long
+                // notes", so fall back to the modal bucket rather than dropping the LN
+                // population: the count is the first-order term, and a wrong bucket
+                // costs less than pricing a 90% LN map as pure rice. A caller that
+                // wants the exact figure should pass the beatmap.
+                ln_duration_buckets: if js_attrs.ln_duration_buckets.iter().sum::<usize>() > 0 {
+                    js_attrs.ln_duration_buckets
+                } else {
+                    sunny::modal_ln_duration_histogram(js_attrs.n_long_notes as usize)
+                },
                 // Not carried through JS: it is a property of how the score was
                 // played, not of the map, so it is re-derived from the mods that
                 // came back with the attributes. `lazer` is not part of the shape

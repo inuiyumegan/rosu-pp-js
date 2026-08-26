@@ -376,7 +376,41 @@ pub struct ErrorModel {
     /// it *worse* where long notes dominate (46.0 to 53.3 above 60%). Under-widening
     /// explains exactly that pattern, since the mixture approaches a single wide
     /// population as the LN share approaches one.
+    ///
+    /// **A single value is known to be insufficient.** Sweeping it wants ~1.75 on maps
+    /// of 5-60% long notes and ~1.0 where they dominate, with the aggregate flat because
+    /// the two cancel. LN *share* cannot express that, which is why the duration
+    /// parameters below exist: this is the floor a long hold tends to, and
+    /// [`Self::short_hold_penalty`] is the surcharge a short one pays on top.
     pub release_sigma_ratio: f64,
+    /// How much wider a release is on an instantaneous hold than on a very long one, as
+    /// a fraction of [`Self::release_sigma_ratio`].
+    ///
+    /// `0.6` would mean a zero-length hold's release lands 1.6x as wide as a long hold's.
+    /// Reaches sigma through [`release_ratio_for_duration`], decaying over
+    /// [`Self::short_hold_scale`].
+    ///
+    /// The mechanism: on a short hold the press motion is still in flight when the
+    /// release comes due, so the player never gets to reset and place the release
+    /// independently. On a long hold they do, and the release becomes an ordinary act
+    /// with only the inherent release penalty left.
+    ///
+    /// **Zero by default**, which makes the ratio duration-independent and leaves the
+    /// shipped model resting on the derived `sqrt(2)` with nothing calibrated in it. The
+    /// duration sweep is what should move it.
+    pub short_hold_penalty: f64,
+    /// The hold duration, in ms, over which [`Self::short_hold_penalty`] decays by
+    /// `1/e`.
+    ///
+    /// Sets what counts as "short". The fixture set's long notes have a median of 100 ms
+    /// and a p10 of 50 ms, so a scale in the low hundreds makes the surcharge bite on the
+    /// bulk of real long notes while leaving half-second holds alone; a scale of a few
+    /// thousand would charge everything alike and be indistinguishable from raising
+    /// [`Self::release_sigma_ratio`].
+    ///
+    /// Only has an effect when the penalty is nonzero, so the default is a plausible
+    /// starting point rather than a fitted value.
+    pub short_hold_scale: f64,
     /// The per-note probability of a lapse unrelated to timing precision: a
     /// misread, a slipped finger, a dropped input.
     ///
@@ -411,6 +445,8 @@ impl Default for ErrorModel {
             // The no-asymmetry floor until the sweep says otherwise, so the shipped
             // default still rests on the derived `sqrt(2)` rather than on a guess.
             release_sigma_ratio: 1.0,
+            short_hold_penalty: 0.0,
+            short_hold_scale: 120.0,
             slip_rate: 0.0,
         }
     }
@@ -741,6 +777,20 @@ pub struct JudgementUnit {
 /// asymmetry.
 pub const LN_SIGMA_SCALE: f64 = std::f64::consts::SQRT_2;
 
+/// How many long-note duration buckets the judgement model distinguishes.
+///
+/// Lives here rather than in `sunny` because it is a property of the error model — the
+/// map layer only counts notes into whatever buckets the model asks for. The edges
+/// themselves are `sunny::LN_DURATION_EDGES`, since those are in map time.
+///
+/// Eight rather than five, chosen by measurement: at five bins the spread of the
+/// spread-multiplier *within* a bin reached 32%, and
+/// `sunny::tests::ln_binning_error_stays_small` measured a 4.5% worst-case error in
+/// fitted skill against evaluating every long note at its own duration. Eight brings
+/// that under the 2% bar. The cost is linear and trivial — a fit walks one unit per
+/// occupied bin, so at most nine.
+pub const LN_DURATION_BUCKETS: usize = 8;
+
 /// The timing-spread multiplier for a ScoreV1 long note whose release is
 /// `release_ratio` times as wide as its press: `sqrt(1 + release_ratio^2)`.
 ///
@@ -760,6 +810,71 @@ pub fn ln_sigma_scale(release_ratio: f64) -> f64 {
     let ratio = release_ratio.max(1.0);
 
     (1.0 + ratio * ratio).sqrt()
+}
+
+/// How much wider a release lands than a press, for a hold of `duration` ms.
+///
+/// Two effects, both pushing the same way:
+///
+/// - **A release is inherently harder to place than a press.** There is no impact to
+///   time against, and the finger is moving off the key rather than onto it. That is the
+///   `release_ratio` floor, applying at any duration.
+/// - **A shorter hold is harder still.** The press motion is not finished when the
+///   release is already due, so the player has no chance to reset — the release is
+///   placed relative to a press that is itself still in flight. As the hold lengthens
+///   the release becomes its own independent act and this surcharge decays away.
+///
+/// Modelled as
+///
+/// ```text
+/// ratio(t) = release_ratio * (1 + short_hold_penalty * exp(-t / short_hold_scale))
+/// ```
+///
+/// so `short_hold_scale` is the duration over which the surcharge decays by `1/e` and
+/// `short_hold_penalty` is its size at zero duration. A long hold tends to
+/// `release_ratio`, recovering the duration-independent model exactly.
+///
+/// Exponential rather than a power law or a hard cutoff, for three reasons: it is
+/// monotone and finite at `t = 0` where a power law diverges, it has one obvious scale
+/// parameter to fit instead of an exponent plus an offset, and it makes the "long holds
+/// are just independent releases" limit exact rather than asymptotic-in-principle.
+///
+/// Continuous in duration by design. An earlier attempt bucketed duration into five
+/// *semantic* categories with a free correlation each, which is five parameters for one
+/// monotone effect and unidentifiable on 119 scores.
+pub fn release_ratio_for_duration(model: &ErrorModel, duration: f64) -> f64 {
+    let base = model.release_sigma_ratio.max(1.0);
+
+    if !duration.is_finite() || duration <= 0.0 {
+        // A non-positive duration is not a hold at all; charge the full surcharge
+        // rather than silently treating it as an infinitely long one.
+        return base * (1.0 + model.short_hold_penalty.max(0.0));
+    }
+
+    let penalty = model.short_hold_penalty.max(0.0);
+
+    if penalty <= 0.0 {
+        return base;
+    }
+
+    let scale = model.short_hold_scale;
+
+    // A non-positive scale means "no duration dependence": the surcharge would decay
+    // instantly, which is the same as not having one.
+    if !scale.is_finite() || scale <= 0.0 {
+        return base;
+    }
+
+    base * (1.0 + penalty * (-duration / scale).exp())
+}
+
+/// The timing-spread multiplier for a ScoreV1 long note of `duration` ms.
+///
+/// Composes [`release_ratio_for_duration`] with [`ln_sigma_scale`]: the duration sets
+/// how much wider the release is, and the variances then add because the two offsets are
+/// summed into one judgement.
+pub fn ln_sigma_scale_for_duration(model: &ErrorModel, duration: f64) -> f64 {
+    ln_sigma_scale(release_ratio_for_duration(model, duration))
 }
 
 impl JudgementUnit {
@@ -785,12 +900,13 @@ impl JudgementUnit {
     /// for the model's release asymmetry.
     ///
     /// Takes the model rather than a bare scale so the release ratio cannot drift
-    /// apart from the one the fit is using.
-    pub fn long_note(difficulty: f64, count: f64, model: &ErrorModel) -> Self {
+    /// apart from the one the fit is using. `duration_ms` is how long the hold lasts in
+    /// map time, which decides how much of the short-hold surcharge it pays.
+    pub fn long_note(difficulty: f64, count: f64, model: &ErrorModel, duration_ms: f64) -> Self {
         Self {
             difficulty,
             weight: count,
-            sigma_scale: ln_sigma_scale(model.release_sigma_ratio),
+            sigma_scale: ln_sigma_scale_for_duration(model, duration_ms),
         }
     }
 
