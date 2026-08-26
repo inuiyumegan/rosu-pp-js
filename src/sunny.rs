@@ -528,7 +528,11 @@ fn hit_leniency_from_window(great_hit_window: f64) -> f64 {
 /// weights use the head-only density.
 pub(crate) fn is_classic(lazer: Option<bool>, mods: &GameMods) -> bool {
     let lazer = lazer.unwrap_or(true);
-    let sv2 = has_mod(mods, "V2");
+    // `SV2`, not `V2`: that is the acronym `rosu_mods::ScoreV2Mania` reports, and the
+    // string is parsed rather than matched, so a wrong one silently never matches. It
+    // did exactly that — every score read as ScoreV1, which mattered as soon as long
+    // notes started being judged differently under the two.
+    let sv2 = has_mod(mods, "SV2");
     let cl = has_mod(mods, "CL");
 
     (!lazer && !sv2) || cl
@@ -4356,6 +4360,231 @@ mod tests {
                     None => print!("  {:>13}", "-"),
                 }
                 println!("  {:>9}", format!("{plausible}/{}", affected.len()));
+            }
+        }
+    }
+
+    /// `is_classic` must actually see the ScoreV2 mod.
+    ///
+    /// Regression test for a silent failure: [`has_mod`] *parses* the acronym string, so
+    /// a wrong one is not a compile error and not a panic — it simply never matches. The
+    /// code asked for `"V2"` where `rosu_mods::ScoreV2Mania` reports `"SV2"`, so every
+    /// score was classified as ScoreV1. That was harmless while V2 only changed the score
+    /// number, and became a real bug the moment long notes were judged differently under
+    /// the two schemes.
+    ///
+    /// Asserts against the mod's own acronym rather than a literal, so this cannot drift
+    /// with the mod crate.
+    #[test]
+    fn classic_detection_sees_the_score_v2_mod() {
+        assert_eq!(
+            rosu_mods::generated_mods::ScoreV2Mania::acronym().as_str(),
+            "SV2",
+            "the acronym this code looks up must be the one the mod reports"
+        );
+
+        let mut v2 = LazerMods::new();
+        single_mod(&mut v2, GameMod::ScoreV2Mania(Default::default()));
+
+        assert!(
+            !is_classic(Some(false), &v2),
+            "a stable score with ScoreV2 judges long notes as two units, so it is not classic"
+        );
+        assert!(
+            is_classic(Some(false), &LazerMods::new()),
+            "a stable score without ScoreV2 is classic"
+        );
+
+        // The lazer default is the other direction, and CL overrides it.
+        assert!(!is_classic(Some(true), &LazerMods::new()));
+
+        let mut cl = LazerMods::new();
+        single_mod(&mut cl, GameMod::ClassicMania(Default::default()));
+        assert!(is_classic(Some(true), &cl));
+    }
+
+    /// Whether the surface infers *less skill* from the same player on long-note charts
+    /// — the "爆黄" complaint, stated in the only form the model can be wrong about.
+    ///
+    /// 爆黄 is 320 -> 300: on LN-heavy charts players cannot convert PERFECTs no matter
+    /// how well they play, and the surplus lands in the yellow 300. This never appears as
+    /// a *residual*, because skill is free per score and the fit simply answers a lower
+    /// number — a 320/300 ratio the model finds surprising becomes "this player is worse",
+    /// not "this score fits badly". So goodness of fit cannot see the complaint at all,
+    /// and every `g_timing` figure in the other harnesses is silent about it.
+    ///
+    /// What it does do is move pricing. If a player's fitted skill falls as LN share
+    /// rises, the surface is charging them for a structural property of the chart, which
+    /// is exactly what the LN widening exists to undo. The question is whether it undoes
+    /// enough of it, and the per-player slope answers that: within one player, true skill
+    /// is roughly constant across their top plays, so any systematic trend against LN
+    /// share is the model's, not the player's.
+    ///
+    /// Confounded in one direction worth stating: a player genuinely weaker at LN will
+    /// show a real negative slope too, and this cannot separate that from a modelling
+    /// artefact. What it *can* do is show whether the LN split moves the slope toward
+    /// zero, which is the thing under our control. Run it with and without
+    /// `SUNNY_NO_LN_SPLIT=1` to see that.
+    ///
+    /// Run with `cargo test --release ln_skill_slope -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn ln_skill_slope() {
+        use std::collections::BTreeMap;
+
+        let Ok(text) = std::fs::read_to_string("local-fixtures/multiuser.tsv") else {
+            println!("no fixtures present; nothing to report");
+            return;
+        };
+
+        struct Point {
+            uid: String,
+            ln_share: f64,
+            median_hold: f64,
+            stars: f64,
+            skill: f64,
+            /// Skill as a multiple of the map's difficulty, which is the scale-free form.
+            /// Comparing raw skill across maps of different star rating would mostly
+            /// measure which maps the player chose.
+            skill_ratio: f64,
+            perfect_share: f64,
+        }
+
+        let model = ErrorModel::default();
+        let mut points = Vec::new();
+
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 18 || f[0] == "uid" {
+                continue;
+            }
+
+            let u = |s: &str| s.parse::<u32>().unwrap_or(0);
+            let counts = [u(f[7]), u(f[8]), u(f[9]), u(f[10]), u(f[11]), u(f[12])];
+            let total: u32 = counts.iter().sum();
+
+            let Some(map) = parse(&format!("local-fixtures/maps/{}.osu", f[2])) else {
+                continue;
+            };
+
+            let (mods, clock_rate) = mods_for(f[3]);
+            let Some(attrs) = calculate(&map, &mods, clock_rate, Some(false), None) else {
+                continue;
+            };
+
+            // Only V1 scores: under V2 the head and release are separate judgements and
+            // the mechanism does not apply, so mixing them in would dilute the slope.
+            if !attrs.ln_judged_as_one || total == 0 || attrs.stars <= 0.0 {
+                continue;
+            }
+
+            let units = judgement_units(&attrs, f64::from(total), &model);
+            let fit = fit_with_quality(&counts, &units, &attrs.hit_windows, &model);
+
+            let total_columns = map.cs.round_ties_even().max(1.0) as usize;
+            let (notes, _) = build_notes(clock_rate, map.hit_objects.iter(), total_columns);
+            let mut holds: Vec<f64> = notes
+                .iter()
+                .filter_map(|n| {
+                    let d = n.tail_or_head() - n.head;
+                    (d > 0.0).then_some(d)
+                })
+                .collect();
+            holds.sort_by(f64::total_cmp);
+
+            let timing: f64 = counts[..5].iter().map(|&c| f64::from(c)).sum();
+
+            points.push(Point {
+                uid: f[0].to_owned(),
+                ln_share: if attrs.n_objects > 0 {
+                    attrs.n_long_notes as f64 / attrs.n_objects as f64
+                } else {
+                    0.0
+                },
+                median_hold: if holds.is_empty() {
+                    0.0
+                } else {
+                    holds[holds.len() / 2]
+                },
+                stars: attrs.stars,
+                skill: fit.skill,
+                skill_ratio: fit.skill / attrs.stars,
+                perfect_share: if timing > 0.0 {
+                    f64::from(counts[0]) / timing
+                } else {
+                    0.0
+                },
+            });
+        }
+
+        if points.is_empty() {
+            println!("no V1 scores in the fixture set; nothing to report");
+            return;
+        }
+
+        println!(
+            "LN split is {}. {} V1 scores.",
+            if ln_split_disabled() { "DISABLED" } else { "on" },
+            points.len()
+        );
+        println!(
+            "\n320 share and fitted skill/stars against LN share, per player.\n\
+             A negative skill/stars trend means the surface reads an LN chart as the \
+             player being worse."
+        );
+
+        let mut by_uid: BTreeMap<&str, Vec<&Point>> = BTreeMap::new();
+        for point in &points {
+            by_uid.entry(point.uid.as_str()).or_default().push(point);
+        }
+
+        for (uid, rows) in &by_uid {
+            println!("\n=== uid {uid} ({} V1 scores)", rows.len());
+            println!(
+                "{:>14} {:>5}  {:>13}  {:>13}  {:>13}",
+                "LN share", "n", "320 share", "skill/stars", "med hold ms"
+            );
+
+            for (lo, hi) in [(0.0, 0.05), (0.05, 0.4), (0.4, 0.75), (0.75, 1.01)] {
+                let band: Vec<&&Point> = rows
+                    .iter()
+                    .filter(|p| p.ln_share >= lo && p.ln_share < hi)
+                    .collect();
+                if band.is_empty() {
+                    continue;
+                }
+                let n = band.len() as f64;
+                let mean = |get: &dyn Fn(&Point) -> f64| -> f64 {
+                    band.iter().map(|p| get(p)).sum::<f64>() / n
+                };
+                println!(
+                    "{:>13}% {:>5}  {:>13.4}  {:>13.4}  {:>13.0}",
+                    format!("{:.0}-{:.0}", 100.0 * lo, 100.0 * hi),
+                    band.len(),
+                    mean(&|p| p.perfect_share),
+                    mean(&|p| p.skill_ratio),
+                    mean(&|p| p.median_hold),
+                );
+            }
+
+            // Least-squares slope of skill/stars on LN share, within this player. The
+            // sign is the whole point; the magnitude says how much pp is at stake.
+            let n = rows.len() as f64;
+            let mean_x = rows.iter().map(|p| p.ln_share).sum::<f64>() / n;
+            let mean_y = rows.iter().map(|p| p.skill_ratio).sum::<f64>() / n;
+            let covariance: f64 = rows
+                .iter()
+                .map(|p| (p.ln_share - mean_x) * (p.skill_ratio - mean_y))
+                .sum();
+            let variance: f64 = rows.iter().map(|p| (p.ln_share - mean_x).powi(2)).sum();
+
+            if variance > 1e-9 {
+                let slope = covariance / variance;
+                println!(
+                    "  slope d(skill/stars)/d(LN share) = {slope:+.4}  \
+                     (mean skill/stars {mean_y:.4}, so {:+.1}% across the full LN range)",
+                    100.0 * slope / mean_y
+                );
             }
         }
     }
