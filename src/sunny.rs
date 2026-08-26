@@ -64,6 +64,22 @@ pub struct SunnyManiaDifficultyAttributes {
     pub max_combo: u32,
     /// The amount of hit objects taken into account.
     pub n_objects: usize,
+    /// How many of those hit objects are long notes.
+    ///
+    /// Read straight off the map, so it is structural input to the judgement model
+    /// rather than anything inferred from a score. [`window_scalar`] uses it to split
+    /// the map into rice and LN populations, since a ScoreV1 long note is judged on
+    /// the sum of two offsets and so carries `sqrt(2)` the timing spread — see
+    /// [`crate::mania_accuracy::LN_SIGMA_SCALE`].
+    pub n_long_notes: usize,
+    /// Whether long notes give a single combined judgement (ScoreV1 / classic)
+    /// rather than separate head and release judgements (ScoreV2).
+    ///
+    /// This is [`is_classic`] carried forward, because the judgement *count* depends
+    /// on it: under V1 the map yields `n_objects` judgements, under V2 it yields
+    /// `n_objects + n_long_notes`. Verified against 143 live scores — every V2 score
+    /// totalled `notes + LN`, and every V1 score bar one totalled `notes`.
+    pub ln_judged_as_one: bool,
 }
 
 /// The result of the sunny performance calculation.
@@ -148,6 +164,8 @@ pub fn calculate(
         hit_windows: windows,
         max_combo,
         n_objects: data.notes.len(),
+        n_long_notes: data.long_notes.len(),
+        ln_judged_as_one: classic,
     })
 }
 
@@ -231,6 +249,79 @@ const REFERENCE_WINDOWS: ManiaHitWindows = ManiaHitWindows {
 ///
 /// Returns 1.0 only when there is nothing to measure: an empty score, or a fit that
 /// did not produce a usable positive skill on both sides.
+/// Whether `SUNNY_NO_LN_SPLIT` is set, which collapses the LN mixture back to a
+/// single population.
+///
+/// An A/B switch for the reporting harnesses, not a feature: the LN split changes no
+/// free parameters, so the only way to attribute a change in fit quality to it is to
+/// price the same fixtures both ways in one build. Unset in every normal run,
+/// including every unit test that pins the split's behaviour.
+fn ln_split_disabled() -> bool {
+    std::env::var_os("SUNNY_NO_LN_SPLIT").is_some()
+}
+
+/// The judgement units a score's counts are fitted against: the map split into a
+/// rice population and, under ScoreV1, a wider long-note one.
+///
+/// Local difficulty is still uniform at the map's star rating — per-note difficulty
+/// is the separate, larger change — so the only structure here is the LN split. That
+/// split matters because an LN-heavy chart is a *mixture*: fitting one sigma to a
+/// mixture of two widths inflates it, which drives the estimated skill down and, via
+/// the `^2.2` in pp, costs far more than the widening itself. 7K charts in the
+/// fixture set average 58% long notes against 4K's 3%, so this is where the two
+/// populations actually differ.
+///
+/// Under ScoreV2 heads and releases are judged separately, so every judgement is a
+/// single press and there is no mixture; the units come back uniform and only the
+/// count changes. `total` is the score's own judgement total, which the caller has
+/// already measured, so the returned weights always sum to exactly what was
+/// observed even when the map's structure and the score disagree.
+///
+/// Everything read here comes from the `.osu` and the mod list. Nothing about how
+/// well the player did enters, which is the line that keeps a bad play from being
+/// re-read as a hard map.
+fn judgement_units(
+    attrs: &SunnyManiaDifficultyAttributes,
+    total: f64,
+    model: &ErrorModel,
+) -> Vec<JudgementUnit> {
+    let uniform = vec![JudgementUnit::repeated(attrs.stars, total)];
+
+    // Under V2 the head and release are two ordinary single-press judgements, so
+    // there is no wide population to separate out.
+    if !attrs.ln_judged_as_one || attrs.n_long_notes == 0 || attrs.n_objects == 0 {
+        return uniform;
+    }
+
+    if ln_split_disabled() {
+        return uniform;
+    }
+
+    // Scale the map's LN share onto the score's own judgement total rather than
+    // using the map's counts directly. A partial play, or a count vector that
+    // disagrees with our object parsing, then still produces weights summing to the
+    // observed total, which is what the multinomial fit requires.
+    let ln_share = attrs.n_long_notes as f64 / attrs.n_objects as f64;
+    let ln_units = (total * ln_share).clamp(0.0, total);
+    let rice_units = total - ln_units;
+
+    let mut units = Vec::with_capacity(2);
+
+    if rice_units > 0.0 {
+        units.push(JudgementUnit::repeated(attrs.stars, rice_units));
+    }
+
+    if ln_units > 0.0 {
+        units.push(JudgementUnit::long_note(attrs.stars, ln_units, model));
+    }
+
+    if units.is_empty() {
+        return uniform;
+    }
+
+    units
+}
+
 fn window_scalar(attrs: &SunnyManiaDifficultyAttributes, state: SunnyScoreState) -> f64 {
     let total = state.total_hits();
 
@@ -247,11 +338,8 @@ fn window_scalar(attrs: &SunnyManiaDifficultyAttributes, state: SunnyScoreState)
         state.misses,
     ];
 
-    // Uniform local difficulty for now: every note carries the map's star rating.
-    // Per-note difficulty replaces this, and is why the response is currently the
-    // same on every map.
-    let units = [JudgementUnit::repeated(attrs.stars, f64::from(total))];
     let model = ErrorModel::default();
+    let units = judgement_units(attrs, f64::from(total), &model);
 
     let played = fit_with_quality(&counts, &units, &attrs.hit_windows, &model);
     let reference = fit_with_quality(&counts, &units, &REFERENCE_WINDOWS, &model);
@@ -3506,6 +3594,13 @@ mod tests {
         g_timing: f64,
         plausible: bool,
         notes: u32,
+        /// The map's long-note share, and the axis the LN mixture actually acts on.
+        /// Key count only stands in for it — 7K charts here average 58% long notes
+        /// against 4K's 3% — so grouping by this separates the mechanism from the
+        /// convention.
+        ln_fraction: f64,
+        /// Whether the score's long notes were judged as one unit (V1) or two (V2).
+        ln_judged_as_one: bool,
     }
 
     /// Reproduces the pre-change pp for one score: the flat `EZ` `0.90` that
@@ -3540,12 +3635,21 @@ mod tests {
     /// Builds the mod state for a report row from its mod-name string.
     ///
     /// Only mods that reach the sunny path are translated: `EZ` and `HR` scale the
-    /// windows, `NF` carries the flat factor, and `DT`/`NC`/`HT` are a clock rate
-    /// rather than a `GameMod`. `V2` and `MR` are deliberately ignored — mirror does
-    /// not change difficulty in this calculator and ScoreV2 only changes the score
-    /// number, not the judgements the surface reads.
+    /// windows, `NF` carries the flat factor, `V2` decides how long notes are judged,
+    /// and `DT`/`NC`/`HT` are a clock rate rather than a `GameMod`. `MR` is ignored,
+    /// since mirroring does not change difficulty in this calculator.
+    ///
+    /// `V2` used to be ignored here too, on the grounds that it "only changes the
+    /// score number, not the judgements". That is true for rice and false for long
+    /// notes, and the fixture set settles it: all 45 V2 rows have a judgement total of
+    /// `notes + LN` while 97 of 98 non-V2 rows total `notes`. So V2 splits an LN into
+    /// two judgements and V1 combines them, which changes both the count and the
+    /// spread — see [`crate::mania_accuracy::LN_SIGMA_SCALE`].
     fn mods_for(names: &str) -> (LazerMods, f64) {
         let mut mods = LazerMods::new();
+        if names.contains("V2") {
+            single_mod(&mut mods, GameMod::ScoreV2Mania(Default::default()));
+        }
         if names.contains("EZ") {
             single_mod(&mut mods, GameMod::EasyMania(Default::default()));
         }
@@ -3600,7 +3704,15 @@ mod tests {
             };
 
             let (mods, clock_rate) = mods_for(&row.mods);
-            let Some(attrs) = calculate(&map, &mods, clock_rate, Some(true), None) else {
+
+            // These are ppy.sb scores, i.e. stable, so `lazer: false`. It used to be
+            // `Some(true)` here, which silently made every fixture ScoreV2 and hid the
+            // LN judgement regime entirely. The judgement totals settle which is
+            // right: a non-V2 row totals `notes`, which is the V1/classic count, and
+            // only the V2 rows total `notes + LN`. With `is_classic(Some(false), ..)`
+            // the V2 bit in `mods` now selects between the two the same way the server
+            // does.
+            let Some(attrs) = calculate(&map, &mods, clock_rate, Some(false), None) else {
                 continue;
             };
 
@@ -3614,11 +3726,8 @@ mod tests {
             };
 
             let perf = calculate_performance(&attrs, &mods, state);
-            let units = [JudgementUnit::repeated(
-                attrs.stars,
-                f64::from(state.total_hits()),
-            )];
             let model = ErrorModel::default();
+            let units = judgement_units(&attrs, f64::from(state.total_hits()), &model);
             let fit = fit_with_quality(&row.counts, &units, &attrs.hit_windows, &model);
 
             out.push(MultiPriced {
@@ -3632,6 +3741,12 @@ mod tests {
                 g_timing: fit.g_timing,
                 plausible: fit.is_plausible(),
                 notes: state.total_hits(),
+                ln_fraction: if attrs.n_objects > 0 {
+                    attrs.n_long_notes as f64 / attrs.n_objects as f64
+                } else {
+                    0.0
+                },
+                ln_judged_as_one: attrs.ln_judged_as_one,
                 row,
             });
         }
@@ -3806,7 +3921,46 @@ mod tests {
             }
             let n = band.len() as f64;
             let mean_od = band.iter().map(|r| f64::from(r.od)).sum::<f64>() / n;
-            summarise_group(&format!("{keys}k (mean OD {mean_od:.1})"), &band);
+            let mean_ln = band.iter().map(|r| r.ln_fraction).sum::<f64>() / n;
+            summarise_group(
+                &format!("{keys}k (mean OD {mean_od:.1}, LN {:.0}%)", 100.0 * mean_ln),
+                &band,
+            );
+        }
+
+        // Long-note share, which is the axis the LN mixture acts on and the thing key
+        // count was standing in for. Under V1 a long note is one judgement over two
+        // summed offsets, so an LN-heavy map is a mixture of a narrow and a wide
+        // population; fitting a single sigma to that inflates it. Grouping here
+        // separates the mechanism from the 4k/7k convention above. Set
+        // `SUNNY_NO_LN_SPLIT=1` to price the same rows without the split.
+        println!(
+            "\nby long-note share (the axis the LN mixture acts on; split {}):",
+            if ln_split_disabled() {
+                "DISABLED"
+            } else {
+                "on"
+            }
+        );
+        for (lo, hi) in [(0.0, 0.05), (0.05, 0.3), (0.3, 0.6), (0.6, 1.01)] {
+            let band: Vec<&MultiPriced> = all
+                .iter()
+                .copied()
+                .filter(|r| r.ln_fraction >= lo && r.ln_fraction < hi)
+                .collect();
+            if band.is_empty() {
+                continue;
+            }
+            let v1 = band.iter().filter(|r| r.ln_judged_as_one).count();
+            summarise_group(
+                &format!(
+                    "LN {:>3.0}-{:<3.0}% ({v1}/{} judged V1)",
+                    100.0 * lo,
+                    100.0 * hi,
+                    band.len()
+                ),
+                &band,
+            );
         }
 
         // Our star rating against the live server's, which is the other half of the
@@ -3846,6 +4000,226 @@ mod tests {
         );
     }
 
+    /// Sweeps [`ErrorModel::release_sigma_ratio`] and reports fit quality by long-note
+    /// share, testing whether a release is harder to place than a press.
+    ///
+    /// The question this settles: `sqrt(2)` assumes a release lands as precisely as a
+    /// press, and players say it does not. The sweep prices the same fixtures at
+    /// ratios from 1.0 (no asymmetry) upward and watches median `g_timing` on the
+    /// LN-heavy bands, where the parameter is the only thing moving.
+    ///
+    /// Read the LN 0-5% row as the control: the split cannot touch those maps, so any
+    /// movement there would mean the sweep is leaking into rice scores and the
+    /// mechanism is not what it claims to be.
+    ///
+    /// Unlike `sigma_floor_sweep`, which found its parameter unidentifiable because
+    /// skill absorbs it exactly, this one changes the *ratio* between two populations
+    /// inside a single map, which skill cannot reproduce. So it should be visible here
+    /// or nowhere.
+    ///
+    /// Run with `cargo test --release ln_release_ratio_sweep -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn ln_release_ratio_sweep() {
+        use crate::mania_accuracy::ln_sigma_scale;
+
+        let cases = load_ln_cases();
+
+        if cases.is_empty() {
+            println!("no fixtures present (local-fixtures/multiuser.tsv); nothing to sweep");
+            return;
+        }
+
+        // The first band is exclusive of zero on purpose. A "0-5% LN" band is *not* a
+        // control: only 24 of the 88 fixtures under 5% have no long notes at all, and
+        // the other 64 have a handful, so the ratio does reach them and the band moves.
+        // The true control is `n_long_notes == 0` (plus every V2 score), reported
+        // separately below.
+        let bands: [(f64, f64); 4] = [(1e-9, 0.05), (0.05, 0.3), (0.3, 0.6), (0.6, 1.01)];
+
+        println!(
+            "{} cases, {} with a V1 long-note population",
+            cases.len(),
+            cases.iter().filter(|c| c.has_ln_effect()).count()
+        );
+        print!("{:>6} {:>7}  {:>13}", "ratio", "scale", "CONTROL");
+        for (lo, hi) in bands {
+            print!("  {:>13}", format!("LN{:.0}-{:.0}%", 100.0 * lo, 100.0 * hi));
+        }
+        println!("  {:>13}  {:>9}", "all V1+LN", "plaus");
+        println!("{}", "-".repeat(6 + 7 + 4 * 15 + 15 + 11));
+
+        for ratio in [1.0, 1.1, 1.2, 1.35, 1.5, 1.75, 2.0, 2.5, 3.0] {
+            let model = ErrorModel {
+                release_sigma_ratio: ratio,
+                ..Default::default()
+            };
+
+            // Median g_timing over a subset, refitting each case under `model`.
+            let median_g = |subset: &[&LnCase]| -> Option<f64> {
+                let mut gs: Vec<f64> = subset
+                    .iter()
+                    .map(|c| {
+                        let total: u32 = c.counts.iter().sum();
+                        let units = ln_units_for(c, f64::from(total), &model);
+                        fit_with_quality(&c.counts, &units, &c.windows, &model).g_timing
+                    })
+                    .collect();
+
+                if gs.is_empty() {
+                    return None;
+                }
+
+                gs.sort_by(f64::total_cmp);
+                Some(gs[gs.len() / 2])
+            };
+
+            print!("{ratio:>6.2} {:>7.3}", ln_sigma_scale(ratio));
+
+            // The genuine control: cases the LN split cannot reach at all, either
+            // because the map has no long notes or because V2 judged them separately.
+            // This column must be constant to the digit, or the parameter is doing
+            // something other than what it claims.
+            let control: Vec<&LnCase> = cases.iter().filter(|c| !c.has_ln_effect()).collect();
+            match median_g(&control) {
+                Some(g) => print!("  {:>13}", format!("{g:.3} (n={})", control.len())),
+                None => print!("  {:>13}", "-"),
+            }
+
+            for (lo, hi) in bands {
+                let band: Vec<&LnCase> = cases
+                    .iter()
+                    .filter(|c| {
+                        c.has_ln_effect() && c.ln_fraction() >= lo && c.ln_fraction() < hi
+                    })
+                    .collect();
+
+                match median_g(&band) {
+                    Some(g) => print!("  {:>13}", format!("{g:.1} (n={})", band.len())),
+                    None => print!("  {:>13}", "-"),
+                }
+            }
+
+            // Only the cases the parameter can reach, which is the figure to minimise.
+            let affected: Vec<&LnCase> = cases.iter().filter(|c| c.has_ln_effect()).collect();
+            let plausible = affected
+                .iter()
+                .filter(|c| {
+                    let total: u32 = c.counts.iter().sum();
+                    let units = ln_units_for(c, f64::from(total), &model);
+                    fit_with_quality(&c.counts, &units, &c.windows, &model).is_plausible()
+                })
+                .count();
+
+            match median_g(&affected) {
+                Some(g) => print!("  {:>13}", format!("{g:.1} (n={})", affected.len())),
+                None => print!("  {:>13}", "-"),
+            }
+            println!("  {:>9}", format!("{plausible}/{}", affected.len()));
+        }
+
+        println!(
+            "\nCONTROL is the cases the split cannot reach (no long notes, or V2 judging); \
+             it must be constant."
+        );
+        println!(
+            "scale is sqrt(1 + ratio^2), the widening a V1 long note gets; ratio 1.00 is the \
+             derived sqrt(2)."
+        );
+    }
+
+    /// The judgement units for one [`LnCase`], mirroring [`judgement_units`] but
+    /// driven by a case rather than by live attributes.
+    fn ln_units_for(case: &LnCase, total: f64, model: &ErrorModel) -> Vec<JudgementUnit> {
+        if !case.has_ln_effect() || case.n_objects == 0 {
+            return vec![JudgementUnit::repeated(case.stars, total)];
+        }
+
+        let ln_units = (total * case.ln_fraction()).clamp(0.0, total);
+        let rice_units = total - ln_units;
+
+        let mut units = Vec::with_capacity(2);
+        if rice_units > 0.0 {
+            units.push(JudgementUnit::repeated(case.stars, rice_units));
+        }
+        if ln_units > 0.0 {
+            units.push(JudgementUnit::long_note(case.stars, ln_units, model));
+        }
+        units
+    }
+
+    /// One fixture row reduced to what a refit needs, so the sweep below can vary the
+    /// model without re-parsing beatmaps for every candidate.
+    struct LnCase {
+        counts: [u32; 6],
+        stars: f64,
+        windows: ManiaHitWindows,
+        n_objects: usize,
+        n_long_notes: usize,
+        ln_judged_as_one: bool,
+        keys: u32,
+    }
+
+    impl LnCase {
+        fn ln_fraction(&self) -> f64 {
+            if self.n_objects == 0 {
+                0.0
+            } else {
+                self.n_long_notes as f64 / self.n_objects as f64
+            }
+        }
+
+        /// Whether the LN mixture can act on this case at all: V1 judging, and some
+        /// long notes to widen.
+        fn has_ln_effect(&self) -> bool {
+            self.ln_judged_as_one && self.n_long_notes > 0
+        }
+    }
+
+    /// Loads `local-fixtures/multiuser.tsv` into refittable cases.
+    ///
+    /// Deliberately separate from [`load_multiuser`]: that one prices scores through
+    /// the full pp stack with the default model, while this keeps the raw inputs so a
+    /// sweep can refit them under any [`ErrorModel`].
+    fn load_ln_cases() -> Vec<LnCase> {
+        let Ok(text) = std::fs::read_to_string("local-fixtures/multiuser.tsv") else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 18 || f[0] == "uid" {
+                continue;
+            }
+
+            let u = |s: &str| s.parse::<u32>().unwrap_or(0);
+            let counts = [u(f[7]), u(f[8]), u(f[9]), u(f[10]), u(f[11]), u(f[12])];
+
+            let Some(map) = parse(&format!("local-fixtures/maps/{}.osu", f[2])) else {
+                continue;
+            };
+
+            let (mods, clock_rate) = mods_for(f[3]);
+            let Some(attrs) = calculate(&map, &mods, clock_rate, Some(false), None) else {
+                continue;
+            };
+
+            out.push(LnCase {
+                counts,
+                stars: attrs.stars,
+                windows: attrs.hit_windows,
+                n_objects: attrs.n_objects,
+                n_long_notes: attrs.n_long_notes,
+                ln_judged_as_one: attrs.ln_judged_as_one,
+                keys: u(f[6]),
+            });
+        }
+
+        out
+    }
+
     /// Clip a title to `n` chars on a char boundary, since beatmap metadata is
     /// routinely CJK and byte slicing would panic.
     fn truncate(s: &str, n: usize) -> String {
@@ -3878,11 +4252,19 @@ mod tests {
             .sum::<f64>()
             / n;
 
+        // Median rather than mean g_timing: the statistic has a long right tail on
+        // real scores, so a handful of unexplainable plays would otherwise set the
+        // figure for the whole group.
+        let mut gs: Vec<f64> = rows.iter().map(|r| r.g_timing).collect();
+        gs.sort_by(f64::total_cmp);
+        let median_g = gs[gs.len() / 2];
+
         let n_rows = rows.len();
         let sum_delta = (after / before - 1.0) * 100.0;
         println!(
             "  {label}: n={n_rows} mean scalar {mean_scalar:.4}  mean dPP {mean_delta:+.2}%  \
-             sum {before:.0} -> {after:.0} ({sum_delta:+.2}%)  plausible {plausible}/{n_rows}"
+             sum {before:.0} -> {after:.0} ({sum_delta:+.2}%)  plausible {plausible}/{n_rows}  \
+             med g {median_g:.1}"
         );
     }
 }

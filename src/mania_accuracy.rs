@@ -354,6 +354,29 @@ pub struct ErrorModel {
     /// and letting it go narrower would make the two components trade places and the
     /// fit bimodal.
     pub lapse_ratio: f64,
+    /// How much wider a key *release* lands than a key press, as a multiple of the
+    /// press spread.
+    ///
+    /// Only reaches the model through [`ln_sigma_scale`], i.e. only for long notes
+    /// judged as a single unit (ScoreV1). At `1.0` a release is as controllable as a
+    /// press and a long note carries [`LN_SIGMA_SCALE`]; above it the long note is
+    /// wider still.
+    ///
+    /// **Why it is a free parameter when `sigma_floor` was rejected as one.** A floor
+    /// is unidentifiable because the fit absorbs it into skill exactly — it moves
+    /// every unit's sigma the same way, and skill can undo that. This does not: it
+    /// widens *only* the LN population, so it changes the *ratio* of the two
+    /// components within a map, which no amount of skill can reproduce. It is
+    /// therefore visible to the counts precisely on the maps that motivate it, and
+    /// invisible on rice maps where it should do nothing.
+    ///
+    /// **Why it must be fitted rather than assumed.** `sqrt(2)` is the `1.0` case and
+    /// the fixture set already argues against it: introducing the split at `1.0`
+    /// improved median `g_timing` on maps of 30-60% long notes (39.3 to 33.1) but made
+    /// it *worse* where long notes dominate (46.0 to 53.3 above 60%). Under-widening
+    /// explains exactly that pattern, since the mixture approaches a single wide
+    /// population as the LN share approaches one.
+    pub release_sigma_ratio: f64,
     /// The per-note probability of a lapse unrelated to timing precision: a
     /// misread, a slipped finger, a dropped input.
     ///
@@ -385,6 +408,9 @@ impl Default for ErrorModel {
             sigma_floor: 0.0,
             lapse_weight: 0.034,
             lapse_ratio: 4.4,
+            // The no-asymmetry floor until the sweep says otherwise, so the shipped
+            // default still rests on the derived `sqrt(2)` rather than on a guess.
+            release_sigma_ratio: 1.0,
             slip_rate: 0.0,
         }
     }
@@ -535,7 +561,34 @@ pub fn judgement_probabilities(
     difficulty: f64,
     skill: f64,
 ) -> JudgementProbabilities {
-    let sigma = model.sigma(difficulty, skill);
+    judgement_probabilities_scaled(windows, model, difficulty, skill, 1.0)
+}
+
+/// As [`judgement_probabilities`], with the unit's timing spread multiplied by
+/// `sigma_scale`.
+///
+/// The scale exists for judgement units whose spread differs from a plain note's
+/// by a factor *derived from the map*, not fitted: a ScoreV1 long note, whose head
+/// and release offsets are summed into a single judgement, is the motivating case
+/// at `sqrt(2)`. Because it multiplies sigma rather than replacing it, the unit
+/// still tracks `difficulty / skill`, so nothing becomes unrepresentable at high
+/// skill the way a fixed sigma floor would.
+pub fn judgement_probabilities_scaled(
+    windows: &ManiaHitWindows,
+    model: &ErrorModel,
+    difficulty: f64,
+    skill: f64,
+    sigma_scale: f64,
+) -> JudgementProbabilities {
+    // A non-positive or NaN scale would silently turn a hard unit into a free one,
+    // so it is treated as "no scaling" rather than propagated.
+    let scale = if sigma_scale.is_finite() && sigma_scale > 0.0 {
+        sigma_scale
+    } else {
+        1.0
+    };
+
+    let sigma = model.sigma(difficulty, skill) * scale;
 
     let mut probabilities = [0.0; 6];
     // Mass still outside every window considered so far, starting with all of it.
@@ -660,6 +713,53 @@ pub struct JudgementUnit {
     /// How many judgements this unit stands for. Lets identical units collapse
     /// into one entry, which keeps the surface cheap on dense maps.
     pub weight: f64,
+    /// A multiplier on this unit's timing spread, for units that are structurally
+    /// wider than a plain note at the same difficulty.
+    ///
+    /// One for an ordinary note. [`LN_SIGMA_SCALE`] for a ScoreV1 long note, where
+    /// two offsets are summed into one judgement so their variances add. Always
+    /// read off the map's own structure, never fitted to the score — see
+    /// [`Self::long_note`].
+    pub sigma_scale: f64,
+}
+
+/// How much wider a ScoreV1 long note's effective timing spread is than a plain
+/// note's when a release is exactly as controllable as a press: `sqrt(2)`.
+///
+/// Under ScoreV1 an LN head and its release form a *single* judgement, graded on the
+/// sum of the two offsets. Independent offsets of equal spread `sigma` sum to spread
+/// `sigma * sqrt(2)`, so the same physical precision converts fewer PERFECTs on a
+/// long note than on a rice note. Under ScoreV2 the two are judged separately and
+/// this does not apply; the caller decides which regime the score was played under.
+///
+/// **This is a floor, not the expected value.** It assumes the release offset has the
+/// same spread as the press, which players consistently report is false — letting go
+/// of a key is harder to place than hitting it. With a release spread `k` times the
+/// press spread the combined scale is [`ln_sigma_scale`]'s `sqrt(1 + k^2)`, and this
+/// constant is the `k = 1` case. Keep it as the reference point that involves no
+/// calibration at all, and see [`ErrorModel::release_sigma_ratio`] for the fitted
+/// asymmetry.
+pub const LN_SIGMA_SCALE: f64 = std::f64::consts::SQRT_2;
+
+/// The timing-spread multiplier for a ScoreV1 long note whose release is
+/// `release_ratio` times as wide as its press: `sqrt(1 + release_ratio^2)`.
+///
+/// The head and release offsets are summed into one judgement, so their variances
+/// add. Writing the press spread as `sigma` and the release as `release_ratio *
+/// sigma`, the sum has spread `sigma * sqrt(1 + release_ratio^2)`. At
+/// `release_ratio = 1` this is exactly [`LN_SIGMA_SCALE`]; at 1.5 it is 1.80, and at
+/// 2 it is 2.24.
+///
+/// A ratio below 1 would say releases are *easier* to place than presses, which no
+/// account of mania playing supports, so it is clamped away.
+pub fn ln_sigma_scale(release_ratio: f64) -> f64 {
+    if !release_ratio.is_finite() {
+        return LN_SIGMA_SCALE;
+    }
+
+    let ratio = release_ratio.max(1.0);
+
+    (1.0 + ratio * ratio).sqrt()
 }
 
 impl JudgementUnit {
@@ -668,6 +768,7 @@ impl JudgementUnit {
         Self {
             difficulty,
             weight: 1.0,
+            sigma_scale: 1.0,
         }
     }
 
@@ -676,6 +777,28 @@ impl JudgementUnit {
         Self {
             difficulty,
             weight: count,
+            sigma_scale: 1.0,
+        }
+    }
+
+    /// `count` ScoreV1 long-note judgements of the given local difficulty, widened
+    /// for the model's release asymmetry.
+    ///
+    /// Takes the model rather than a bare scale so the release ratio cannot drift
+    /// apart from the one the fit is using.
+    pub fn long_note(difficulty: f64, count: f64, model: &ErrorModel) -> Self {
+        Self {
+            difficulty,
+            weight: count,
+            sigma_scale: ln_sigma_scale(model.release_sigma_ratio),
+        }
+    }
+
+    /// The same unit with its spread multiplied by `scale`.
+    pub fn with_sigma_scale(self, scale: f64) -> Self {
+        Self {
+            sigma_scale: scale,
+            ..self
         }
     }
 }
@@ -690,7 +813,13 @@ pub fn expected_counts(
     let mut totals = [0.0; 6];
 
     for unit in units {
-        let probabilities = judgement_probabilities(windows, model, unit.difficulty, skill);
+        let probabilities = judgement_probabilities_scaled(
+            windows,
+            model,
+            unit.difficulty,
+            skill,
+            unit.sigma_scale,
+        );
 
         for judgement in ManiaJudgement::ALL {
             totals[judgement as usize] += unit.weight * probabilities.get(judgement);
@@ -1149,6 +1278,113 @@ mod tests {
 
     fn uniform_units(difficulty: f64, count: usize) -> Vec<JudgementUnit> {
         vec![JudgementUnit::new(difficulty); count]
+    }
+
+    /// The whole reason the two-unit "share" form is legitimate: `expected_counts` is
+    /// linear in the weights, so collapsing identical units into one weighted entry is
+    /// exact, not an approximation.
+    ///
+    /// Worth pinning because the collapsed form looks like it is averaging when it is
+    /// in fact summing. If this ever fails, every LN-share figure becomes suspect.
+    #[test]
+    fn collapsing_identical_units_is_exact_not_an_approximation() {
+        let windows = od9_windows();
+        let model = ErrorModel::default();
+        let scale = ln_sigma_scale(1.6);
+
+        // 300 rice notes and 700 long notes, spelled out one judgement at a time.
+        let mut spelled = vec![JudgementUnit::new(6.0); 300];
+        spelled.extend(vec![JudgementUnit::new(6.0).with_sigma_scale(scale); 700]);
+
+        let collapsed = [
+            JudgementUnit::repeated(6.0, 300.0),
+            JudgementUnit::repeated(6.0, 700.0).with_sigma_scale(scale),
+        ];
+
+        let from_spelled = expected_counts(&spelled, &windows, &model, 7.0).as_array();
+        let from_collapsed = expected_counts(&collapsed, &windows, &model, 7.0).as_array();
+
+        for (a, b) in from_spelled.iter().zip(from_collapsed.iter()) {
+            assert!(
+                (a - b).abs() < 1e-9,
+                "collapsed weights must reproduce the per-note sum exactly: {a} vs {b}"
+            );
+        }
+    }
+
+    /// A mixture of two widths must be strictly harder than the narrow population
+    /// alone and strictly easier than the wide one alone.
+    ///
+    /// This is the sanity check on the LN split's direction: adding long notes to a map
+    /// can only cost PERFECTs at fixed skill, never gain them.
+    #[test]
+    fn an_ln_mixture_sits_between_its_two_populations() {
+        let windows = od9_windows();
+        let model = ErrorModel::default();
+        let scale = ln_sigma_scale(1.0);
+
+        let perfect_share = |units: &[JudgementUnit]| {
+            let counts = expected_counts(units, &windows, &model, 7.0);
+            counts.get(ManiaJudgement::Perfect) / counts.total()
+        };
+
+        let all_rice = [JudgementUnit::repeated(6.0, 1000.0)];
+        let half = [
+            JudgementUnit::repeated(6.0, 500.0),
+            JudgementUnit::repeated(6.0, 500.0).with_sigma_scale(scale),
+        ];
+        let all_ln = [JudgementUnit::repeated(6.0, 1000.0).with_sigma_scale(scale)];
+
+        let (rice, mixed, ln) = (
+            perfect_share(&all_rice),
+            perfect_share(&half),
+            perfect_share(&all_ln),
+        );
+
+        assert!(
+            rice > mixed && mixed > ln,
+            "a mixture must sit strictly between its components: {rice} / {mixed} / {ln}"
+        );
+    }
+
+    /// `sqrt(1 + k^2)` at `k = 1` is `sqrt(2)`, and a release cannot be easier to place
+    /// than a press.
+    #[test]
+    fn the_ln_scale_reduces_to_sqrt_two_without_asymmetry() {
+        assert!((ln_sigma_scale(1.0) - LN_SIGMA_SCALE).abs() < 1e-12);
+
+        // Clamped, not extrapolated: a sub-1 ratio would claim releases are more
+        // precise than presses, which is not a regime we model.
+        assert!((ln_sigma_scale(0.5) - LN_SIGMA_SCALE).abs() < 1e-12);
+        assert!((ln_sigma_scale(f64::NAN) - LN_SIGMA_SCALE).abs() < 1e-12);
+
+        // Monotone above 1, and matching the closed form.
+        assert!(ln_sigma_scale(2.0) > ln_sigma_scale(1.5));
+        assert!((ln_sigma_scale(2.0) - 5.0_f64.sqrt()).abs() < 1e-12);
+    }
+
+    /// A degenerate `sigma_scale` must not turn a hard unit into a free one.
+    ///
+    /// The scale reaches sigma multiplicatively, so a zero or negative value would
+    /// collapse the distribution and make every judgement a certain PERFECT — a
+    /// silently unbounded score. It is treated as "no scaling" instead.
+    #[test]
+    fn a_degenerate_sigma_scale_cannot_manufacture_perfects() {
+        let windows = od9_windows();
+        let model = ErrorModel::default();
+
+        let baseline = judgement_probabilities(&windows, &model, 6.0, 7.0);
+
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let probabilities =
+                judgement_probabilities_scaled(&windows, &model, 6.0, 7.0, bad);
+
+            assert_eq!(
+                probabilities.get(ManiaJudgement::Perfect),
+                baseline.get(ManiaJudgement::Perfect),
+                "a {bad} scale must fall back to no scaling, not a free PERFECT"
+            );
+        }
     }
 
     #[test]

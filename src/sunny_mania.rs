@@ -48,6 +48,13 @@ pub struct JsSunnyManiaDifficultyAttributes {
     /// The amount of hit objects taken into account.
     #[wasm_bindgen(js_name = "nObjects", readonly)]
     pub n_objects: u32,
+    /// How many of those hit objects are long notes.
+    ///
+    /// Exposed because the judgement model needs it: under ScoreV1 a long note is
+    /// graded on the summed head and release offsets, so it carries more timing
+    /// spread than a plain note and an LN-heavy map is a mixture of the two.
+    #[wasm_bindgen(js_name = "nLongNotes", readonly)]
+    pub n_long_notes: u32,
     /// The mods used for the calculation, kept for the performance calc.
     #[serde(skip)]
     pub(crate) mods: rosu_mods::GameMods,
@@ -69,6 +76,7 @@ impl From<SunnyManiaDifficultyAttributes> for JsSunnyManiaDifficultyAttributes {
             great_hit_window: attrs.great_hit_window,
             max_combo: attrs.max_combo,
             n_objects: attrs.n_objects as u32,
+            n_long_notes: attrs.n_long_notes as u32,
             mods: GameMods::default(),
             hit_windows: attrs.hit_windows,
         }
@@ -261,6 +269,12 @@ impl JsSunnyManiaPerformance {
                 hit_windows,
                 max_combo: js_attrs.max_combo,
                 n_objects: js_attrs.n_objects as usize,
+                n_long_notes: js_attrs.n_long_notes as usize,
+                // Not carried through JS: it is a property of how the score was
+                // played, not of the map, so it is re-derived from the mods that
+                // came back with the attributes. `lazer` is not part of the shape
+                // either, so this follows the same default the difficulty calc uses.
+                ln_judged_as_one: sunny::is_classic(None, &mods),
             };
 
             return Ok((attrs, mods));
