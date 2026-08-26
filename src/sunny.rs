@@ -5125,4 +5125,703 @@ mod tests {
              med g {median_g:.1}{live_note}"
         );
     }
+
+    /// The release-to-next-press *gap*, which is the physical quantity 反键 charting
+    /// varies and the one the accuracy surface currently cannot see.
+    ///
+    /// The surface bins long notes by how long they are *held*
+    /// ([`LN_DURATION_EDGES`]) and charges short holds more, on the reasoning that the
+    /// press motion has not finished when the release comes due. 反键 inverts that: the
+    /// key is held for most of the map and the *release* is the brief event, so the hold
+    /// is long — the cheapest bin — while the thing being timed is a gap of a few tens
+    /// of milliseconds. If gap and hold length are close to independent across real
+    /// maps, then duration binning is not a proxy for gap and the model is blind to it.
+    ///
+    /// Prints, per map, the median gap alongside the median hold and the share of map
+    /// time spent holding, then correlates the two.
+    ///
+    /// Run with `cargo test --release inverse_gap_structure -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn inverse_gap_structure() {
+        use std::fs;
+
+        struct MapShape {
+            id: String,
+            keys: usize,
+            od: f32,
+            median_hold: f64,
+            median_gap: f64,
+            hold_share: f64,
+            ln_share: f64,
+            /// Long notes whose gap to the next press in the same column is under
+            /// 45 ms — the shortest hold bin's own upper edge, so "shorter than the
+            /// shortest thing the model treats as short".
+            tight_gap_share: f64,
+        }
+
+        let Ok(entries) = fs::read_dir("local-fixtures/maps") else {
+            println!("no fixture maps present; nothing to report");
+            return;
+        };
+
+        let mut shapes = Vec::new();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            if path.extension().and_then(|e| e.to_str()) != Some("osu") {
+                continue;
+            }
+
+            let Some(path_str) = path.to_str() else {
+                continue;
+            };
+            let Some(map) = parse(path_str) else {
+                continue;
+            };
+
+            let total_columns = map.cs.round_ties_even().max(1.0) as usize;
+            let (notes, _) = build_notes(1.0, map.hit_objects.iter(), total_columns);
+
+            if notes.len() < 2 {
+                continue;
+            }
+
+            // Group by column so "the next press" means the next press the same finger
+            // has to make, which is what a release can collide with.
+            let mut by_column: Vec<Vec<Note>> = vec![Vec::new(); total_columns];
+
+            for note in &notes {
+                if note.column < total_columns {
+                    by_column[note.column].push(*note);
+                }
+            }
+
+            for column in &mut by_column {
+                column.sort_by(|a, b| a.head.total_cmp(&b.head));
+            }
+
+            let mut holds = Vec::new();
+            let mut gaps = Vec::new();
+            let mut held_time = 0.0;
+            let mut tight = 0usize;
+
+            for column in &by_column {
+                for (idx, note) in column.iter().enumerate() {
+                    let Some(tail) = note.tail else {
+                        continue;
+                    };
+
+                    let duration = tail - note.head;
+                    holds.push(duration);
+                    held_time += duration;
+
+                    if let Some(next) = column.get(idx + 1) {
+                        let gap = next.head - tail;
+
+                        if gap >= 0.0 {
+                            gaps.push(gap);
+
+                            if gap < 45.0 {
+                                tight += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if holds.is_empty() || gaps.is_empty() {
+                continue;
+            }
+
+            let first = notes.first().map_or(0.0, |n| n.head);
+            let last = notes.iter().map(|n| n.tail_or_head()).fold(0.0, f64::max);
+            let span = (last - first).max(1.0);
+
+            let median = |v: &mut Vec<f64>| {
+                v.sort_by(f64::total_cmp);
+                v[v.len() / 2]
+            };
+
+            let n_long = holds.len();
+            let n_gaps = gaps.len();
+
+            shapes.push(MapShape {
+                id: path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_owned(),
+                keys: total_columns,
+                od: map.od,
+                median_hold: median(&mut holds),
+                median_gap: median(&mut gaps),
+                // Held time as a share of one column's worth of map time, which is what
+                // "the key is down most of the time" means when averaged over columns.
+                hold_share: held_time / (span * total_columns as f64),
+                ln_share: n_long as f64 / notes.len() as f64,
+                tight_gap_share: tight as f64 / n_gaps as f64,
+            });
+        }
+
+        if shapes.is_empty() {
+            println!("no parseable fixture maps; nothing to report");
+            return;
+        }
+
+        // Sort by hold share: the top of this list is what 反键 charting looks like
+        // numerically, if the fixture set contains any.
+        shapes.sort_by(|a, b| b.hold_share.total_cmp(&a.hold_share));
+
+        println!(
+            "{} maps. Sorted by share of time held; the top rows are the inverse-style ones.",
+            shapes.len()
+        );
+        println!(
+            "{:>9} {:>4} {:>5} {:>11} {:>10} {:>10} {:>9} {:>10}",
+            "map", "keys", "od", "median hold", "median gap", "hold share", "ln share", "gap<45ms"
+        );
+
+        for shape in shapes.iter().take(15) {
+            println!(
+                "{:>9} {:>4} {:>5.1} {:>10.0}ms {:>9.0}ms {:>9.1}% {:>8.1}% {:>9.1}%",
+                shape.id,
+                shape.keys,
+                shape.od,
+                shape.median_hold,
+                shape.median_gap,
+                shape.hold_share * 100.0,
+                shape.ln_share * 100.0,
+                shape.tight_gap_share * 100.0
+            );
+        }
+
+        // Does hold duration predict gap? If the model's duration bins were a usable
+        // proxy for gap tightness, long holds would come with long gaps and this
+        // correlation would be strongly positive.
+        let n = shapes.len() as f64;
+        let log_hold: Vec<f64> = shapes.iter().map(|s| s.median_hold.max(1.0).ln()).collect();
+        let log_gap: Vec<f64> = shapes.iter().map(|s| s.median_gap.max(1.0).ln()).collect();
+
+        let mean_h = log_hold.iter().sum::<f64>() / n;
+        let mean_g = log_gap.iter().sum::<f64>() / n;
+
+        let mut cov = 0.0;
+        let mut var_h = 0.0;
+        let mut var_g = 0.0;
+
+        for (h, g) in log_hold.iter().zip(&log_gap) {
+            cov += (h - mean_h) * (g - mean_g);
+            var_h += (h - mean_h).powi(2);
+            var_g += (g - mean_g).powi(2);
+        }
+
+        let corr = cov / (var_h.sqrt() * var_g.sqrt()).max(1e-12);
+
+        println!(
+            "\ncorrelation of log median hold with log median gap: {corr:+.3} over {} maps",
+            shapes.len()
+        );
+
+        let inverse: Vec<&MapShape> = shapes.iter().filter(|s| s.hold_share > 0.5).collect();
+        let normal: Vec<&MapShape> = shapes.iter().filter(|s| s.hold_share <= 0.2).collect();
+
+        let summarise = |label: &str, group: &[&MapShape]| {
+            if group.is_empty() {
+                println!("  {label}: none");
+                return;
+            }
+
+            let k = group.len() as f64;
+            println!(
+                "  {label}: n={} median hold {:.0}ms  median gap {:.0}ms  gap<45ms {:.1}%  \
+                 mean od {:.1}",
+                group.len(),
+                group.iter().map(|s| s.median_hold).sum::<f64>() / k,
+                group.iter().map(|s| s.median_gap).sum::<f64>() / k,
+                group.iter().map(|s| s.tight_gap_share).sum::<f64>() / k * 100.0,
+                group.iter().map(|s| f64::from(s.od)).sum::<f64>() / k
+            );
+        };
+
+        summarise("held >50% of the time", &inverse);
+        summarise("held <20% of the time", &normal);
+
+        // What the model charges these maps, to see whether the duration bins happen to
+        // catch the inverse maps anyway.
+        let model = ErrorModel::default();
+        let scale_for = |duration: f64| {
+            crate::mania_accuracy::ln_sigma_scale_for_duration(&model, duration)
+        };
+
+        println!(
+            "\nthe model's LN spread multiplier at each duration bin's representative:"
+        );
+        for (idx, &rep) in LN_DURATION_REPRESENTATIVES.iter().enumerate() {
+            println!("  bin {idx}: {rep:>4.0}ms -> {:.3}x", scale_for(rep));
+        }
+    }
+
+    /// How often a release's judgement window reaches past the next press in the same
+    /// column, which is the collision 反键 charting creates.
+    ///
+    /// The surface treats every judgement as an independent draw from a timing
+    /// distribution. That assumption needs each judgement to have its own window to land
+    /// in. When the gap between a release and the next press in the same column is
+    /// smaller than the window the release is judged against, the two events compete for
+    /// the same interval of time: releasing late enough to still score a 300 can push the
+    /// press past its own window, so the player cannot place both independently and has
+    /// to sacrifice one. Independent draws cannot represent that, and the model will read
+    /// the resulting counts as a less skilled player rather than a harder map.
+    ///
+    /// Reports gaps against the map's *own* windows, since a low-OD map has wider windows
+    /// and so collides at wider gaps — which is the opposite of the fixed reference's
+    /// assumption that low OD means lenient.
+    ///
+    /// Run with `cargo test --release window_overlap_structure -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn window_overlap_structure() {
+        use std::fs;
+
+        struct Overlap {
+            id: String,
+            keys: usize,
+            od: f32,
+            great: f64,
+            good: f64,
+            /// Share of releases whose gap to the next press is under the GREAT window,
+            /// so a 320-eligible release error can cost the next note its own 320.
+            under_great: f64,
+            /// Share under the GOOD window, the 200 boundary.
+            under_good: f64,
+            median_gap: f64,
+            hold_share: f64,
+            n_releases: usize,
+        }
+
+        let Ok(entries) = fs::read_dir("local-fixtures/maps") else {
+            println!("no fixture maps present; nothing to report");
+            return;
+        };
+
+        let mut rows = Vec::new();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            if path.extension().and_then(|e| e.to_str()) != Some("osu") {
+                continue;
+            }
+
+            let Some(path_str) = path.to_str() else {
+                continue;
+            };
+            let Some(map) = parse(path_str) else {
+                continue;
+            };
+
+            let total_columns = map.cs.round_ties_even().max(1.0) as usize;
+            let (notes, _) = build_notes(1.0, map.hit_objects.iter(), total_columns);
+
+            if notes.len() < 2 {
+                continue;
+            }
+
+            // The map's own windows, no mods — the same set `reference_windows` now
+            // prices against.
+            let windows = hit_windows(&map, &GameMods::default(), 1.0, true);
+
+            let mut by_column: Vec<Vec<Note>> = vec![Vec::new(); total_columns];
+
+            for note in &notes {
+                if note.column < total_columns {
+                    by_column[note.column].push(*note);
+                }
+            }
+
+            for column in &mut by_column {
+                column.sort_by(|a, b| a.head.total_cmp(&b.head));
+            }
+
+            let mut gaps = Vec::new();
+            let mut held_time = 0.0;
+
+            for column in &by_column {
+                for (idx, note) in column.iter().enumerate() {
+                    let Some(tail) = note.tail else {
+                        continue;
+                    };
+
+                    held_time += tail - note.head;
+
+                    if let Some(next) = column.get(idx + 1) {
+                        let gap = next.head - tail;
+
+                        if gap >= 0.0 {
+                            gaps.push(gap);
+                        }
+                    }
+                }
+            }
+
+            if gaps.len() < 20 {
+                continue;
+            }
+
+            let n = gaps.len();
+            let under_great = gaps.iter().filter(|&&g| g < windows.great).count();
+            let under_good = gaps.iter().filter(|&&g| g < windows.good).count();
+
+            gaps.sort_by(f64::total_cmp);
+
+            let first = notes.first().map_or(0.0, |n| n.head);
+            let last = notes.iter().map(|n| n.tail_or_head()).fold(0.0, f64::max);
+            let span = (last - first).max(1.0);
+
+            rows.push(Overlap {
+                id: path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_owned(),
+                keys: total_columns,
+                od: map.od,
+                great: windows.great,
+                good: windows.good,
+                under_great: under_great as f64 / n as f64,
+                under_good: under_good as f64 / n as f64,
+                median_gap: gaps[n / 2],
+                hold_share: held_time / (span * total_columns as f64),
+                n_releases: n,
+            });
+        }
+
+        if rows.is_empty() {
+            println!("no parseable fixture maps; nothing to report");
+            return;
+        }
+
+        rows.sort_by(|a, b| b.under_good.total_cmp(&a.under_good));
+
+        println!(
+            "{} maps with at least 20 releases, sorted by the share of releases whose \
+             next press falls inside the release's own GOOD window.",
+            rows.len()
+        );
+        println!(
+            "{:>9} {:>4} {:>5} {:>7} {:>6} {:>10} {:>11} {:>10} {:>10}",
+            "map", "keys", "od", "great", "good", "median gap", "gap<great", "gap<good", "held"
+        );
+
+        for row in rows.iter().take(15) {
+            println!(
+                "{:>9} {:>4} {:>5.1} {:>6.1}ms {:>5.1}ms {:>9.0}ms {:>10.1}% {:>9.1}% {:>9.1}%",
+                row.id,
+                row.keys,
+                row.od,
+                row.great,
+                row.good,
+                row.median_gap,
+                row.under_great * 100.0,
+                row.under_good * 100.0,
+                row.hold_share * 100.0
+            );
+        }
+
+        let summarise = |label: &str, group: &[&Overlap]| {
+            if group.is_empty() {
+                println!("  {label}: none");
+                return;
+            }
+
+            let k = group.len() as f64;
+            println!(
+                "  {label}: n={} mean od {:.1}  median gap {:.0}ms  gap<great {:.1}%  \
+                 gap<good {:.1}%",
+                group.len(),
+                group.iter().map(|r| f64::from(r.od)).sum::<f64>() / k,
+                group.iter().map(|r| r.median_gap).sum::<f64>() / k,
+                group.iter().map(|r| r.under_great).sum::<f64>() / k * 100.0,
+                group.iter().map(|r| r.under_good).sum::<f64>() / k * 100.0
+            );
+        };
+
+        println!("\nby keymode:");
+        for keys in [4, 7] {
+            let group: Vec<&Overlap> = rows.iter().filter(|r| r.keys == keys).collect();
+            summarise(&format!("{keys}K"), &group);
+        }
+
+        println!("\nby how much of the map is spent holding:");
+        let held_high: Vec<&Overlap> = rows.iter().filter(|r| r.hold_share > 0.35).collect();
+        let held_low: Vec<&Overlap> = rows.iter().filter(|r| r.hold_share <= 0.15).collect();
+        summarise("held >35%", &held_high);
+        summarise("held <15%", &held_low);
+
+        // Total exposure: how many releases across the whole set are in collision, which
+        // decides whether this is a niche correction or a broad one.
+        let total: usize = rows.iter().map(|r| r.n_releases).sum();
+        let colliding: f64 = rows
+            .iter()
+            .map(|r| r.under_good * r.n_releases as f64)
+            .sum();
+
+        println!(
+            "\n{colliding:.0} of {total} releases across the set ({:.1}%) have their next \
+             press inside the release's GOOD window.",
+            colliding / total as f64 * 100.0
+        );
+    }
+
+    /// What sunny's own release term says about 反键 spacing.
+    ///
+    /// [`compute_rbar`] is the one place in the codebase that already reads the
+    /// release-to-next-press gap: `i_t = |next_head - tail - 80| / leniency`, combined
+    /// with the hold's own `i_h` through
+    /// `2 / (2 + exp(-5(i_h - 0.75)) + exp(-5(i_t - 0.75)))`, and the result *multiplies*
+    /// the release difficulty. The `- 80.0` centres it, so the term is extremal at a
+    /// gap of 80 ms — and 80 ms is 1/4 at 187 bpm, i.e. exactly the spacing dense 反键
+    /// charting uses.
+    ///
+    /// Prints the multiplier against gap to establish which direction it points, since a
+    /// term minimised at 反键 spacing would be actively cancelling the difficulty the
+    /// pattern creates.
+    ///
+    /// Run with `cargo test --release rbar_gap_response -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "prints a report rather than asserting"]
+    fn rbar_gap_response() {
+        // The same combination `compute_rbar` applies, extracted so the shape can be
+        // read off directly.
+        let combined = |i_h: f64, i_t: f64| {
+            2.0 / (2.0 + (-5.0 * (i_h - 0.75)).exp() + (-5.0 * (i_t - 0.75)).exp())
+        };
+
+        println!(
+            "sunny's rbar release multiplier `1 + 0.8*i` against release-to-next-press gap,\n\
+             at a fixed 150ms hold. Higher = sunny charges more."
+        );
+
+        for od in [0.0, 5.0, 8.0] {
+            let window = if od <= 0.0 { 64.5 } else { 34.0 + 3.0 * (10.0 - od) };
+            let leniency = hit_leniency_from_window(window);
+
+            println!("\n  OD {od:.0} (great {window:.1}ms, leniency {leniency:.4}s):");
+            println!("  {:>8} {:>10} {:>12}", "gap", "i", "1 + 0.8i");
+
+            let i_h = 0.001 * (150.0 - 80.0_f64).abs() / leniency;
+
+            for gap in [20.0, 40.0, 60.0, 80.0, 100.0, 150.0, 250.0, 500.0, 1000.0] {
+                let i_t = 0.001 * (gap - 80.0_f64).abs() / leniency;
+                let i = combined(i_h, i_t);
+
+                println!("  {gap:>6.0}ms {i:>10.4} {:>12.4}", 1.0 + 0.8 * i);
+            }
+        }
+
+        println!(
+            "\nFor reference, the accuracy surface's LN spread multiplier over the same\n\
+             range of hold durations, to show whether it varies at all by default:"
+        );
+
+        let model = ErrorModel::default();
+
+        for duration in [34.0, 84.0, 175.0, 419.0, 900.0] {
+            println!(
+                "  hold {duration:>4.0}ms -> {:.4}x",
+                crate::mania_accuracy::ln_sigma_scale_for_duration(&model, duration)
+            );
+        }
+    }
+
+    /// Whether pp is under-predicted, and the fit is worse, on maps whose
+    /// release-to-next-press gaps are tight.
+    ///
+    /// [`window_overlap_structure`] already showed that a release's gap to the next
+    /// press in the same column can fall inside the release's own GOOD window, which
+    /// breaks the independent-judgement assumption the whole surface rests on. This
+    /// harness asks whether that collision actually shows up as mispricing: it joins
+    /// each of `local-fixtures/multiuser.tsv`'s scored plays (via [`load_multiuser`],
+    /// the 143-score set with live pp) to its map's median release gap and collision
+    /// share, then buckets by each axis and reports mean predicted/live pp ratio and
+    /// median `g_timing` per bucket. A monotone drop in the ratio, or a rise in
+    /// `g_timing`, toward the tight-gap end would say the model under-rates 反键
+    /// charting; a flat table would say the collision is priced fine, or at least not
+    /// through pp or fit quality.
+    ///
+    /// Run with `cargo test --release gap_vs_fit_sweep -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn gap_vs_fit_sweep() {
+        use std::collections::HashMap;
+
+        /// A map's release-gap shape, keyed by map id so every score on the same map
+        /// reuses one computation instead of re-parsing the `.osu` per row.
+        struct GapShape {
+            median_gap: f64,
+            collision_share: f64,
+        }
+
+        fn gap_shape_for(map_id: &str) -> Option<GapShape> {
+            let map = parse(&format!("local-fixtures/maps/{map_id}.osu"))?;
+
+            let total_columns = map.cs.round_ties_even().max(1.0) as usize;
+            let (notes, _) = build_notes(1.0, map.hit_objects.iter(), total_columns);
+
+            if notes.len() < 2 {
+                return None;
+            }
+
+            // The map's own windows, no mods: the same reference `window_overlap_structure`
+            // prices collisions against.
+            let windows = hit_windows(&map, &GameMods::default(), 1.0, true);
+
+            let mut by_column: Vec<Vec<Note>> = vec![Vec::new(); total_columns];
+            for note in &notes {
+                if note.column < total_columns {
+                    by_column[note.column].push(*note);
+                }
+            }
+            for column in &mut by_column {
+                column.sort_by(|a, b| a.head.total_cmp(&b.head));
+            }
+
+            let mut gaps = Vec::new();
+
+            for column in &by_column {
+                for (idx, note) in column.iter().enumerate() {
+                    let Some(tail) = note.tail else {
+                        continue;
+                    };
+
+                    if let Some(next) = column.get(idx + 1) {
+                        let gap = next.head - tail;
+
+                        if gap >= 0.0 {
+                            gaps.push(gap);
+                        }
+                    }
+                }
+            }
+
+            if gaps.len() < 20 {
+                return None;
+            }
+
+            gaps.sort_by(f64::total_cmp);
+            let n = gaps.len();
+            let under_good = gaps.iter().filter(|&&g| g < windows.good).count();
+
+            Some(GapShape {
+                median_gap: gaps[n / 2],
+                collision_share: under_good as f64 / n as f64,
+            })
+        }
+
+        let scores = load_multiuser();
+        if scores.is_empty() {
+            println!("no fixtures present (local-fixtures/multiuser.tsv); nothing to report");
+            return;
+        }
+
+        struct Point {
+            median_gap: f64,
+            collision_share: f64,
+            pp_ratio: f64,
+            g_timing: f64,
+        }
+
+        let mut cache: HashMap<String, Option<GapShape>> = HashMap::new();
+        let mut points = Vec::new();
+
+        for s in &scores {
+            if s.row.live_pp <= 0.0 {
+                continue;
+            }
+
+            let shape = cache
+                .entry(s.row.map_id.clone())
+                .or_insert_with(|| gap_shape_for(&s.row.map_id));
+
+            let Some(shape) = shape else {
+                continue;
+            };
+
+            points.push(Point {
+                median_gap: shape.median_gap,
+                collision_share: shape.collision_share,
+                pp_ratio: s.after_pp / s.row.live_pp,
+                g_timing: s.g_timing,
+            });
+        }
+
+        if points.is_empty() {
+            println!("no scores with both live pp and a fitted gap shape; nothing to report");
+            return;
+        }
+
+        println!(
+            "{} scores with live pp, joined to their map's release-gap shape \
+             (maps with fewer than 20 releases skipped).",
+            points.len()
+        );
+
+        let median = |v: &mut Vec<f64>| -> f64 {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+
+        let summarise = |label: &str, group: &[&Point]| {
+            if group.is_empty() {
+                println!("  {label:>14}: n=0");
+                return;
+            }
+
+            let n = group.len() as f64;
+            let mut g_timings: Vec<f64> = group.iter().map(|p| p.g_timing).collect();
+
+            println!(
+                "  {label:>14}: n={:<4} mean gap {:>7.0}ms  mean collision {:>6.1}%  \
+                 mean pred/live {:>6.3}  median g_timing {:>7.1}",
+                group.len(),
+                group.iter().map(|p| p.median_gap).sum::<f64>() / n,
+                group.iter().map(|p| p.collision_share).sum::<f64>() / n * 100.0,
+                group.iter().map(|p| p.pp_ratio).sum::<f64>() / n,
+                median(&mut g_timings),
+            );
+        };
+
+        println!("\nby median release-to-next-press gap:");
+        let gap_edges = [
+            ("<80ms", 0.0, 80.0),
+            ("80-120ms", 80.0, 120.0),
+            ("120-200ms", 120.0, 200.0),
+            ("200-400ms", 200.0, 400.0),
+            (">=400ms", 400.0, f64::INFINITY),
+        ];
+        for (label, lo, hi) in gap_edges {
+            let group: Vec<&Point> = points
+                .iter()
+                .filter(|p| p.median_gap >= lo && p.median_gap < hi)
+                .collect();
+            summarise(label, &group);
+        }
+
+        println!("\nby collision share (releases under the map's own GOOD window):");
+        let collision_edges = [
+            ("<5%", 0.0, 0.05),
+            ("5-15%", 0.05, 0.15),
+            ("15-30%", 0.15, 0.30),
+            (">=30%", 0.30, f64::INFINITY),
+        ];
+        for (label, lo, hi) in collision_edges {
+            let group: Vec<&Point> = points
+                .iter()
+                .filter(|p| p.collision_share >= lo && p.collision_share < hi)
+                .collect();
+            summarise(label, &group);
+        }
+    }
 }
