@@ -93,6 +93,28 @@ impl ManiaHitWindows {
         }
     }
 
+    /// The wider of two window sets, taken judgement by judgement.
+    ///
+    /// Used to build a one-sided pricing reference: comparing a score against the wider
+    /// of "a fixed reference OD" and "this map's own windows" means a map stricter than
+    /// the reference is still rewarded for its strictness, while a more lenient map is
+    /// simply priced against itself rather than charged for its leniency.
+    ///
+    /// Per judgement rather than picking one set wholesale, because the two schemes do not
+    /// order uniformly: in the classic scheme PERFECT is a flat 16 ms at every OD while
+    /// every other window scales, so a map can be stricter than the reference on GREAT and
+    /// identical on PERFECT.
+    pub fn widest_of(&self, other: &Self) -> Self {
+        Self {
+            perfect: self.perfect.max(other.perfect),
+            great: self.great.max(other.great),
+            good: self.good.max(other.good),
+            ok: self.ok.max(other.ok),
+            meh: self.meh.max(other.meh),
+            miss: self.miss.max(other.miss),
+        }
+    }
+
     /// The judgement a hit error of `error` ms would receive.
     ///
     /// `error` is treated as an absolute value.
@@ -476,6 +498,42 @@ mod tests {
         // Converts keep the flat PERFECT window either way.
         assert_close(tight.perfect, 16.5);
         assert_close(loose.perfect, 16.5);
+    }
+
+    /// The JS round-trip drops the full window sets and carries only `greatHitWindow`,
+    /// so the cached-attributes path has to rebuild the map's own windows by stripping the
+    /// mod multiplier back out. Since that set is now the pricing reference, an inversion
+    /// error there does not blur pricing — it reverses it. Dividing by the multiplier
+    /// instead of multiplying gave `EZ` a reference *wider* than the windows it was played
+    /// on, which prices the mod as a bonus.
+    ///
+    /// Tolerance is 1 ms because `finalize` floors to whole milliseconds before the 0.5
+    /// offset, and that floor is not invertible.
+    #[test]
+    fn stripping_the_mod_multiplier_recovers_the_maps_own_window() {
+        for od in [4.0, 8.0, 9.0] {
+            let unmodded = hit_windows(&map(od, false), &mods(&[]), 1.0, true);
+
+            for mod_list in [
+                vec![GameMod::EasyMania(Default::default())],
+                vec![GameMod::HardRockMania(Default::default())],
+                vec![],
+            ] {
+                let m = mods(&mod_list);
+                let played = hit_windows(&map(od, false), &m, 1.0, true);
+
+                let recovered = played.great * difficulty_multiplier(&m);
+
+                assert!(
+                    (recovered - unmodded.great).abs() < 1.0,
+                    "od {od} with {mod_list:?}: stripping {} from played {} gave {recovered}, \
+                     want the map's own {}",
+                    difficulty_multiplier(&m),
+                    played.great,
+                    unmodded.great
+                );
+            }
+        }
     }
 
     #[test]

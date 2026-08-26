@@ -325,9 +325,12 @@ pub fn calculate_performance(
     }
 }
 
-/// The reference window set that [`window_scalar`] is measured against: OD 8
-/// classic non-convert, the modal mania OD. The choice only fixes where the scalar
-/// equals 1, not the size of its response.
+/// OD 8 classic non-convert, the modal mania OD.
+///
+/// No longer the pricing reference — see [`reference_windows`] for why the map's own
+/// windows replaced it. Still the fixed yardstick the calibration harnesses fit against,
+/// where a constant is what is wanted so that fit quality across maps is comparable, and
+/// still reachable for pricing via `SUNNY_FIXED_REFERENCE`.
 ///
 /// A literal because it must be `const`; `reference_windows_match_od8_no_mod` pins
 /// it against [`hit_windows`] so the two cannot drift.
@@ -340,58 +343,63 @@ const REFERENCE_WINDOWS: ManiaHitWindows = ManiaHitWindows {
     miss: 164.5,
 };
 
-/// How much the windows a score was played under change what it is worth.
-///
-/// This is where mods get priced, and it is the whole point of widening the windows
-/// *before* grading the score. The same judgement counts are fitted twice: once
-/// against the windows actually in effect, once against [`REFERENCE_WINDOWS`]. A
-/// player who delivers a given 320 count through wider `EZ` windows demonstrably
-/// hit less precisely, so the first fit returns a lower skill and the ratio falls
-/// below 1. Nothing here inspects the mod list.
-///
-/// Deliberately *not* gated on [`ManiaFitQuality::is_plausible`]. The absolute fit is
-/// still imperfect on many real scores even after the error model was given a proper
-/// tail, but that error is largely common to both fits and so divides out of the
-/// ratio. Gating on it made pricing bimodal: whichever scores happened to fit got
-/// priced and the rest silently kept their unmodified value, which is a worse failure
-/// than a slightly mis-sized adjustment. `is_plausible` stays useful for calibration,
-/// where the absolute fit is the thing under test.
-///
-/// Worth knowing how little the shape calibration moved this: replacing the single
-/// normal with the fitted two-component mixture halved mean `g_timing` across the 20
-/// real scores (101.6 to 51.6) while the mean `EZ` scalar shifted only from 0.8256 to
-/// 0.8273. That is the design working as intended — the scalar is a ratio of two fits
-/// that share a shape error, so it is far more robust than the absolute fit is. It
-/// also means the mod response is set by `skill_exponent` and the windows, not by the
-/// tail, and it is why the shape could be fitted without disturbing pricing.
-///
-/// Returns 1.0 only when there is nothing to measure: an empty score, or a fit that
-/// did not produce a usable positive skill on both sides.
-///
 /// The windows a score is priced *against*, which decides what the surface charges for.
 ///
-/// Two choices, and they differ in what they claim OD means:
+/// **The map's own windows**, which confines the surface to pricing *mods*: every no-mod
+/// score prices at exactly 1.0 at any OD or keymode, and a mod is charged for how far it
+/// moves the windows away from what the map itself asked for.
 ///
-/// - **Fixed [`REFERENCE_WINDOWS`]** (OD 8) says a low-OD map is genuinely more lenient,
+/// Three candidates were measured against the same 143 live scores; the alternatives are
+/// kept behind env switches so the comparison can be rerun in one build, the way
+/// `SUNNY_NO_LN_SPLIT` is kept.
+///
+/// - **Fixed [`REFERENCE_WINDOWS`]** (OD 8, `SUNNY_FIXED_REFERENCE`) says a low-OD map is genuinely more lenient,
 ///   so a score on it demonstrates less precision and should earn less. That claim is
 ///   very hard to defend in mania, where OD is a charting convention rather than a
 ///   difficulty setting: 7K charts in the fixture set average OD 4.8 against 4K's 8.2,
 ///   and 7K LN maps average OD 4.2. Under this reference those maps lose 16.6% of their
 ///   live pp for their OD alone.
-/// - **The map's own windows** ([`SunnyManiaDifficultyAttributes::map_windows`]) makes
-///   every no-mod score price at exactly 1.0 at any OD or keymode, confining the surface
-///   to pricing mods. It gives up the claim that OD itself earns pp — the weakest
-///   inference in the design — and with it the cross-keymode penalty.
+/// - **One-sided** (`SUNNY_ONESIDED_REFERENCE`), the wider of the two per window: a map
+///   stricter than OD 8 keeps its bonus, a map more lenient than OD 8 pays no penalty.
+///   Asymmetric by construction, and the asymmetry is not merely convenient — the two
+///   directions are not equally well evidenced. Above the reference the claim "these 320s
+///   came through a 14.5 ms window, so this player was precise to better than 14.5 ms" is
+///   directly witnessed by the counts. Below it, "these 320s came through a 20 ms window,
+///   so this player was only precise to 20 ms" is *not* witnessed, because a 320 is
+///   censored: a player who would have hit inside 16.5 ms anyway produces exactly the same
+///   count as one who needed the full 20 ms. The surface can therefore detect precision
+///   finer than the window it is given, but not coarser, and a one-sided reference is what
+///   that asymmetry looks like when taken seriously. That censoring argument did not
+///   survive testing: the low-OD 7K scores the fixed reference penalises average a 63.4%
+///   320 share with none above 90%, so they are nowhere near the saturation the argument
+///   needs. The asymmetry rests on the endogeneity of mania OD alone.
 ///
-/// Selected by `SUNNY_MAP_REFERENCE` so the two can be measured against the same
-/// fixtures in one build. Defaults to the fixed reference; see `multiuser_report` for
-/// what switching costs and earns.
+/// Measured against 143 live scores, as a fraction of live pp:
+///
+/// | group | fixed | one-sided | map |
+/// |---|---|---|---|
+/// | all (n=143) | −12.49% | −7.12% | −8.27% |
+/// | 7K no-mod (n=51) | −13.94% | +0.30% | −0.21% |
+/// | 4K no-mod OD≥8.9 (n=19) | +2.80% | +2.80% | +0.10% |
+/// | EZ on OD≥8.1 (n=9) | −32.68% | −32.68% | −39.75% |
+///
+/// The map reference was chosen over the one-sided variant knowing it costs the high-OD
+/// 4K bonus (+2.80% to +0.10%), because a symmetric rule is defensible to players in a way
+/// "your OD only counts when it helps you" is not. It also repairs `EZ`: under a fixed
+/// reference, `EZ`'s widening and a high-OD map's narrowing partly cancelled, so the same
+/// mod cost 32.68% on high-OD maps and 39.06% on low-OD ones. Against the map's own
+/// windows `EZ` costs the same everywhere (−39.75% / −39.18%), which is what pricing a
+/// mod rather than a map means.
 fn reference_windows(attrs: &SunnyManiaDifficultyAttributes) -> ManiaHitWindows {
-    if std::env::var_os("SUNNY_MAP_REFERENCE").is_some() {
-        attrs.map_windows
-    } else {
-        REFERENCE_WINDOWS
+    if std::env::var_os("SUNNY_FIXED_REFERENCE").is_some() {
+        return REFERENCE_WINDOWS;
     }
+
+    if std::env::var_os("SUNNY_ONESIDED_REFERENCE").is_some() {
+        return REFERENCE_WINDOWS.widest_of(&attrs.map_windows);
+    }
+
+    attrs.map_windows
 }
 
 /// Whether `SUNNY_NO_LN_SPLIT` is set, which collapses the LN mixture back to a
@@ -491,6 +499,33 @@ fn judgement_units(
     units
 }
 
+/// How much the windows a score was played under change what it is worth.
+///
+/// This is where mods get priced, and it is the whole point of widening the windows
+/// *before* grading the score. The same judgement counts are fitted twice: once
+/// against the windows actually in effect, once against [`reference_windows`]. A
+/// player who delivers a given 320 count through wider `EZ` windows demonstrably
+/// hit less precisely, so the first fit returns a lower skill and the ratio falls
+/// below 1. Nothing here inspects the mod list.
+///
+/// Deliberately *not* gated on [`ManiaFitQuality::is_plausible`]. The absolute fit is
+/// still imperfect on many real scores even after the error model was given a proper
+/// tail, but that error is largely common to both fits and so divides out of the
+/// ratio. Gating on it made pricing bimodal: whichever scores happened to fit got
+/// priced and the rest silently kept their unmodified value, which is a worse failure
+/// than a slightly mis-sized adjustment. `is_plausible` stays useful for calibration,
+/// where the absolute fit is the thing under test.
+///
+/// Worth knowing how little the shape calibration moved this: replacing the single
+/// normal with the fitted two-component mixture halved mean `g_timing` across the 20
+/// real scores (101.6 to 51.6) while the mean `EZ` scalar shifted only from 0.8256 to
+/// 0.8273. That is the design working as intended — the scalar is a ratio of two fits
+/// that share a shape error, so it is far more robust than the absolute fit is. It
+/// also means the mod response is set by `skill_exponent` and the windows, not by the
+/// tail, and it is why the shape could be fitted without disturbing pricing.
+///
+/// Returns 1.0 only when there is nothing to measure: an empty score, or a fit that
+/// did not produce a usable positive skill on both sides.
 fn window_scalar(attrs: &SunnyManiaDifficultyAttributes, state: SunnyScoreState) -> f64 {
     let total = state.total_hits();
 
@@ -2104,15 +2139,16 @@ mod tests {
         );
     }
 
-    /// A score played on exactly the reference windows must be priced at 1: the two
-    /// fits are then the same fit. Guards the scalar against picking up an offset
-    /// from anything other than the windows.
+    /// Every no-mod score is priced at 1, at any OD. This is the defining property of
+    /// pricing against the map's own windows — the two fits are then literally the same
+    /// fit — and it is what confines the surface to charging for mods.
+    ///
+    /// Swept across OD rather than checked at OD 8, because at OD 8 the map reference and
+    /// the retired fixed reference agree and the test cannot tell them apart. OD 0 and 10
+    /// are the extremes of the mania range, and 4.2 is the fixture mean for 7K LN charts —
+    /// the maps that lost 16.6% of their live pp to the fixed reference.
     #[test]
-    fn a_reference_od_no_mod_score_is_priced_at_one() {
-        let map = synthetic_map(8.0, 2000, 120.0);
-        let mods = GameMods::default();
-        let attrs = calculate(&map, &mods, 1.0, Some(true), None).unwrap();
-
+    fn a_no_mod_score_is_priced_at_one_whatever_the_od() {
         let state = SunnyScoreState {
             n320: 1400,
             n300: 480,
@@ -2122,13 +2158,19 @@ mod tests {
             misses: 5,
         };
 
-        let perf = calculate_performance(&attrs, &mods, state);
+        for od in [0.0, 4.2, 8.0, 10.0] {
+            let map = synthetic_map(od, 2000, 120.0);
+            let mods = GameMods::default();
+            let attrs = calculate(&map, &mods, 1.0, Some(true), None).unwrap();
 
-        assert!(
-            (perf.window_scalar - 1.0).abs() < 1e-6,
-            "reference windows must be neutral, got {}",
-            perf.window_scalar
-        );
+            let perf = calculate_performance(&attrs, &mods, state);
+
+            assert!(
+                (perf.window_scalar - 1.0).abs() < 1e-6,
+                "a no-mod score at OD {od} must price at 1, got {}",
+                perf.window_scalar
+            );
+        }
     }
 
     /// The one case with nothing to measure. Everything else gets priced, however
@@ -4504,8 +4546,6 @@ mod tests {
             uid: String,
             ln_share: f64,
             median_hold: f64,
-            stars: f64,
-            skill: f64,
             /// Skill as a multiple of the map's difficulty, which is the scale-free form.
             /// Comparing raw skill across maps of different star rating would mostly
             /// measure which maps the player chose.
@@ -4569,8 +4609,6 @@ mod tests {
                 } else {
                     holds[holds.len() / 2]
                 },
-                stars: attrs.stars,
-                skill: fit.skill,
                 skill_ratio: fit.skill / attrs.stars,
                 perfect_share: if timing > 0.0 {
                     f64::from(counts[0]) / timing
@@ -4940,7 +4978,6 @@ mod tests {
         /// checked against the exact per-note sum.
         ln_durations: Vec<f64>,
         ln_judged_as_one: bool,
-        keys: u32,
     }
 
     impl LnCase {
@@ -5010,7 +5047,6 @@ mod tests {
                 ln_duration_buckets: attrs.ln_duration_buckets,
                 ln_durations,
                 ln_judged_as_one: attrs.ln_judged_as_one,
-                keys: u(f[6]),
             });
         }
 

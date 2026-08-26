@@ -273,12 +273,17 @@ impl JsSunnyManiaPerformance {
                 js_attrs.hit_windows
             };
 
-            // Likewise the mod-stripped window set. `great_hit_window` already has the
-            // mod multiplier folded in, so undo it before inverting: EZ multiplied the
-            // GREAT window by 1.4 and HR divided by it.
+            // Likewise the mod-stripped window set, which is what the score is priced
+            // *against*, so getting it wrong misprices mods rather than merely blurring
+            // them. `great_hit_window` already has the multiplier folded in, and
+            // `hit_windows` folds it in by *dividing*, so undo it by multiplying:
+            // `EZ`'s 1/1.4 multiplied the played window by 1.4, and multiplying by 1/1.4
+            // takes it back. Dividing here instead would widen an already-widened window
+            // and hand `EZ` a bonus.
+            // Pinned by `stripping_the_mod_multiplier_recovers_the_maps_own_window`.
             let map_windows = if js_attrs.map_windows == Default::default() {
                 let unmodded = js_attrs.great_hit_window
-                    / crate::mania_windows::difficulty_multiplier(&mods);
+                    * crate::mania_windows::difficulty_multiplier(&mods);
                 crate::mania_windows::windows_from_great(unmodded)
             } else {
                 js_attrs.map_windows
