@@ -5652,73 +5652,76 @@ mod tests {
     /// through pp or fit quality.
     ///
     /// Run with `cargo test --release gap_vs_fit_sweep -- --ignored --nocapture`.
+    /// A map's release-gap shape, keyed by map id so every score on the same map
+    /// reuses one computation instead of re-parsing the `.osu` per row.
+    ///
+    /// Shared between [`gap_vs_fit_sweep`] and [`collision_skill_slope`], which both
+    /// need the same collision share against the map's own GOOD window.
+    struct GapShape {
+        median_gap: f64,
+        collision_share: f64,
+    }
+
+    fn gap_shape_for(map_id: &str) -> Option<GapShape> {
+        let map = parse(&format!("local-fixtures/maps/{map_id}.osu"))?;
+
+        let total_columns = map.cs.round_ties_even().max(1.0) as usize;
+        let (notes, _) = build_notes(1.0, map.hit_objects.iter(), total_columns);
+
+        if notes.len() < 2 {
+            return None;
+        }
+
+        // The map's own windows, no mods: the same reference `window_overlap_structure`
+        // prices collisions against.
+        let windows = hit_windows(&map, &GameMods::default(), 1.0, true);
+
+        let mut by_column: Vec<Vec<Note>> = vec![Vec::new(); total_columns];
+        for note in &notes {
+            if note.column < total_columns {
+                by_column[note.column].push(*note);
+            }
+        }
+        for column in &mut by_column {
+            column.sort_by(|a, b| a.head.total_cmp(&b.head));
+        }
+
+        let mut gaps = Vec::new();
+
+        for column in &by_column {
+            for (idx, note) in column.iter().enumerate() {
+                let Some(tail) = note.tail else {
+                    continue;
+                };
+
+                if let Some(next) = column.get(idx + 1) {
+                    let gap = next.head - tail;
+
+                    if gap >= 0.0 {
+                        gaps.push(gap);
+                    }
+                }
+            }
+        }
+
+        if gaps.len() < 20 {
+            return None;
+        }
+
+        gaps.sort_by(f64::total_cmp);
+        let n = gaps.len();
+        let under_good = gaps.iter().filter(|&&g| g < windows.good).count();
+
+        Some(GapShape {
+            median_gap: gaps[n / 2],
+            collision_share: under_good as f64 / n as f64,
+        })
+    }
+
     #[test]
     #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
     fn gap_vs_fit_sweep() {
         use std::collections::HashMap;
-
-        /// A map's release-gap shape, keyed by map id so every score on the same map
-        /// reuses one computation instead of re-parsing the `.osu` per row.
-        struct GapShape {
-            median_gap: f64,
-            collision_share: f64,
-        }
-
-        fn gap_shape_for(map_id: &str) -> Option<GapShape> {
-            let map = parse(&format!("local-fixtures/maps/{map_id}.osu"))?;
-
-            let total_columns = map.cs.round_ties_even().max(1.0) as usize;
-            let (notes, _) = build_notes(1.0, map.hit_objects.iter(), total_columns);
-
-            if notes.len() < 2 {
-                return None;
-            }
-
-            // The map's own windows, no mods: the same reference `window_overlap_structure`
-            // prices collisions against.
-            let windows = hit_windows(&map, &GameMods::default(), 1.0, true);
-
-            let mut by_column: Vec<Vec<Note>> = vec![Vec::new(); total_columns];
-            for note in &notes {
-                if note.column < total_columns {
-                    by_column[note.column].push(*note);
-                }
-            }
-            for column in &mut by_column {
-                column.sort_by(|a, b| a.head.total_cmp(&b.head));
-            }
-
-            let mut gaps = Vec::new();
-
-            for column in &by_column {
-                for (idx, note) in column.iter().enumerate() {
-                    let Some(tail) = note.tail else {
-                        continue;
-                    };
-
-                    if let Some(next) = column.get(idx + 1) {
-                        let gap = next.head - tail;
-
-                        if gap >= 0.0 {
-                            gaps.push(gap);
-                        }
-                    }
-                }
-            }
-
-            if gaps.len() < 20 {
-                return None;
-            }
-
-            gaps.sort_by(f64::total_cmp);
-            let n = gaps.len();
-            let under_good = gaps.iter().filter(|&&g| g < windows.good).count();
-
-            Some(GapShape {
-                median_gap: gaps[n / 2],
-                collision_share: under_good as f64 / n as f64,
-            })
-        }
 
         let scores = load_multiuser();
         if scores.is_empty() {
@@ -5823,5 +5826,350 @@ mod tests {
                 .collect();
             summarise(label, &group);
         }
+    }
+
+    /// Whether fitted skill reads as *lower* on maps where releases collide with the
+    /// next press, within one player.
+    ///
+    /// [`window_overlap_structure`] found that a meaningful share of releases have
+    /// their next same-column press land inside the release's own GOOD window, which
+    /// breaks the independent-judgement assumption the fit rests on. [`gap_vs_fit_sweep`]
+    /// asked whether that shows up in pp/fit-quality pooled across players; this asks
+    /// the sharper question directly of skill, and *within* each player rather than
+    /// pooled, for the same reason [`ln_skill_slope`] does: a player's true skill is
+    /// roughly constant across their own top plays, so if the fit reads them as *less*
+    /// skilled specifically on their higher-collision maps, that is the collision
+    /// difficulty being underrated, not the player being worse. Pooling across players
+    /// naively — treating every score as one observation of the same slope — would
+    /// confound this with players of different ability simply preferring different map
+    /// styles, exactly the error the per-player framing avoids.
+    ///
+    /// The first version of this test avoided that confound by fitting one slope per
+    /// player and averaging the three slopes. That is *correct* but wasteful: with 3
+    /// players it reports on 2 degrees of freedom (n_players - 1) while sitting on top
+    /// of 87 scores. A single outlier player dominates the average completely, which is
+    /// exactly what happened — uid 10107 alone swung the headline number.
+    ///
+    /// The fix pools all scores while still absorbing between-player ability, by
+    /// "demeaning" each score against its own player's mean before pooling: for score i
+    /// belonging to player p, x_i = collision_share_i - mean_collision_share_p and
+    /// y_i = skill_i - mean_skill_p. Averaging out to zero within each player is exactly
+    /// what a player fixed effect (an intercept per player) does in a regression — this
+    /// is the "within" or fixed-effects estimator, computed by hand instead of via a
+    /// matrix library because with one regressor it reduces to an OLS-through-the-origin
+    /// on the demeaned pool: slope = sum(x_i * y_i) / sum(x_i^2). It uses up n_players
+    /// degrees of freedom for the intercepts (one mean subtracted per player) plus 1 for
+    /// the slope itself, leaving n - n_players - 1 residual degrees of freedom — about
+    /// 83 here instead of the 2 the per-player average was implicitly resting on, for
+    /// the same 87 scores. The per-player table is kept below since it is still useful
+    /// to see the raw shape per player; the pooled estimate is the headline because it
+    /// is the one with enough power to say anything.
+    ///
+    /// Also prints the identical pooled fixed-effects estimate against `attrs.stars` as
+    /// a control: if skill trends with star rating within a player too, the collision
+    /// slope may just be picking up difficulty misestimation in general rather than
+    /// collision specifically.
+    ///
+    /// A second confound, caught only after the pooled estimate above was written: uid
+    /// 10107 (documented at the `REAL_SCORES` fixture above as an "EZ pp exploiter") runs
+    /// most of their scores under `EZ`, which multiplies hit windows — and therefore the
+    /// absolute gap needed to avoid a collision — by 1.4x. [`gap_shape_for`] always
+    /// computes collision share against the map's *own*, no-mod windows, so an EZ score's
+    /// true collision exposure is understated on the x-axis: the same chart is easier to
+    /// avoid colliding on than its no-mod collision share suggests, for a player who
+    /// abnormally favours it. That taints any slope pooled across mod states, so the
+    /// pooled estimate below is printed three times: all scores, no-window-mod scores
+    /// (excluding `EZ` and `HR`, both of which rescale windows), and window-mod scores
+    /// only. This deliberately does not try to rescale the modded collision share to
+    /// compensate — that rescaling needs its own care (whether it is windows-only or also
+    /// changes hold/gap geometry) and is future work, not this report's job.
+    ///
+    /// Only players with at least 4 scores and a collision-share range of at least
+    /// 0.15 are reported in the per-player table — a player whose maps all sit at
+    /// similar collision share cannot inform a slope, and would only add noise. The
+    /// pooled estimate does not apply that filter: it uses every player with at least 2
+    /// scores, since the fixed-effects demeaning itself down-weights players with little
+    /// internal spread (their demeaned x_i cluster near zero and contribute little to
+    /// sum(x_i^2)).
+    ///
+    /// Run with `cargo test --release collision_skill_slope -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn collision_skill_slope() {
+        use std::collections::{BTreeMap, HashMap};
+
+        let scores = load_multiuser();
+        if scores.is_empty() {
+            println!("no fixtures present (local-fixtures/multiuser.tsv); nothing to report");
+            return;
+        }
+
+        struct Point {
+            uid: String,
+            collision_share: f64,
+            stars: f64,
+            skill: f64,
+            /// Whether this score used a mod that rescales hit windows (`EZ` or `HR`),
+            /// which makes the no-mod `collision_share` an understatement (`EZ`) or
+            /// overstatement (`HR`) of the score's true collision exposure.
+            window_mod: bool,
+        }
+
+        let mut cache: HashMap<String, Option<GapShape>> = HashMap::new();
+        let mut points = Vec::new();
+
+        for s in &scores {
+            if s.row.live_pp <= 0.0 || s.skill <= 0.0 {
+                continue;
+            }
+
+            let shape = cache
+                .entry(s.row.map_id.clone())
+                .or_insert_with(|| gap_shape_for(&s.row.map_id));
+
+            let Some(shape) = shape else {
+                continue;
+            };
+
+            points.push(Point {
+                uid: s.row.uid.clone(),
+                collision_share: shape.collision_share,
+                stars: s.stars,
+                skill: s.skill,
+                window_mod: s.row.mods.contains("EZ") || s.row.mods.contains("HR"),
+            });
+        }
+
+        if points.is_empty() {
+            println!(
+                "no scores with both a fitted skill and a fitted gap shape; nothing to report"
+            );
+            return;
+        }
+
+        // Pooled within-player (fixed-effects) OLS slope of `get_y` on `get_x`, computed
+        // by demeaning each point against its own player's mean and running a single
+        // OLS-through-the-origin over the pooled, demeaned points. Returns the slope, its
+        // standard error, the t-statistic, n, and n_players. See the doc comment above
+        // for why this beats averaging per-player slopes.
+        fn pooled_fixed_effects(
+            by_uid: &BTreeMap<&str, Vec<&Point>>,
+            get_x: impl Fn(&Point) -> f64,
+            get_y: impl Fn(&Point) -> f64,
+        ) -> Option<(f64, f64, f64, usize, usize)> {
+            let mut demeaned = Vec::new();
+            let mut n_players = 0;
+
+            for rows in by_uid.values() {
+                if rows.len() < 2 {
+                    continue;
+                }
+                n_players += 1;
+
+                let n = rows.len() as f64;
+                let mean_x = rows.iter().map(|p| get_x(p)).sum::<f64>() / n;
+                let mean_y = rows.iter().map(|p| get_y(p)).sum::<f64>() / n;
+
+                for p in rows {
+                    demeaned.push((get_x(p) - mean_x, get_y(p) - mean_y));
+                }
+            }
+
+            let n = demeaned.len();
+            let sum_xx: f64 = demeaned.iter().map(|(x, _)| x * x).sum();
+            if n == 0 || sum_xx <= 1e-9 {
+                return None;
+            }
+
+            let sum_xy: f64 = demeaned.iter().map(|(x, y)| x * y).sum();
+            let slope = sum_xy / sum_xx;
+
+            let residual_df = n as isize - n_players as isize - 1;
+            if residual_df <= 0 {
+                return None;
+            }
+
+            let ss_res: f64 = demeaned
+                .iter()
+                .map(|(x, y)| (y - slope * x).powi(2))
+                .sum();
+            let s2 = ss_res / residual_df as f64;
+            let se = (s2 / sum_xx).sqrt();
+            let t = if se > 1e-12 { slope / se } else { f64::INFINITY };
+
+            Some((slope, se, t, n, n_players))
+        }
+
+        let report_pooled = |label: &str, subset: &[&Point]| {
+            if subset.is_empty() {
+                println!("  {label}: n=0, nothing to report");
+                return;
+            }
+
+            let mut grouped: BTreeMap<&str, Vec<&Point>> = BTreeMap::new();
+            for p in subset {
+                grouped.entry(p.uid.as_str()).or_default().push(p);
+            }
+
+            let mean_skill = subset.iter().map(|p| p.skill).sum::<f64>() / subset.len() as f64;
+
+            println!("  {label}:");
+            match pooled_fixed_effects(&grouped, |p| p.collision_share, |p| p.skill) {
+                Some((slope, se, t, n, n_players)) => println!(
+                    "    collision share: n={n:<4} n_players={n_players}  slope={slope:+.3}  \
+                     ({:+.1}% per +100pp collision)  se={se:.3}  t={t:+.2}",
+                    100.0 * slope / mean_skill
+                ),
+                None => println!("    collision share: not enough within-player spread"),
+            }
+            match pooled_fixed_effects(&grouped, |p| p.stars, |p| p.skill) {
+                Some((slope, se, t, n, n_players)) => println!(
+                    "    stars (control): n={n:<4} n_players={n_players}  slope={slope:+.3}  \
+                     ({:+.1}% per +1 star)  se={se:.3}  t={t:+.2}",
+                    100.0 * slope / mean_skill
+                ),
+                None => println!("    stars (control): not enough within-player spread"),
+            }
+        };
+
+        println!(
+            "{} scores with a fitted skill and a fitted gap shape, across {} players.",
+            points.len(),
+            points
+                .iter()
+                .map(|p| p.uid.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        );
+
+        println!(
+            "\nPooled within-player (fixed-effects) slope of fitted skill against \
+             collision share, plus the identical estimate against `attrs.stars` as a \
+             control. This is the headline: it pools all qualifying players' demeaned \
+             scores into one regression instead of averaging three separate slopes."
+        );
+
+        let all: Vec<&Point> = points.iter().collect();
+        let no_window_mod: Vec<&Point> = points.iter().filter(|p| !p.window_mod).collect();
+        let window_mod: Vec<&Point> = points.iter().filter(|p| p.window_mod).collect();
+
+        println!();
+        report_pooled("(a) all scores", &all);
+        println!();
+        report_pooled("(b) no-window-mod scores (excludes EZ, HR)", &no_window_mod);
+        println!();
+        report_pooled("(c) window-mod scores only (EZ or HR)", &window_mod);
+
+        // Least-squares slope of `ys` on `xs`. Shared by the collision regression and
+        // the stars control so the two are computed identically.
+        fn slope(pairs: &[(f64, f64)]) -> Option<f64> {
+            let n = pairs.len() as f64;
+            let mean_x = pairs.iter().map(|(x, _)| x).sum::<f64>() / n;
+            let mean_y = pairs.iter().map(|(_, y)| y).sum::<f64>() / n;
+            let covariance: f64 = pairs
+                .iter()
+                .map(|(x, y)| (x - mean_x) * (y - mean_y))
+                .sum();
+            let variance: f64 = pairs.iter().map(|(x, _)| (x - mean_x).powi(2)).sum();
+            (variance > 1e-9).then_some(covariance / variance)
+        }
+
+        let mut by_uid: BTreeMap<&str, Vec<&Point>> = BTreeMap::new();
+        for point in &points {
+            by_uid.entry(point.uid.as_str()).or_default().push(point);
+        }
+
+        println!(
+            "\nPer-player context (not the headline — see the pooled estimate above): each \
+             player's own share of scores using a window mod, and their individual slope of \
+             fitted skill against collision share, with fitted skill against `attrs.stars` \
+             printed alongside as a control. Only players with >= 4 scores and a \
+             collision-share range >= 0.15 are shown; the rest cannot inform a slope."
+        );
+
+        let mut excluded_n = 0;
+        let mut excluded_range = 0;
+        let mut collision_slopes = Vec::new();
+
+        for (uid, rows) in &by_uid {
+            if rows.len() < 4 {
+                excluded_n += 1;
+                continue;
+            }
+
+            let lo = rows
+                .iter()
+                .map(|p| p.collision_share)
+                .fold(f64::INFINITY, f64::min);
+            let hi = rows
+                .iter()
+                .map(|p| p.collision_share)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let range = hi - lo;
+
+            if range < 0.15 {
+                excluded_range += 1;
+                continue;
+            }
+
+            let mean_skill = rows.iter().map(|p| p.skill).sum::<f64>() / rows.len() as f64;
+            let window_mod_share =
+                rows.iter().filter(|p| p.window_mod).count() as f64 / rows.len() as f64;
+
+            let collision_pairs: Vec<(f64, f64)> =
+                rows.iter().map(|p| (p.collision_share, p.skill)).collect();
+            let stars_pairs: Vec<(f64, f64)> = rows.iter().map(|p| (p.stars, p.skill)).collect();
+
+            let Some(collision_slope) = slope(&collision_pairs) else {
+                continue;
+            };
+            let stars_slope = slope(&stars_pairs);
+
+            let collision_pct = 100.0 * collision_slope / mean_skill;
+            collision_slopes.push(collision_pct);
+
+            println!(
+                "\n=== uid {uid} (n={}, collision share {lo:.2}-{hi:.2}, mean skill \
+                 {mean_skill:.2}, {:.0}% EZ/HR)",
+                rows.len(),
+                window_mod_share * 100.0
+            );
+            println!(
+                "  d(skill)/d(collision share) = {collision_slope:+.3}  \
+                 ({collision_pct:+.1}% per +100pp collision share)"
+            );
+            match stars_slope {
+                Some(stars_slope) => println!(
+                    "  d(skill)/d(stars)            = {stars_slope:+.3}  \
+                     ({:+.1}% per +1 star, control)",
+                    100.0 * stars_slope / mean_skill
+                ),
+                None => println!("  d(skill)/d(stars)            = n/a (no star-rating spread)"),
+            }
+        }
+
+        println!(
+            "\n{} players excluded for fewer than 4 scores, {} for a collision-share range \
+             under 0.15.",
+            excluded_n, excluded_range
+        );
+
+        if collision_slopes.is_empty() {
+            println!("\nno player had enough spread to compute a slope; nothing to summarise.");
+            return;
+        }
+
+        let mut sorted = collision_slopes.clone();
+        sorted.sort_by(f64::total_cmp);
+        let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+        let median = sorted[sorted.len() / 2];
+        let negative = sorted.iter().filter(|&&s| s < 0.0).count();
+        let positive = sorted.iter().filter(|&&s| s > 0.0).count();
+
+        println!(
+            "\nOverall, {} qualifying players: mean collision slope {mean:+.1}% per +100pp, \
+             median {median:+.1}% per +100pp, {negative} negative vs {positive} positive.",
+            sorted.len()
+        );
     }
 }
