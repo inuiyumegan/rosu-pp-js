@@ -1496,6 +1496,89 @@ fn compute_density_and_keys(data: &RebirthData, key_usage: &[Vec<bool>]) -> (Vec
 // Final computation
 // ---------------------------------------------------------------------------
 
+/// Floor on [`release_density_weight`]'s output.
+///
+/// The floor can only ever raise the factor, never lower it, so it can only raise stars;
+/// `0.0` would be bit-for-bit identical to the unclamped `35.0 / (density + 8.0)` baseline.
+///
+/// `1.5` is the shipped value, chosen from a sweep over `0.8` / `1.0` / `1.2` / `1.5` /
+/// `2.0` on the 405-map fixture set as the point where the long-note cohorts gain a few
+/// percent while rice does not move at all and the hardest map in the set moves 10.757 ->
+/// 10.765. It is an empirical choice, not a derived one, and the honest account of what it
+/// does and does not act on is in `release_density_weight`'s doc comment. Changing it means
+/// updating `release_density_weight_ships_a_raised_floor`'s table.
+///
+/// Median % stars change vs the unclamped baseline, by long-note share of objects:
+///
+/// | floor | rice | 0-30% | 30-60% | >60% | maps moved |
+/// | --- | --- | --- | --- | --- | --- |
+/// | 0.8 | +0.000 | +0.000 | +0.000 | +0.003 | 120 |
+/// | 1.0 | +0.000 | +0.000 | +0.119 | +0.294 | 192 |
+/// | 1.2 | +0.000 | +0.007 | +0.931 | +1.164 | 275 |
+/// | 1.5 | +0.000 | +0.156 | +2.365 | +2.629 | 332 |
+/// | 2.0 | +0.000 | +0.869 | +4.678 | +5.279 | 347 |
+///
+/// Within 7K alone the gain is monotone in long-note share (0% -> +0.000%, 2-11% ->
+/// +0.515%, 12-31% -> +0.762%, 32-58% -> +2.452%, 98%+ -> +3.287%), which is the shape the
+/// change is for: it prices long-note charts up in proportion to how much of the chart is
+/// long notes, and leaves rice alone.
+const RELEASE_WEIGHT_FLOOR: f64 = 1.5;
+
+/// Cap on [`release_density_weight`]'s output.
+///
+/// `f64::INFINITY` is likewise a no-op against the unclamped baseline. Exists mostly for
+/// symmetry with the floor and so a future experiment raising the floor can also bound
+/// the amplifying side (density-0 corners already reach 4.375 uncapped) without a second
+/// change to this function's signature.
+const RELEASE_WEIGHT_CAP: f64 = f64::INFINITY;
+
+/// The weight `rbar` (release difficulty) carries inside `s_all`, as a function of local
+/// note density.
+///
+/// This is asymmetric with `pbar` (press difficulty)'s weight on purpose — or rather, on
+/// no purpose that survives inspection: `pbar` is weighted by a flat `0.8` regardless of
+/// density, while this factor swings from 4.375 at density 0 down to 0.32 at density 100.
+/// The two terms are added inside the same `(...).powf(1.5)`, so at high density the
+/// release term is discarded almost three-fold relative to the press term, for no reason
+/// tied to how hard the release actually is.
+///
+/// `release_density_weight_structure` measures where the fixture set actually sits: dense
+/// long-note charts (inverse/反键 patterns, 7K in particular) push local density up, which
+/// is exactly the regime this factor suppresses hardest — the release difficulty is most
+/// real there (a colliding release genuinely competes with the next press for one
+/// judgement window, see `compute_rbar`'s `COLLISION_WEIGHT`) and most discarded by this
+/// divisor.
+///
+/// The shipped floor of `1.5` bounds that suppression, but **not in the way the framing
+/// above would suggest**, and the difference is worth writing down because it constrains
+/// what a future fix here can be.
+///
+/// The factor crosses 1.0 at density 27, so a floor of `0.8` acts *only* on density > 35.75
+/// — the genuinely suppressed corners. Swept over the fixture set, floor `0.8` moves the
+/// cohort above 60% long notes by `+0.003%` stars, and moves map `5143109` — 67.5%
+/// of its weight in the suppressed regime, the worst case in 405 maps — by `+0.003%`. Floor
+/// `1.5` moves that same map `+2.349%`.
+///
+/// So the effect lives in density `[15.33, 27]`, where the factor is already *above* 1.0
+/// and nothing is being suppressed. The reason is the sum it sits in:
+/// `0.8 * pbar + rbar * factor`. Where the factor bites hardest `pbar` is large and `rbar`
+/// small, so raising it perturbs a sum it does not dominate. `1.5` therefore ships as a
+/// broad amplification of release weight across the mid-density band — empirically the
+/// right shape (monotone in long-note share within a keymode, and exactly zero on rice),
+/// but a fitted constant, not a correction to an over-suppressed tail.
+///
+/// Two consequences for later work. Rice reads exactly `+0.000%` at every floor because
+/// `rbar ≈ 0` without releases; that is a property of `rbar` and not evidence the floor is
+/// long-note-selective. And a *bounded-tail* fix cannot be what this needs — if the divisor
+/// is wrong, it is wrong in its whole form across the mid-density band, and replacing the
+/// form is the change to make rather than clamping it harder.
+///
+/// Default floor/cap make this bit-for-bit identical to the unclamped baseline; see
+/// `release_density_weight_default_is_identity`.
+fn release_density_weight(density: f64) -> f64 {
+    (35.0 / (density + 8.0)).clamp(RELEASE_WEIGHT_FLOOR, RELEASE_WEIGHT_CAP)
+}
+
 struct RebirthParams {
     sr: f64,
     spikiness: f64,
@@ -1541,7 +1624,7 @@ fn calculate_from_data(data: &RebirthData, classic: bool) -> Option<RebirthParam
                     .powf(1.5)
                 + (1.0 - 0.4)
                     * (abar[idx].powf(2.0 / 3.0)
-                        * (0.8 * pbar[idx] + rbar[idx] * 35.0 / (density[idx] + 8.0)))
+                        * (0.8 * pbar[idx] + rbar[idx] * release_density_weight(density[idx])))
                         .powf(1.5))
             .powf(2.0 / 3.0);
             let t_all = (abar[idx].powf(3.0 / keys[idx]) * xbar[idx]) / (xbar[idx] + s_all + 1.0);
@@ -5736,6 +5819,388 @@ mod tests {
              change (it does not touch `window_scalar`, only `d` via `compute_rbar`); see the \
              full `cargo test --release` run for its pass/fail status."
         );
+    }
+
+    /// Pins the stars [`RELEASE_WEIGHT_FLOOR`] actually ships at, so a change to it — or
+    /// to anything in `s_all`'s arithmetic — has to be a deliberate edit to this table
+    /// rather than a silent drift. The `baseline` column is the pre-floor value
+    /// (`35.0 / (density[idx] + 8.0)` unclamped), kept alongside so the size and *sign* of
+    /// the shipped change stay legible at the assertion site.
+    ///
+    /// Covers a spread of the fixture set: the most LN-heavy 7K maps
+    /// (`release_density_weight_structure`'s top rows), two rice-leaning maps, and a
+    /// couple of the multiuser fixture's EZ+DT rows. `5583718` is the control — it holds
+    /// no long notes, so `rbar` is ~0, and its stars must not move at any floor.
+    ///
+    /// Every case is a *rise*, which is the invariant that matters beyond the digits: the
+    /// floor can only raise `release_density_weight`'s output, so it can only raise stars.
+    #[test]
+    fn release_density_weight_ships_a_raised_floor() {
+        assert_eq!(
+            RELEASE_WEIGHT_FLOOR, 1.5,
+            "shipped floor changed; update the expected stars below deliberately"
+        );
+        assert_eq!(
+            RELEASE_WEIGHT_CAP,
+            f64::INFINITY,
+            "cap is still a no-op; the amplifying low-density side is left alone"
+        );
+
+        // (map, baseline stars before the floor, stars at the shipped floor)
+        let cases: [(&str, f64, f64); 9] = [
+            ("3888054", 8.4455695952, 8.7237776572),
+            ("3888137", 9.1392900779, 9.4509781646),
+            ("5143109", 9.3534213016, 9.5741273600),
+            ("3501735", 9.0189268647, 9.2699937203),
+            ("1209101", 4.4565775646, 4.4586452644),
+            ("4229780", 8.9160413631, 8.9225767659),
+            ("3477077", 8.4100784840, 8.4345987638),
+            // Rice control: no releases, so no movement at any floor.
+            ("5583718", 8.8150062669, 8.8150062669),
+            ("4633018", 9.8255189639, 9.8333973479),
+        ];
+
+        for (id, baseline_stars, expected_stars) in cases {
+            assert!(
+                expected_stars >= baseline_stars,
+                "map {id}: the floor can only raise stars, but the table claims \
+                 {baseline_stars:.10} -> {expected_stars:.10}"
+            );
+
+            let map = parse(&format!("local-fixtures/maps/{id}.osu"))
+                .unwrap_or_else(|| panic!("fixture map {id}.osu not present"));
+            let attrs = calculate(&map, &GameMods::default(), 1.0, Some(false), None)
+                .unwrap_or_else(|| panic!("calculate() returned None for {id}"));
+
+            assert!(
+                (attrs.stars - expected_stars).abs() < 1e-9,
+                "map {id}: expected stars {expected_stars:.10}, got {:.10} \
+                 (pre-floor baseline was {baseline_stars:.10})",
+                attrs.stars
+            );
+        }
+    }
+
+    /// Dumps machine-parseable lines for the `RELEASE_WEIGHT_FLOOR` sweep: one `MAP` line
+    /// per fixture map (id, keys, LN share, stars) and one `SCORE` line per
+    /// `local-fixtures/multiuser.tsv` row (uid, map id, keys, LN fraction, stars, live pp,
+    /// our pp), so an external script can diff this build's output against a baseline
+    /// capture without needing Rust to hold both in memory at once — the sweep rebuilds
+    /// the crate for each `RELEASE_WEIGHT_FLOOR` value, so "baseline" and "current" can
+    /// never coexist in one process.
+    ///
+    /// Not a report in its own right — `release_density_weight_structure` and
+    /// `multiuser_report`/`ladder_report` are the human-readable versions of this same
+    /// data. This exists only as sweep plumbing.
+    ///
+    /// Run with `cargo test --release release_density_weight_sweep_dump -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints machine-readable sweep plumbing, not a report"]
+    fn release_density_weight_sweep_dump() {
+        use std::fs;
+
+        println!("RELEASE_WEIGHT_FLOOR\t{RELEASE_WEIGHT_FLOOR}");
+        println!("RELEASE_WEIGHT_CAP\t{RELEASE_WEIGHT_CAP}");
+
+        let Ok(entries) = fs::read_dir("local-fixtures/maps") else {
+            println!("no fixture maps present; nothing to dump");
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("osu") {
+                continue;
+            }
+            let Some(path_str) = path.to_str() else {
+                continue;
+            };
+            let Some(map) = parse(path_str) else {
+                continue;
+            };
+            let Some(attrs) = calculate(&map, &GameMods::default(), 1.0, Some(false), None) else {
+                continue;
+            };
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_owned();
+            let keys = map.cs.round_ties_even().max(1.0) as u32;
+            let ln_share = if attrs.n_objects > 0 {
+                attrs.n_long_notes as f64 / attrs.n_objects as f64
+            } else {
+                0.0
+            };
+            println!(
+                "MAP\t{id}\t{keys}\t{ln_share:.6}\t{:.10}",
+                attrs.stars
+            );
+        }
+
+        for score in load_multiuser() {
+            println!(
+                "SCORE\t{}\t{}\t{}\t{:.6}\t{:.10}\t{:.6}\t{:.6}",
+                score.row.uid,
+                score.row.map_id,
+                score.row.keys,
+                score.ln_fraction,
+                score.stars,
+                score.row.live_pp,
+                score.after_pp
+            );
+        }
+    }
+
+    /// Whether `s_all`'s `35.0 / (density + 8.0)` release-weight divisor actually lands
+    /// on dense LN charts, which is the premise behind touching it at all.
+    ///
+    /// The factor multiplies `rbar` inside `s_all` (see the constant's definition site);
+    /// `pbar`'s weight is a flat `0.8` with no density dependence, so any density
+    /// sensitivity in the combined term is entirely this factor's. At density 0 it is
+    /// 4.375 (amplifying release difficulty); at density 27 it crosses 1.0; at density
+    /// 100 it is 0.32 (suppressing). This duplicates the formula for reporting only —
+    /// production computes it inline in `calculate_from_data` and does not expose it.
+    ///
+    /// Per map: the weighted mean factor and the object-count-weighted share of corners
+    /// where the factor is below/above 1.0, using the *same* weights `calculate_from_data`
+    /// aggregates `d_all` with (`effective_weights`: `density_v2 * gap` under the non-classic
+    /// path, since every `calculate()` call site in this module that isn't specifically
+    /// testing classic scoring passes `Some(false)`). Then cross-tabulated against LN share
+    /// and keymode.
+    ///
+    /// Run with `cargo test --release release_density_weight_structure -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn release_density_weight_structure() {
+        use std::fs;
+
+        struct MapWeight {
+            id: String,
+            keys: usize,
+            ln_share: f64,
+            n_objects: usize,
+            weighted_mean_factor: f64,
+            /// Object-count-weighted share of corners where the factor is < 1.0
+            /// (release suppressed relative to press's flat 0.8).
+            suppressed_share: f64,
+        }
+
+        fn weight_shape_for(map: &Beatmap) -> Option<MapWeight> {
+            let total_columns = map.cs.round_ties_even().max(1.0) as usize;
+            let (notes, _) = build_notes(1.0, map.hit_objects.iter(), total_columns);
+
+            if notes.len() < 2 || total_columns == 0 {
+                return None;
+            }
+
+            let n_long_notes = notes.iter().filter(|n| n.tail.is_some()).count();
+            let ln_share = n_long_notes as f64 / notes.len() as f64;
+
+            // Map's own windows, no mods, `classic = false`: matches every
+            // `calculate()` call site in this module other than ones specifically
+            // exercising the classic/ScoreV1 path.
+            let windows = hit_windows(map, &GameMods::default(), 1.0, false);
+            let great_hit_window = get_hit_window_300(map, 1.0, false, false);
+            let hit_leniency = hit_leniency_from_window(great_hit_window);
+            let data = RebirthData::new(notes, total_columns, hit_leniency, windows.good);
+
+            (|| {
+                if data.all_corners.len() < 2 {
+                    return None;
+                }
+
+                let key_usage = get_key_usage(&data);
+                let (density_base, density_v2_base, _keys_base) =
+                    compute_density_and_keys(&data, &key_usage);
+                let density = step_interp(&data.all_corners, &data.base_corners, &density_base);
+                let density_v2 =
+                    step_interp(&data.all_corners, &data.base_corners, &density_v2_base);
+
+                let mut gaps = vec![0.0; data.all_corners.len()];
+                if gaps.len() < 2 {
+                    return None;
+                }
+                gaps[0] = (data.all_corners[1] - data.all_corners[0]) / 2.0;
+                let last = gaps.len() - 1;
+                gaps[last] = (data.all_corners[last] - data.all_corners[last - 1]) / 2.0;
+                for idx in 1..last {
+                    gaps[idx] = (data.all_corners[idx + 1] - data.all_corners[idx - 1]) / 2.0;
+                }
+
+                // Non-classic (`ContainsCL` false) weighting, matching `calculate_from_data`'s
+                // `effective_weights` when `classic` is false.
+                let effective_weights: Vec<f64> = density_v2
+                    .iter()
+                    .zip(&gaps)
+                    .map(|(&c, &gap)| c * gap)
+                    .collect();
+
+                let total_weight: f64 = effective_weights.iter().sum();
+                if total_weight <= 0.0 {
+                    return None;
+                }
+
+                let factors: Vec<f64> = density.iter().map(|&d| 35.0 / (d + 8.0)).collect();
+
+                let weighted_mean_factor = factors
+                    .iter()
+                    .zip(&effective_weights)
+                    .map(|(&f, &w)| f * w)
+                    .sum::<f64>()
+                    / total_weight;
+
+                let suppressed_weight: f64 = factors
+                    .iter()
+                    .zip(&effective_weights)
+                    .filter(|&(&f, _)| f < 1.0)
+                    .map(|(_, &w)| w)
+                    .sum();
+
+                Some(MapWeight {
+                    id: String::new(), // filled by caller
+                    keys: total_columns,
+                    ln_share,
+                    n_objects: data.notes.len(),
+                    weighted_mean_factor,
+                    suppressed_share: suppressed_weight / total_weight,
+                })
+            })()
+        }
+
+        let Ok(entries) = fs::read_dir("local-fixtures/maps") else {
+            println!("no fixture maps present; nothing to report");
+            return;
+        };
+
+        let mut rows = Vec::new();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("osu") {
+                continue;
+            }
+            let Some(path_str) = path.to_str() else {
+                continue;
+            };
+            let Some(map) = parse(path_str) else {
+                continue;
+            };
+            let Some(mut shape) = weight_shape_for(&map) else {
+                continue;
+            };
+            shape.id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_owned();
+            rows.push(shape);
+        }
+
+        if rows.is_empty() {
+            println!("no parseable fixture maps; nothing to report");
+            return;
+        }
+
+        println!("{} maps parsed.", rows.len());
+
+        let n = rows.len() as f64;
+        let mean_of_means = rows.iter().map(|r| r.weighted_mean_factor).sum::<f64>() / n;
+        let mut sorted_means: Vec<f64> = rows.iter().map(|r| r.weighted_mean_factor).collect();
+        sorted_means.sort_by(f64::total_cmp);
+        let median_factor = sorted_means[sorted_means.len() / 2];
+
+        println!(
+            "overall: mean-of-per-map weighted mean factor = {mean_of_means:.4}, median = \
+             {median_factor:.4}"
+        );
+
+        let total_objects: f64 = rows.iter().map(|r| r.n_objects as f64).sum();
+        let overall_suppressed_share = rows
+            .iter()
+            .map(|r| r.suppressed_share * r.n_objects as f64)
+            .sum::<f64>()
+            / total_objects;
+        println!(
+            "object-count-weighted share of corners with factor < 1.0 (suppressed): \
+             {:.1}%",
+            overall_suppressed_share * 100.0
+        );
+
+        // Cross-tab: LN share bucket.
+        let ln_buckets = [
+            ("0%", 0.0, 0.0),
+            ("0-30%", 0.0, 0.30),
+            ("30-60%", 0.30, 0.60),
+            (">60%", 0.60, f64::INFINITY),
+        ];
+
+        println!("\nby LN-share bucket:");
+        for (label, lo, hi) in ln_buckets {
+            let group: Vec<&MapWeight> = if lo == 0.0 && hi == 0.0 {
+                rows.iter().filter(|r| r.ln_share == 0.0).collect()
+            } else {
+                rows.iter()
+                    .filter(|r| r.ln_share > lo && r.ln_share <= hi)
+                    .collect()
+            };
+            if group.is_empty() {
+                println!("  {label:>7}: n=0");
+                continue;
+            }
+            let mut vals: Vec<f64> = group.iter().map(|r| r.weighted_mean_factor).collect();
+            vals.sort_by(f64::total_cmp);
+            let med = vals[vals.len() / 2];
+            let gn = group.len() as f64;
+            let mean = vals.iter().sum::<f64>() / gn;
+            println!(
+                "  {label:>7}: n={:<4} median factor {med:.4}  mean factor {mean:.4}",
+                group.len()
+            );
+        }
+
+        // Cross-tab: keymode.
+        println!("\nby keymode:");
+        let keymode_preds: [(&str, fn(usize) -> bool); 3] = [
+            ("4K", |k| k == 4),
+            ("7K", |k| k == 7),
+            ("other", |k| k != 4 && k != 7),
+        ];
+        for (label, pred) in keymode_preds {
+            let group: Vec<&MapWeight> = rows.iter().filter(|r| pred(r.keys)).collect();
+            if group.is_empty() {
+                println!("  {label:>5}: n=0");
+                continue;
+            }
+            let mut vals: Vec<f64> = group.iter().map(|r| r.weighted_mean_factor).collect();
+            vals.sort_by(f64::total_cmp);
+            let med = vals[vals.len() / 2];
+            let gn = group.len() as f64;
+            let mean = vals.iter().sum::<f64>() / gn;
+            println!(
+                "  {label:>5}: n={:<4} median factor {med:.4}  mean factor {mean:.4}",
+                group.len()
+            );
+        }
+
+        // The 10 most LN-heavy maps: are they in the suppressed regime?
+        let mut by_ln = rows.iter().collect::<Vec<_>>();
+        by_ln.sort_by(|a, b| b.ln_share.total_cmp(&a.ln_share));
+        println!("\ntop 10 by LN share (is the premise true for these?):");
+        println!(
+            "{:>9} {:>4} {:>8} {:>14} {:>12}",
+            "map", "keys", "ln share", "weighted mean", "suppressed%"
+        );
+        for row in by_ln.iter().take(10) {
+            println!(
+                "{:>9} {:>4} {:>7.1}% {:>14.4} {:>11.1}%",
+                row.id,
+                row.keys,
+                row.ln_share * 100.0,
+                row.weighted_mean_factor,
+                row.suppressed_share * 100.0
+            );
+        }
     }
 
     /// How often a release's judgement window reaches past the next press in the same
