@@ -267,7 +267,7 @@ pub fn calculate(
         return None;
     }
 
-    let data = RebirthData::new(notes, total_columns, hit_leniency);
+    let data = RebirthData::new(notes, total_columns, hit_leniency, windows.good);
     let params = calculate_from_data(&data, classic)?;
 
     Some(SunnyManiaDifficultyAttributes {
@@ -681,6 +681,10 @@ fn column_for(object: &HitObject, total_columns: usize) -> usize {
 struct RebirthData {
     total_columns: usize,
     hit_leniency: f64,
+    /// The GOOD hit window (ms) a release is judged against. Mod-aware: it is the
+    /// *played* windows (`windows`, not `map_windows`), so a tighter HR window really
+    /// does mean less collision. Used by [`compute_rbar`]'s collision term.
+    good_window: f64,
     t_end: f64,
     notes: Vec<Note>,
     notes_by_column: Vec<Vec<Note>>,
@@ -692,7 +696,7 @@ struct RebirthData {
 }
 
 impl RebirthData {
-    fn new(mut notes: Vec<Note>, total_columns: usize, hit_leniency: f64) -> Self {
+    fn new(mut notes: Vec<Note>, total_columns: usize, hit_leniency: f64, good_window: f64) -> Self {
         notes.sort_by(compare_notes);
 
         let mut notes_by_column = vec![Vec::new(); total_columns];
@@ -721,6 +725,7 @@ impl RebirthData {
         Self {
             total_columns,
             hit_leniency,
+            good_window,
             t_end,
             notes,
             notes_by_column,
@@ -1369,6 +1374,21 @@ fn compute_abar(
 // Rbar
 // ---------------------------------------------------------------------------
 
+/// How much a fully-colliding LN release is charged on top of its base difficulty.
+///
+/// A release whose next same-column press falls inside the window the release is
+/// judged against forces two events to share one interval, which no model of
+/// independent draws can represent. 23.8% of releases across the fixture set are in
+/// this state (`inverse_gap_structure`), and sunny's existing `1 + 0.8*i` rhythm term
+/// charges them about 33% *less* than sparse releases.
+///
+/// **This magnitude is a deliberate unfitted guess.** The ladder fixtures cannot size
+/// it: `tools/fetch_ladder.sh` selects `s.acc between 88.0 and 99.5`, which bounds
+/// accuracy by construction and biases every regression that controls for stars. It is
+/// set conservatively — below the ~33% discount it offsets — so it corrects the sign of
+/// the response without asserting a magnitude the data cannot support.
+const COLLISION_WEIGHT: f64 = 0.25;
+
 fn find_next_note_in_column(note: Note, notes: &[Note]) -> Option<Note> {
     let idx = notes.partition_point(|candidate| candidate.head < note.head);
 
@@ -1382,7 +1402,7 @@ fn compute_rbar(data: &RebirthData) -> Vec<f64> {
         return r_step;
     }
 
-    let i_list: Vec<_> = data
+    let (i_list, c_list): (Vec<f64>, Vec<f64>) = data
         .tails
         .iter()
         .map(|tail| {
@@ -1392,9 +1412,23 @@ fn compute_rbar(data: &RebirthData) -> Vec<f64> {
             let i_h = 0.001 * (tail_time - tail.head - 80.0).abs() / data.hit_leniency;
             let i_t = 0.001 * (next_head - tail_time - 80.0).abs() / data.hit_leniency;
 
-            2.0 / (2.0 + (-5.0 * (i_h - 0.75)).exp() + (-5.0 * (i_t - 0.75)).exp())
+            let i = 2.0 / (2.0 + (-5.0 * (i_h - 0.75)).exp() + (-5.0 * (i_t - 0.75)).exp());
+
+            // Collision overlap: how much of the release's own GOOD window is eaten by
+            // the next same-column press. `next_head` is 1e9 when there is no following
+            // note in the column, which correctly yields overlap 0. A negative gap
+            // (release after the next head) clamps to 1.0 — total collision, which is
+            // the right answer.
+            let g = next_head - tail_time;
+            let c = if data.good_window > 0.0 {
+                (1.0 - g / data.good_window).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+
+            (i, c)
         })
-        .collect();
+        .unzip();
 
     for idx in 0..data.tails.len() - 1 {
         let t_start = data.tails[idx].tail_or_head();
@@ -1407,10 +1441,18 @@ fn compute_rbar(data: &RebirthData) -> Vec<f64> {
         }
 
         let delta_r = 0.001 * (t_end - t_start);
+        // The collision factor is additive-in-factor to the existing rhythm term
+        // (`1 + 0.8*i`) rather than a replacement of it: that term has a defensible
+        // reading upstream where a release inside comfortable 1/4 rhythm has the next
+        // note as a timing anchor, whereas this term charges specifically for the two
+        // judgements sharing one interval. The `0.5` averages the pair's overlaps so a
+        // fully-colliding pair yields exactly `1 + COLLISION_WEIGHT`, not
+        // `1 + 2*COLLISION_WEIGHT`.
         let value = 0.08
             * delta_r.powf(-0.5)
             * data.hit_leniency.powi(-1)
-            * (1.0 + 0.8 * (i_list[idx] + i_list[idx + 1]));
+            * (1.0 + 0.8 * (i_list[idx] + i_list[idx + 1]))
+            * (1.0 + COLLISION_WEIGHT * 0.5 * (c_list[idx] + c_list[idx + 1]));
 
         for step in &mut r_step[left..right] {
             *step = value;
@@ -5450,6 +5492,250 @@ mod tests {
         for (idx, &rep) in LN_DURATION_REPRESENTATIVES.iter().enumerate() {
             println!("  bin {idx}: {rep:>4.0}ms -> {:.3}x", scale_for(rep));
         }
+    }
+
+    /// Whether the new collision term (`COLLISION_WEIGHT` in `compute_rbar`) actually
+    /// lands on the maps `inverse_gap_structure` and `window_overlap_structure` measured
+    /// as colliding, and leaves everything else alone.
+    ///
+    /// The production code does not expose `compute_rbar`'s internals, so this
+    /// deliberately duplicates the collision-overlap formula (`(1 - gap/good) .clamp(0,
+    /// 1)`) against the same map-own GOOD window `window_overlap_structure` uses, purely
+    /// for reporting: it is not a second implementation the production code is checked
+    /// against, just a way to see the multiplier without a before/after build.
+    ///
+    /// Run with `cargo test --release collision_term_pricing -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "prints a report rather than asserting"]
+    fn collision_term_pricing() {
+        use std::fs;
+
+        /// Duplicate of the production overlap formula in `compute_rbar`, for
+        /// reporting only. `gap` may be 1e9 (no following note in the column) or
+        /// negative (release after the next head); both are handled by the clamp
+        /// exactly as in production.
+        fn overlap_for(gap: f64, good_window: f64) -> f64 {
+            if good_window > 0.0 {
+                (1.0 - gap / good_window).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        }
+
+        struct MapCollision {
+            id: String,
+            keys: usize,
+            collision_share: f64,
+            mean_factor: f64,
+        }
+
+        // Per-map: gaps (release -> next same-column press) and per-tail overlaps,
+        // sorted by tail time to mirror `RebirthData.tails`' ordering, which is what
+        // `compute_rbar` actually pairs up consecutively.
+        fn collision_shape_for(map: &Beatmap) -> Option<(f64, Vec<f64>, usize, f64)> {
+            let total_columns = map.cs.round_ties_even().max(1.0) as usize;
+            let (notes, _) = build_notes(1.0, map.hit_objects.iter(), total_columns);
+
+            if notes.len() < 2 || total_columns == 0 {
+                return None;
+            }
+
+            // The map's own windows, no mods: the same reference `window_overlap_structure`
+            // and `inverse_gap_structure` price collisions against.
+            let windows = hit_windows(map, &GameMods::default(), 1.0, true);
+            let good_window = windows.good;
+
+            let mut by_column: Vec<Vec<Note>> = vec![Vec::new(); total_columns];
+            for note in &notes {
+                if note.column < total_columns {
+                    by_column[note.column].push(*note);
+                }
+            }
+            for column in &mut by_column {
+                column.sort_by(|a, b| a.head.total_cmp(&b.head));
+            }
+
+            let mut gaps = Vec::new();
+            let mut tails: Vec<(f64, f64)> = Vec::new(); // (tail_time, overlap)
+
+            for column in &by_column {
+                for (idx, note) in column.iter().enumerate() {
+                    let Some(tail_time) = note.tail else {
+                        continue;
+                    };
+
+                    let gap = column.get(idx + 1).map_or(1e9, |next| next.head - tail_time);
+                    gaps.push(gap);
+                    tails.push((tail_time, overlap_for(gap, good_window)));
+                }
+            }
+
+            if gaps.is_empty() {
+                return None;
+            }
+
+            tails.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+            let n_gaps = gaps.len();
+            let under_good = gaps.iter().filter(|&&g| g < good_window).count();
+            let collision_share = under_good as f64 / n_gaps as f64;
+
+            let overlaps: Vec<f64> = tails.iter().map(|&(_, c)| c).collect();
+
+            (tails.len() >= 2).then(|| {
+                let mut factor_sum = 0.0;
+                let mut factor_n = 0usize;
+
+                for idx in 0..overlaps.len() - 1 {
+                    factor_sum += 1.0 + COLLISION_WEIGHT * 0.5 * (overlaps[idx] + overlaps[idx + 1]);
+                    factor_n += 1;
+                }
+
+                (collision_share, overlaps, total_columns, factor_sum / factor_n as f64)
+            })
+        }
+
+        // --- (a) map 5143109: the 7K/OD0/97.9%-LN/100%-collision-share map. ---
+        if let Some(map) = parse("local-fixtures/maps/5143109.osu") {
+            let mods = GameMods::default();
+            match calculate(&map, &mods, 1.0, Some(true), None) {
+                Some(attrs) => {
+                    if let Some((collision_share, overlaps, keys, mean_factor)) =
+                        collision_shape_for(&map)
+                    {
+                        let mean_overlap = overlaps.iter().sum::<f64>() / overlaps.len() as f64;
+                        let max_overlap = overlaps.iter().cloned().fold(0.0, f64::max);
+
+                        println!(
+                            "map 5143109: keys={keys} stars={:.4}  collision_share={:.1}%  \
+                             mean_overlap={mean_overlap:.4}  max_overlap={max_overlap:.4}  \
+                             mean applied factor (1+{COLLISION_WEIGHT}*avg(c))={mean_factor:.4}",
+                            attrs.stars,
+                            collision_share * 100.0
+                        );
+                    } else {
+                        println!("map 5143109: fewer than 2 long notes with gaps; nothing to report");
+                    }
+                }
+                None => println!("map 5143109: calculate() returned None"),
+            }
+        } else {
+            println!("map 5143109: local-fixtures/maps/5143109.osu not present; nothing to report");
+        }
+
+        // --- (b) every fixture map: collision share vs. mean applied factor. ---
+        let Ok(entries) = fs::read_dir("local-fixtures/maps") else {
+            println!("\nno fixture maps present; nothing further to report");
+            return;
+        };
+
+        let mut rows = Vec::new();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            if path.extension().and_then(|e| e.to_str()) != Some("osu") {
+                continue;
+            }
+
+            let Some(path_str) = path.to_str() else {
+                continue;
+            };
+            let Some(map) = parse(path_str) else {
+                continue;
+            };
+
+            let Some((collision_share, overlaps, keys, mean_factor)) = collision_shape_for(&map)
+            else {
+                continue;
+            };
+
+            let _ = &overlaps;
+
+            rows.push(MapCollision {
+                id: path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_owned(),
+                keys,
+                collision_share,
+                mean_factor,
+            });
+        }
+
+        if rows.is_empty() {
+            println!("\nno parseable fixture maps with at least 2 long notes; nothing to report");
+            return;
+        }
+
+        rows.sort_by(|a, b| b.collision_share.total_cmp(&a.collision_share));
+
+        println!(
+            "\n{} maps with at least 2 long notes. Sorted by collision share.",
+            rows.len()
+        );
+        println!(
+            "{:>9} {:>4} {:>15} {:>13}",
+            "map", "keys", "collision share", "mean factor"
+        );
+
+        for row in rows.iter().take(15) {
+            println!(
+                "{:>9} {:>4} {:>14.1}% {:>13.4}",
+                row.id,
+                row.keys,
+                row.collision_share * 100.0,
+                row.mean_factor
+            );
+        }
+
+        // THIS IS THE KEY OUTPUT: whether the term is targeted (zero-collision maps
+        // stay at exactly 1.0, and only colliding maps move) or diffuse (everything
+        // moves regardless of collision share).
+        let buckets = [
+            ("0%", 0.0, 0.0),
+            ("0-10%", 0.0, 0.10),
+            ("10-30%", 0.10, 0.30),
+            ("30-60%", 0.30, 0.60),
+            (">60%", 0.60, f64::INFINITY),
+        ];
+
+        println!("\nby collision-share bucket:");
+        for (label, lo, hi) in buckets {
+            let group: Vec<&MapCollision> = if lo == 0.0 && hi == 0.0 {
+                rows.iter().filter(|r| r.collision_share == 0.0).collect()
+            } else {
+                rows.iter()
+                    .filter(|r| r.collision_share > lo && r.collision_share <= hi)
+                    .collect()
+            };
+
+            if group.is_empty() {
+                println!("  {label:>7}: n=0");
+                continue;
+            }
+
+            let n = group.len() as f64;
+            let mean_factor = group.iter().map(|r| r.mean_factor).sum::<f64>() / n;
+
+            println!("  {label:>7}: n={:<4} mean applied factor {mean_factor:.4}", group.len());
+
+            if label == "0%" && (mean_factor - 1.0).abs() > 1e-9 {
+                println!(
+                    "    !!! LEAK: zero-collision maps must show a mean factor of exactly \
+                     1.0, got {mean_factor:.6}"
+                );
+            }
+        }
+
+        // --- (c) no-mod pricing is untouched. ---
+        println!(
+            "\nno-mod window_scalar == 1.0 is covered by \
+             `a_no_mod_score_is_priced_at_one_whatever_the_od`, which is unaffected by this \
+             change (it does not touch `window_scalar`, only `d` via `compute_rbar`); see the \
+             full `cargo test --release` run for its pass/fail status."
+        );
     }
 
     /// How often a release's judgement window reaches past the next press in the same
