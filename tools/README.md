@@ -55,9 +55,28 @@ cat local-fixtures/ladder-*.tsv \
   | cargo test --release ladder_report -- --ignored --nocapture --exact sunny::tests::ladder_report
 ```
 
-The TSV's `pp` column is the **live ppy.sb figure, from an older algorithm than sunny**,
-so treat a ratio against it as the gap between two algorithms rather than as error in
-this one.
+## Where each number comes from
+
+Every fixture mixes columns of different provenance, and getting this wrong has already
+cost one round of bad reasoning. Treat this table as the answer; do not re-derive it from
+the fetch scripts.
+
+| Column | Source | Algorithm |
+| --- | --- | --- |
+| `pp` in `ladder*.tsv` | ppy.sb | **live sunny pp**, as deployed, before our changes |
+| `pp` in the tRPC fixtures (`multiuser.tsv`, `bp1.json`, `bp2.json`, `batch.tsv`) | ppy.sb tRPC endpoint | **live sunny pp**, same as above |
+| star column in `ladder*.tsv` | bancho.py `maps.diff` | **bancho**, a different calculation (`log`-`log` slope 0.78) |
+| `.osu` files under `local-fixtures/maps/` | `osu.ppy.sh/osu/$mapid` | n/a |
+
+So a single ladder row carries sunny pp next to bancho stars. Both pp sources are the
+algorithm family this crate computes, which makes a pp ratio against them a measure of
+**our own changes** rather than the gap to a foreign algorithm. That is the calibration
+anchor for anything needing an absolute pp scale — pricing from fitted skill instead of a
+window ratio, most of all.
+
+The star column is the one to distrust, per the warning above: fit exponents against
+sunny's own `d`, never against `maps.diff`. A ratio of our stars to that column running
+~1.2 is the two calculations disagreeing, not a defect in ours.
 
 To see what a candidate `sigma_floor` would do — to fit quality and to pricing, which
 turn out to be different questions:
