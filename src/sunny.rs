@@ -3969,6 +3969,95 @@ mod tests {
         out
     }
 
+    /// Reads a difficulty-ladder TSV (`local-fixtures/ladder.tsv` or
+    /// `local-fixtures/ladder-strong.tsv`) and prices every row exactly like
+    /// [`load_multiuser`], reusing [`MultiRow`]/[`MultiPriced`] rather than a second
+    /// point type so ladder and multiuser scores can be pooled directly by
+    /// [`collision_skill_slope`]. The TSV's `cohort` column becomes `uid`: each ladder
+    /// cohort is one player, exactly as multiuser's `uid` is.
+    ///
+    /// The ladder is no-mod/NF only by construction (`tools/fetch_ladder.sh` selects
+    /// `mods in (0,1)`, and in the fixtures on disk the `mods` column is `0` for every
+    /// row — no `NF` rows actually landed), so `mods_for` is skipped entirely and
+    /// `row.mods` is stored as the literal `"0"` from the TSV, which makes
+    /// `.contains("EZ")`/`.contains("HR")` downstream correctly return false.
+    fn load_ladder(path: &str) -> Vec<MultiPriced> {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 19 || f[0] == "cohort" {
+                continue;
+            }
+
+            let u = |s: &str| s.parse::<u32>().unwrap_or(0);
+            let mut row = MultiRow {
+                uid: f[0].to_owned(),
+                map_id: f[3].to_owned(),
+                mods: f[7].to_owned(),
+                live_stars: f[6].parse().unwrap_or(0.0),
+                keys: 0,
+                counts: [u(f[10]), u(f[11]), u(f[12]), u(f[13]), u(f[14]), u(f[15])],
+                acc: f[8].parse().unwrap_or(0.0),
+                live_pp: f[9].parse().unwrap_or(0.0),
+                title: "ladder".to_owned(),
+                version: String::new(),
+            };
+
+            let Some(map) = parse(&format!("local-fixtures/maps/{}.osu", row.map_id)) else {
+                continue;
+            };
+            row.keys = map.cs.round_ties_even().max(1.0) as u32;
+
+            // No mods, rate 1.0: the ladder is deliberately no-mod/NF only, so the
+            // map's own windows and note timings are the right ones (same assumption
+            // `ladder_report` makes above).
+            let Some(attrs) = calculate(&map, &GameMods::default(), 1.0, Some(false), None) else {
+                continue;
+            };
+
+            let state = SunnyScoreState {
+                n320: row.counts[0],
+                n300: row.counts[1],
+                n200: row.counts[2],
+                n100: row.counts[3],
+                n50: row.counts[4],
+                misses: row.counts[5],
+            };
+
+            let perf = calculate_performance(&attrs, &GameMods::default(), state);
+            let model = ErrorModel::default();
+            let units = judgement_units(&attrs, f64::from(state.total_hits()), &model);
+            let fit = fit_with_quality(&row.counts, &units, &attrs.hit_windows, &model);
+
+            out.push(MultiPriced {
+                stars: attrs.stars,
+                od: map.od,
+                is_convert: map.is_convert,
+                before_pp: pp_before_change(&attrs, &GameMods::default(), state),
+                after_pp: perf.pp,
+                scalar: perf.window_scalar,
+                skill: fit.skill,
+                g_timing: fit.g_timing,
+                plausible: fit.is_plausible(),
+                notes: state.total_hits(),
+                ln_fraction: if attrs.n_objects > 0 {
+                    attrs.n_long_notes as f64 / attrs.n_objects as f64
+                } else {
+                    0.0
+                },
+                ln_judged_as_one: attrs.ln_judged_as_one,
+                row,
+            });
+        }
+
+        out
+    }
+
     /// Not an assertion — the cross-user report. Prices every score in
     /// `local-fixtures/multiuser.tsv` under both the pre-change stack
     /// ([`pp_before_change`]: flat `EZ` `0.90`, no window scalar) and the current one
@@ -5921,17 +6010,73 @@ mod tests {
     /// internal spread (their demeaned x_i cluster near zero and contribute little to
     /// sum(x_i^2)).
     ///
+    /// The scores above are all [`load_multiuser`]'s 87-score, 3-player set, which is
+    /// too thin for the stars control specifically: one of its three players has all
+    /// 45 of their scores in the >=8 star bin, so there is almost no within-player
+    /// star spread to fit against. `local-fixtures/ladder.tsv` and
+    /// `local-fixtures/ladder-strong.tsv` (via [`load_ladder`]) are pooled in
+    /// alongside it for exactly that reason: each is a set of "difficulty ladders",
+    /// ~30 scores per player spanning a wide star range within one quarter, which is
+    /// the shape the stars slope needs. `ladder-weak.tsv` is a byte-identical copy of
+    /// `ladder.tsv` (same five cohorts) and is not read a second time, to avoid
+    /// silently doubling those players' weight in the pooled fit. The ladder TSVs are
+    /// no-mod/NF only by construction (`tools/fetch_ladder.sh` selects `mods in
+    /// (0,1)`, and every row on disk is mods=0), so all ladder scores fall into the
+    /// no-window-mod group of the three-way split below; the window-mod-only group
+    /// stays entirely multiuser.tsv scores, unaffected by the pooling.
+    ///
+    /// Also prints mean score accuracy per star bin per player, right after the
+    /// existing fitted-skill-per-star-bin table, as a check on whether that stars
+    /// trend is a real model defect or a selection artefact of the ladder's own
+    /// fetch query (`acc between 88 and 99.5`): see the comment at that table for the
+    /// reasoning.
+    ///
     /// Run with `cargo test --release collision_skill_slope -- --ignored --nocapture`.
     #[test]
     #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
     fn collision_skill_slope() {
         use std::collections::{BTreeMap, HashMap};
 
-        let scores = load_multiuser();
+        // Pooled with `local-fixtures/multiuser.tsv` (87 scores, 3 players) below:
+        // the multiuser set alone leaves almost no within-player star spread — one
+        // player has all 45 of their scores in the >=8 star bin — so it cannot
+        // identify a stars slope separately from a collision slope. The ladder TSVs
+        // are "difficulty ladders": for each of several players, ~30 scores spanning
+        // 2-10+ stars within one quarter, which is exactly the within-player spread
+        // the joint regression needs. `ladder.tsv` and `ladder-weak.tsv` are byte-
+        // identical (both hold cohorts 1514/2160/2187/2460/3102), so only one of the
+        // two is read to avoid silently doubling those five players' weight.
+        let multiuser = load_multiuser();
+        let ladder = load_ladder("local-fixtures/ladder.tsv");
+        let ladder_strong = load_ladder("local-fixtures/ladder-strong.tsv");
+
+        let n_multiuser = multiuser.len();
+        let n_ladder = ladder.len() + ladder_strong.len();
+
+        let mut scores = multiuser;
+        scores.extend(ladder);
+        scores.extend(ladder_strong);
+
         if scores.is_empty() {
-            println!("no fixtures present (local-fixtures/multiuser.tsv); nothing to report");
+            println!(
+                "no fixtures present (local-fixtures/multiuser.tsv, ladder.tsv, \
+                 ladder-strong.tsv); nothing to report"
+            );
             return;
         }
+
+        let n_cohorts = scores
+            .iter()
+            .map(|s| s.row.uid.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+
+        println!(
+            "loaded {} scores across {n_cohorts} cohorts: {n_multiuser} from multiuser.tsv, \
+             {n_ladder} from the ladder TSVs (ladder.tsv + ladder-strong.tsv; \
+             ladder-weak.tsv skipped as a byte-identical duplicate of ladder.tsv).",
+            scores.len()
+        );
 
         struct Point {
             uid: String,
@@ -5948,6 +6093,14 @@ mod tests {
             map_id: String,
             mods: String,
             counts: [u32; 6],
+            /// Standard 320-weighted mania accuracy computed from `counts`
+            /// (`(320*n320+300*n300+200*n200+100*n100+50*n50) / (320*total)`), for
+            /// the selection-artefact check below. Computed here rather than reused
+            /// from the TSV's own `acc` column, since that column's exact provenance
+            /// (live server) is not guaranteed to use this weighting, and the point
+            /// of the diagnostic is comparing accuracy against fitted skill under one
+            /// consistent definition.
+            accuracy: f64,
         }
 
         let mut cache: HashMap<String, Option<GapShape>> = HashMap::new();
@@ -5966,6 +6119,15 @@ mod tests {
                 continue;
             };
 
+            let total_hits = s.row.counts.iter().sum::<u32>();
+            let accuracy = if total_hits > 0 {
+                let [n320, n300, n200, n100, n50, _miss] = s.row.counts;
+                let numerator = 320 * n320 + 300 * n300 + 200 * n200 + 100 * n100 + 50 * n50;
+                f64::from(numerator) / (320.0 * f64::from(total_hits))
+            } else {
+                0.0
+            };
+
             points.push(Point {
                 uid: s.row.uid.clone(),
                 collision_share: shape.collision_share,
@@ -5975,6 +6137,7 @@ mod tests {
                 map_id: s.row.map_id.clone(),
                 mods: s.row.mods.clone(),
                 counts: s.row.counts,
+                accuracy,
             });
         }
 
@@ -6068,6 +6231,18 @@ mod tests {
             corr: f64,
             n: usize,
             n_players: usize,
+            /// Player-clustered (sandwich) standard errors for `b1`/`b2`, computed
+            /// alongside the classical `se1`/`se2` above. The classical SEs assume
+            /// residuals are independent within a player, which the per-player
+            /// slopes in the table below (ranging from -70% to +75% per +100pp
+            /// collision share) show is false here; these relax that assumption, at
+            /// the cost of being unreliable themselves when `n_players` is small (see
+            /// the `< 20` warning printed alongside). `None` when there are too few
+            /// clusters or residual degrees of freedom to compute them.
+            cluster_se1: Option<f64>,
+            cluster_t1: Option<f64>,
+            cluster_se2: Option<f64>,
+            cluster_t2: Option<f64>,
         }
 
         // Two-variable within-player (fixed-effects) OLS of `y` on `x1` and `x2`
@@ -6078,6 +6253,10 @@ mod tests {
         // `skill_exponent` sweep below can reuse it with refit skills as `y` without
         // constructing throwaway `Point`s.
         fn pooled_joint(by_uid: &BTreeMap<&str, Vec<(f64, f64, f64)>>) -> Option<JointFit> {
+            // Kept per-cluster (rather than flattened straight away, as the plain
+            // `demeaned` vec below still is) so the cluster-robust sandwich SEs after
+            // the classical fit can walk cluster-by-cluster without re-demeaning.
+            let mut clusters: Vec<Vec<(f64, f64, f64)>> = Vec::new();
             let mut demeaned: Vec<(f64, f64, f64)> = Vec::new();
             let mut n_players = 0;
 
@@ -6092,9 +6271,13 @@ mod tests {
                 let mean_x2 = rows.iter().map(|(_, x2, _)| x2).sum::<f64>() / n;
                 let mean_y = rows.iter().map(|(_, _, y)| y).sum::<f64>() / n;
 
+                let mut cluster = Vec::with_capacity(rows.len());
                 for (x1, x2, y) in rows {
-                    demeaned.push((x1 - mean_x1, x2 - mean_x2, y - mean_y));
+                    let point = (x1 - mean_x1, x2 - mean_x2, y - mean_y);
+                    demeaned.push(point);
+                    cluster.push(point);
                 }
+                clusters.push(cluster);
             }
 
             let n = demeaned.len();
@@ -6128,6 +6311,62 @@ mod tests {
             let t2 = if se2 > 1e-12 { b2 / se2 } else { f64::INFINITY };
             let corr = s12 / (s11 * s22).sqrt();
 
+            // Player-clustered (sandwich) standard errors: meat = sum over clusters g
+            // of (X_g' e_g)(X_g' e_g)', V = (X'X)^-1 * meat * (X'X)^-1. (X'X)^-1 is the
+            // symmetric 2x2 `[[a, b], [b, c]]` built from the same `s11`/`s12`/`s22`/
+            // `det` already used for the classical SEs above; only the sandwich
+            // wrapped around it (`meat`) differs. `G` is the number of clusters that
+            // fed the fit (`n_players`, since every cluster here has >= 2 rows by the
+            // `rows.len() < 2` filter above).
+            let g = n_players as f64;
+            let a = s22 / det;
+            let b_off = -s12 / det;
+            let c = s11 / det;
+
+            let (mut m11, mut m12, mut m22) = (0.0f64, 0.0f64, 0.0f64);
+            for cluster in &clusters {
+                let (mut score1, mut score2) = (0.0f64, 0.0f64);
+                for (x1, x2, y) in cluster {
+                    let e = y - b1 * x1 - b2 * x2;
+                    score1 += x1 * e;
+                    score2 += x2 * e;
+                }
+                m11 += score1 * score1;
+                m12 += score1 * score2;
+                m22 += score2 * score2;
+            }
+
+            // V = Ainv * M * Ainv, both symmetric 2x2, multiplied out explicitly.
+            let t11 = a * m11 + b_off * m12;
+            let t12 = a * m12 + b_off * m22;
+            let t21 = b_off * m11 + c * m12;
+            let t22 = b_off * m12 + c * m22;
+            let v11 = t11 * a + t12 * b_off;
+            let v22 = t21 * b_off + t22 * c;
+
+            // Usual small-sample factor: G/(G-1) * (N-1)/(N-K), K=2 regressors
+            // (`b1`, `b2`) here — the player fixed effects are already removed by the
+            // demeaning above, so they are not counted separately in K.
+            let cluster_dof_ok = g > 1.0 && residual_df > 0;
+            let correction = if cluster_dof_ok {
+                (g / (g - 1.0)) * ((n as f64 - 1.0) / (n as f64 - 2.0))
+            } else {
+                f64::NAN
+            };
+
+            let (cluster_se1, cluster_t1, cluster_se2, cluster_t2) = if cluster_dof_ok
+                && v11 > 0.0
+                && v22 > 0.0
+            {
+                let se1c = (correction * v11).sqrt();
+                let se2c = (correction * v22).sqrt();
+                let t1c = if se1c > 1e-12 { b1 / se1c } else { f64::INFINITY };
+                let t2c = if se2c > 1e-12 { b2 / se2c } else { f64::INFINITY };
+                (Some(se1c), Some(t1c), Some(se2c), Some(t2c))
+            } else {
+                (None, None, None, None)
+            };
+
             Some(JointFit {
                 b1,
                 se1,
@@ -6138,7 +6377,78 @@ mod tests {
                 corr,
                 n,
                 n_players,
+                cluster_se1,
+                cluster_t1,
+                cluster_se2,
+                cluster_t2,
             })
+        }
+
+        // Each qualifying player's own univariate slope of skill on collision share
+        // within `subset`, using the same >=4-scores / >=0.15-collision-share-range
+        // qualification as the per-player table further below. Returns the raw
+        // `d(skill)/d(collision share)` values (the units printed on the left of
+        // that table's "(+NN.N% per +100pp collision share)" figures, before the
+        // conversion to a percentage of mean skill) — that is the unit the
+        // between-player summary below is computed in.
+        fn qualifying_collision_slopes(subset: &[&Point]) -> Vec<f64> {
+            let mut grouped: BTreeMap<&str, Vec<&Point>> = BTreeMap::new();
+            for p in subset {
+                grouped.entry(p.uid.as_str()).or_default().push(p);
+            }
+
+            let mut out = Vec::new();
+            for rows in grouped.values() {
+                if rows.len() < 4 {
+                    continue;
+                }
+                let lo = rows
+                    .iter()
+                    .map(|p| p.collision_share)
+                    .fold(f64::INFINITY, f64::min);
+                let hi = rows
+                    .iter()
+                    .map(|p| p.collision_share)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                if hi - lo < 0.15 {
+                    continue;
+                }
+                let pairs: Vec<(f64, f64)> =
+                    rows.iter().map(|p| (p.collision_share, p.skill)).collect();
+                if let Some(s) = slope(&pairs) {
+                    out.push(s);
+                }
+            }
+            out
+        }
+
+        // Between-player summary: one observation per qualifying player (their own
+        // slope, computed above), rather than one observation per score. Crude —
+        // n_players is small and every player contributes equally regardless of how
+        // many scores they have — but honest: it cannot be fooled by within-player
+        // residual correlation the way the pooled fit's classical SE can, which is
+        // exactly the concern here (per-player slopes range from -70% to +75% per
+        // +100pp collision share; see the per-player table below).
+        fn print_between_player_summary(slopes: &[f64]) {
+            let n = slopes.len();
+            if n < 2 {
+                println!(
+                    "    between-player summary: n_players={n}, not enough qualifying \
+                     players to summarise"
+                );
+                return;
+            }
+            let n_f = n as f64;
+            let mean = slopes.iter().sum::<f64>() / n_f;
+            let variance = slopes.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / (n_f - 1.0);
+            let sd = variance.sqrt();
+            let se = sd / n_f.sqrt();
+            let t = if se > 1e-12 { mean / se } else { f64::INFINITY };
+            println!(
+                "    between-player summary (one slope per qualifying player, raw \
+                 d(skill)/d(collision share)): n_players={n}  mean={mean:+.3}  sd={sd:.3}  \
+                 se={se:.3}  t={t:+.2}"
+            );
         }
 
         let report_pooled = |label: &str, subset: &[&Point]| {
@@ -6163,6 +6473,7 @@ mod tests {
                 ),
                 None => println!("    collision share: not enough within-player spread"),
             }
+            print_between_player_summary(&qualifying_collision_slopes(subset));
             match pooled_fixed_effects(&grouped, |p| p.stars, |p| p.skill) {
                 Some((slope, se, t, n, n_players)) => println!(
                     "    stars (control): n={n:<4} n_players={n_players}  slope={slope:+.3}  \
@@ -6203,6 +6514,42 @@ mod tests {
                         fit.se2,
                         fit.t2
                     );
+                    // Player-clustered (sandwich) SEs, printed right next to the
+                    // classical ones above: the classical `se1`/`se2` assume residuals
+                    // are independent within a player, which the per-player slope
+                    // table below (spanning -70% to +75% per +100pp collision share)
+                    // shows is false. These relax that assumption but need many
+                    // clusters to be trusted themselves — see the G<20 warning.
+                    match (fit.cluster_se1, fit.cluster_t1) {
+                        (Some(se1c), Some(t1c)) => println!(
+                            "      collision: b1={:+.3}  clustered se={se1c:.3}  \
+                             clustered t={t1c:+.2}  (G={} clusters)",
+                            fit.b1, fit.n_players
+                        ),
+                        _ => println!(
+                            "      collision: clustered se/t not computable (too few clusters \
+                             or residual df)"
+                        ),
+                    }
+                    match (fit.cluster_se2, fit.cluster_t2) {
+                        (Some(se2c), Some(t2c)) => println!(
+                            "      stars:     b2={:+.3}  clustered se={se2c:.3}  \
+                             clustered t={t2c:+.2}  (G={} clusters)",
+                            fit.b2, fit.n_players
+                        ),
+                        _ => println!(
+                            "      stars:     clustered se/t not computable (too few clusters \
+                             or residual df)"
+                        ),
+                    }
+                    if fit.n_players < 20 {
+                        println!(
+                            "      warning: G={} clusters < 20 — cluster-robust inference is \
+                             unreliable with this few clusters; the clustered se/t above are \
+                             indicative, not a settled standard error.",
+                            fit.n_players
+                        );
+                    }
                     if fit.corr.abs() >= 0.7 {
                         println!(
                             "      warning: |corr| >= 0.7 — collision share and stars are too \
@@ -6239,12 +6586,87 @@ mod tests {
         let no_window_mod: Vec<&Point> = points.iter().filter(|p| !p.window_mod).collect();
         let window_mod: Vec<&Point> = points.iter().filter(|p| p.window_mod).collect();
 
+        println!(
+            "(all ladder scores are no-mod or NF, neither of which rescales hit windows, so \
+             every ladder row lands in the no-window-mod group below; the window-mod-only \
+             group is entirely multiuser.tsv scores.)"
+        );
         println!();
         report_pooled("(a) all scores", &all);
         println!();
         report_pooled("(b) no-window-mod scores (excludes EZ, HR)", &no_window_mod);
         println!();
         report_pooled("(c) window-mod scores only (EZ or HR)", &window_mod);
+
+        // Leave-one-player-out table for the joint collision coefficient, on the
+        // no-window-mod subset (the one the headline `-14.8%` figure comes from):
+        // re-run the pooled joint regression 12 times, each time dropping one
+        // player's rows entirely, to see whether the pooled estimate depends on any
+        // single player. A coefficient that keeps sign and rough magnitude with any
+        // one player removed is a much better argument for the pooled estimate than
+        // the pooled t-statistic alone; one that flips sign or blows up when a
+        // particular player is dropped means that player, not a general collision
+        // effect, is driving it.
+        println!(
+            "\nLeave-one-player-out: joint (collision + stars) collision coefficient on the \
+             no-window-mod subset, re-fit with each player's rows dropped in turn. Shows \
+             whether the pooled estimate depends on one player."
+        );
+
+        let mut no_window_mod_by_uid: BTreeMap<&str, Vec<(f64, f64, f64)>> = BTreeMap::new();
+        for p in &no_window_mod {
+            no_window_mod_by_uid
+                .entry(p.uid.as_str())
+                .or_default()
+                .push((p.collision_share, p.stars, p.skill));
+        }
+
+        let loo_uids: Vec<&str> = no_window_mod_by_uid.keys().copied().collect();
+        let mut loo_b1s: Vec<(String, f64)> = Vec::new();
+
+        for &dropped_uid in &loo_uids {
+            let subset: BTreeMap<&str, Vec<(f64, f64, f64)>> = no_window_mod_by_uid
+                .iter()
+                .filter(|&(&uid, _)| uid != dropped_uid)
+                .map(|(&uid, rows)| (uid, rows.clone()))
+                .collect();
+
+            match pooled_joint(&subset) {
+                Some(fit) => {
+                    println!(
+                        "  drop uid {dropped_uid:<8}: n={:<4} n_players={}  b1(collision)={:+.3}",
+                        fit.n, fit.n_players, fit.b1
+                    );
+                    loo_b1s.push((dropped_uid.to_string(), fit.b1));
+                }
+                None => println!(
+                    "  drop uid {dropped_uid:<8}: joint regression skipped (det near zero or \
+                     not enough spread)"
+                ),
+            }
+        }
+
+        if !loo_b1s.is_empty() {
+            let min = loo_b1s
+                .iter()
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .expect("non-empty");
+            let max = loo_b1s
+                .iter()
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .expect("non-empty");
+            println!(
+                "  range across the {} refits: min b1={:+.3} (dropping uid {}), \
+                 max b1={:+.3} (dropping uid {})",
+                loo_b1s.len(),
+                min.1,
+                min.0,
+                max.1,
+                max.0
+            );
+        } else {
+            println!("  no refit produced a joint fit; nothing to summarise.");
+        }
 
         // Least-squares slope of `ys` on `xs`. Shared by the collision regression and
         // the stars control so the two are computed identically.
@@ -6391,6 +6813,48 @@ mod tests {
                     print!(
                         "  {label:>4}: n={:<3} skill={mean_skill:6.2}",
                         group.len()
+                    );
+                }
+            }
+            println!();
+        }
+
+        // Selection-artefact check: is the stars-vs-skill climb above real, or is it
+        // what you'd see anyway from which scores got kept? The ladder fetch selects
+        // scores with `acc between 88 and 99.5`, i.e. it holds *accuracy* in a band
+        // rather than holding *skill* constant. If a player's own true skill is flat
+        // across their star range but the band-selected accuracy is also roughly flat
+        // across stars, then the error model has no choice but to fit rising skill at
+        // higher `d` to explain "same accuracy at harder content" — that is
+        // `sigma = sigma_ref * ((d + floor)/skill)^skill_exponent` doing exactly what
+        // it is supposed to do, not a defect. The alternative outcome — accuracy
+        // visibly falling with stars while fitted skill still climbs — would be the
+        // genuine problem, since then the model is inventing ability gains the scores
+        // themselves do not show.
+        println!(
+            "\nMean score accuracy by star-rating bin, per player (same bins, same scores). \
+             Flat accuracy across bins alongside climbing fitted skill (above) says the \
+             stars trend is survivorship — these are the scores that were kept, at roughly \
+             fixed accuracy, not evidence the model invents skill gains. Falling accuracy \
+             alongside climbing skill would be the actual model problem."
+        );
+
+        for (uid, rows) in &by_uid {
+            print!("  uid {uid:<8}");
+            for (label, lo, hi) in &star_bins {
+                let group: Vec<&&Point> = rows
+                    .iter()
+                    .filter(|p| p.stars >= *lo && p.stars < *hi)
+                    .collect();
+                if group.is_empty() {
+                    print!("  {label:>4}: n=0          ");
+                } else {
+                    let mean_acc =
+                        group.iter().map(|p| p.accuracy).sum::<f64>() / group.len() as f64;
+                    print!(
+                        "  {label:>4}: n={:<3} acc={:6.2}%",
+                        group.len(),
+                        mean_acc * 100.0
                     );
                 }
             }
