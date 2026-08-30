@@ -4421,35 +4421,6 @@ mod tests {
         reference_g_timing: f64,
     }
 
-    /// Reproduces the pre-change pp for one score: the flat `EZ` `0.90` that
-    /// `calculate_performance` used to apply, and no window scalar.
-    ///
-    /// Kept here rather than behind a flag in the shipping code because the old
-    /// behaviour is not something the calculator should still be able to do — the
-    /// report needs it only as a baseline to diff against. Mirrors `2c2e8a1`'s
-    /// `calculate_performance` exactly: same multiplier stack, `window_scalar` of 1.
-    fn pp_before_change(
-        attrs: &SunnyManiaDifficultyAttributes,
-        mods: &GameMods,
-        state: SunnyScoreState,
-    ) -> f64 {
-        let mut multiplier = 1.0;
-        if has_mod(mods, "NF") {
-            multiplier *= 0.75;
-        }
-        if has_mod(mods, "EZ") {
-            multiplier *= 0.90;
-        }
-
-        let score_accuracy = custom_accuracy(state);
-
-        compute_difficulty_value(attrs.stars, score_accuracy, 1.0)
-            * multiplier
-            * variety_multiplier(attrs.variety)
-            * acc_multiplier(score_accuracy, attrs.acc_scalar)
-            * length_multiplier(attrs.n_objects as f64, attrs.stars)
-    }
-
     /// Builds the mod state for a report row from its mod-name string.
     ///
     /// Only mods that reach the sunny path are translated: `EZ` and `HR` scale the
@@ -4679,7 +4650,7 @@ mod tests {
 
     /// Not an assertion — the cross-user report. Prices every score in
     /// `local-fixtures/multiuser.tsv` under both the pre-change stack
-    /// ([`pp_before_change`]: flat `EZ` `0.90`, no window scalar) and the current one
+    /// (flat `EZ` `0.90`, no window scalar) and the current one
     /// (windows priced, no `EZ` factor), and prints them side by side.
     ///
     /// Why both are computed here rather than read from the API's `pp` column: live
@@ -4968,7 +4939,7 @@ mod tests {
     /// no-op change. `g_timing` is the only figure here that is not contaminated by
     /// that: it is a property of the fit against the *observed judgement counts*
     /// alone and does not reference live pp at all. This report does **not** compute
-    /// the [`pp_before_change`] (`2c2e8a1`) baseline column — only `multiuser_report`
+    /// the pre-change baseline (`2c2e8a1`: flat `EZ` `0.90`, no window scalar) column — only `multiuser_report`
     /// does that, and it was not added here; treat any comparison against that
     /// baseline as absent, not as implicitly agreeing with it.
     ///
