@@ -4394,8 +4394,7 @@ mod tests {
         stars: f64,
         od: f32,
         is_convert: bool,
-        before_pp: f64,
-        after_pp: f64,
+        current_pp: f64,
         scalar: f64,
         skill: f64,
         g_timing: f64,
@@ -4560,8 +4559,7 @@ mod tests {
                 stars: attrs.stars,
                 od: map.od,
                 is_convert: map.is_convert,
-                before_pp: pp_before_change(&attrs, &mods, state),
-                after_pp: perf.pp,
+                current_pp: perf.pp,
                 scalar: perf.window_scalar,
                 skill: fit.skill,
                 g_timing: fit.g_timing,
@@ -4658,8 +4656,7 @@ mod tests {
                 stars: attrs.stars,
                 od: map.od,
                 is_convert: map.is_convert,
-                before_pp: pp_before_change(&attrs, &GameMods::default(), state),
-                after_pp: perf.pp,
+                current_pp: perf.pp,
                 scalar: perf.window_scalar,
                 skill: fit.skill,
                 g_timing: fit.g_timing,
@@ -4714,19 +4711,19 @@ mod tests {
 
         for (uid, rows) in &by_uid {
             let mut rows = rows.clone();
-            rows.sort_by(|a, b| b.after_pp.total_cmp(&a.after_pp));
+            rows.sort_by(|a, b| b.current_pp.total_cmp(&a.current_pp));
 
             println!("\n=== uid {uid} ({} scores)", rows.len());
             println!(
-                "{:>8} {:>9} {:>4} {:>4} {:>4} {:>6} {:>6} {:>6} {:>26} {:>7} {:>8} {:>8} {:>8} {:>7} {:>7} {:>6} {:>5}",
+                "{:>8} {:>9} {:>4} {:>4} {:>4} {:>6} {:>6} {:>6} {:>26} {:>7} {:>8} {:>9} {:>7} {:>7} {:>6} {:>5}",
                 "map", "mods", "k", "od", "cvt", "our*", "live*", "notes",
-                "320/300/200/100/50/miss", "acc%", "livePP", "beforePP", "afterPP",
+                "320/300/200/100/50/miss", "acc%", "livePP", "currentPP",
                 "d%", "scalar", "skill", "plaus"
             );
 
             for r in &rows {
-                let delta = if r.before_pp > 0.0 {
-                    (r.after_pp / r.before_pp - 1.0) * 100.0
+                let delta = if r.row.live_pp > 0.0 {
+                    (r.current_pp / r.row.live_pp - 1.0) * 100.0
                 } else {
                     0.0
                 };
@@ -4740,7 +4737,7 @@ mod tests {
                     r.row.counts[5]
                 );
                 println!(
-                    "{:>8} {:>9} {:>4} {:>4} {:>4} {:>6.2} {:>6.2} {:>6} {:>26} {:>7.3} {:>8.1} {:>8.1} {:>8.1} {:>+7.2} {:>7.4} {:>6.2} {:>5}",
+                    "{:>8} {:>9} {:>4} {:>4} {:>4} {:>6.2} {:>6.2} {:>6} {:>26} {:>7.3} {:>8.1} {:>9.1} {:>+7.2} {:>7.4} {:>6.2} {:>5}",
                     r.row.map_id,
                     r.row.mods,
                     r.row.keys,
@@ -4752,8 +4749,7 @@ mod tests {
                     composition,
                     r.row.acc,
                     r.row.live_pp,
-                    r.before_pp,
-                    r.after_pp,
+                    r.current_pp,
                     delta,
                     r.scalar,
                     r.skill,
@@ -4828,7 +4824,7 @@ mod tests {
                 scalars.iter().copied().fold(f64::INFINITY, f64::min),
                 scalars.iter().copied().fold(f64::NEG_INFINITY, f64::max),
                 band.iter()
-                    .map(|r| (r.after_pp / r.before_pp - 1.0) * 100.0)
+                    .map(|r| (r.current_pp / r.row.live_pp - 1.0) * 100.0)
                     .sum::<f64>()
                     / n
             );
@@ -5013,7 +5009,7 @@ mod tests {
                 r.od,
                 r.ln_fraction * 100.0,
                 r.row.live_pp,
-                r.after_pp,
+                r.current_pp,
                 r.scalar,
                 r.g_timing,
                 r.reference_g_timing,
@@ -5037,7 +5033,7 @@ mod tests {
                 println!("  {label}: n=0");
                 return;
             }
-            let mut ratios: Vec<f64> = rows.iter().map(|r| r.after_pp / r.row.live_pp).collect();
+            let mut ratios: Vec<f64> = rows.iter().map(|r| r.current_pp / r.row.live_pp).collect();
             println!(
                 "  {label}: n={:<4} median ourPP/livePP {:.4}",
                 rows.len(),
@@ -6013,45 +6009,28 @@ mod tests {
         }
 
         let n = rows.len() as f64;
-        let before: f64 = rows.iter().map(|r| r.before_pp).sum();
-        let after: f64 = rows.iter().map(|r| r.after_pp).sum();
+        let current: f64 = rows.iter().map(|r| r.current_pp).sum();
+        let live: f64 = rows.iter().map(|r| r.row.live_pp).sum();
         let mean_scalar = rows.iter().map(|r| r.scalar).sum::<f64>() / n;
         let plausible = rows.iter().filter(|r| r.plausible).count();
 
-        // Against the *live* server as well as against our own before-stack. These answer
-        // different questions and only the second one players can feel: `before_pp` is
-        // this branch's difficulty calc with the old multiplier stack, so it isolates the
-        // surface change, while `live_pp` is what a player actually sees today and
-        // therefore what any complaint about pp being too low is about. The two diverge
-        // because our star ratings have drifted from live's independently of this branch.
-        let with_live: Vec<&&MultiPriced> =
-            rows.iter().filter(|r| r.row.live_pp > 0.0).collect();
-        let live_note = if with_live.is_empty() {
-            String::new()
-        } else {
-            let live: f64 = with_live.iter().map(|r| r.row.live_pp).sum();
-            let after_live: f64 = with_live.iter().map(|r| r.after_pp).sum();
-            let mean_ratio = with_live
-                .iter()
-                .map(|r| r.after_pp / r.row.live_pp)
-                .sum::<f64>()
-                / with_live.len() as f64;
-            format!(
-                "  vs live: sum {:+.1}% mean {:+.1}%",
-                (after_live / live - 1.0) * 100.0,
-                (mean_ratio - 1.0) * 100.0
-            )
-        };
-
-        // The per-score mean delta and the aggregate delta answer different
-        // questions: the first weights every score equally, the second weights by pp
-        // and so is what a player's top-play total actually moves by.
+        // Comparing current against live (the sunny reference from fixtures).
         let mean_delta = rows
             .iter()
-            .filter(|r| r.before_pp > 0.0)
-            .map(|r| (r.after_pp / r.before_pp - 1.0) * 100.0)
-            .sum::<f64>()
-            / n;
+            .filter(|r| r.row.live_pp > 0.0)
+            .map(|r| (r.current_pp / r.row.live_pp - 1.0) * 100.0)
+            .sum::<f64>();
+        let mean_delta = if rows.iter().any(|r| r.row.live_pp > 0.0) {
+            mean_delta / rows.iter().filter(|r| r.row.live_pp > 0.0).count() as f64
+        } else {
+            0.0
+        };
+
+        let live_note = format!(
+            "  sum {:+.2}% mean {:+.2}%",
+            (current / live - 1.0) * 100.0,
+            mean_delta
+        );
 
         // Median rather than mean g_timing: the statistic has a long right tail on
         // real scores, so a handful of unexplainable plays would otherwise set the
@@ -6061,10 +6040,10 @@ mod tests {
         let median_g = gs[gs.len() / 2];
 
         let n_rows = rows.len();
-        let sum_delta = (after / before - 1.0) * 100.0;
+        let sum_delta = (current / live - 1.0) * 100.0;
         println!(
             "  {label}: n={n_rows} mean scalar {mean_scalar:.4}  mean dPP {mean_delta:+.2}%  \
-             sum {before:.0} -> {after:.0} ({sum_delta:+.2}%)  plausible {plausible}/{n_rows}  \
+             sum {live:.0} -> {current:.0} ({sum_delta:+.2}%)  plausible {plausible}/{n_rows}  \
              med g {median_g:.1}{live_note}"
         );
     }
@@ -6676,7 +6655,7 @@ mod tests {
                 score.ln_fraction,
                 score.stars,
                 score.row.live_pp,
-                score.after_pp
+                score.current_pp
             );
         }
     }
@@ -7701,7 +7680,7 @@ mod tests {
             points.push(Point {
                 median_gap: shape.median_gap,
                 collision_share: shape.collision_share,
-                pp_ratio: s.after_pp / s.row.live_pp,
+                pp_ratio: s.current_pp / s.row.live_pp,
                 g_timing: s.g_timing,
             });
         }
