@@ -8781,6 +8781,39 @@ mod tests {
     /// A map's star rating, keymode, and per-note `(difficulty, hold duration if long)`.
     type PerNoteDifficulty = (f64, usize, Vec<(f64, Option<f64>)>);
 
+    /// Same-column gap in ms for each note of `data`, indexed like `data.notes`.
+    ///
+    /// The gap is measured from the *end* of the previous note in the column — its tail for
+    /// a hold, its head otherwise — because that is when the finger becomes free to travel,
+    /// which is the quantity [`ErrorModel::recovery_mean_offset`] was fitted against.
+    /// `f64::INFINITY` for a column's first note, which has no predecessor to recover from.
+    ///
+    /// `notes_by_column` is already in head order, since `RebirthData::new` sorts `notes`
+    /// before distributing them.
+    fn same_column_gaps(data: &RebirthData) -> Vec<f64> {
+        // Index notes by identity so the per-column walk can write back into map order.
+        let mut position: HashMap<(u64, usize), usize> = HashMap::new();
+
+        for (idx, note) in data.notes.iter().enumerate() {
+            position.insert((note.head.to_bits(), note.column), idx);
+        }
+
+        let mut gaps = vec![f64::INFINITY; data.notes.len()];
+
+        for column in &data.notes_by_column {
+            for pair in column.windows(2) {
+                let (previous, note) = (pair[0], pair[1]);
+                let previous_end = previous.tail.unwrap_or(previous.head);
+
+                if let Some(&idx) = position.get(&(note.head.to_bits(), note.column)) {
+                    gaps[idx] = (note.head - previous_end).max(0.0);
+                }
+            }
+        }
+
+        gaps
+    }
+
     /// Per-note local difficulty for one map: `(d_all_at_head, hold_duration_ms)` per note.
     ///
     /// The `d_all` expression is copied from `calculate_from_data` rather than exposed by
@@ -9657,6 +9690,373 @@ mod tests {
                 } else {
                     0.0
                 }
+            );
+        }
+    }
+
+    /// Does a measured mean offset move pp, where every width parameter does not?
+    ///
+    /// This is the question the whole bias line rests on. `tools/input_state.py` measured a
+    /// gap-driven timing offset on 629,418 replay notes (see
+    /// [`ErrorModel::recovery_offset`]), and the reason it is interesting is structural: the
+    /// per-score `skill` enters only through `sigma`, so it absorbs any width change
+    /// exactly, while it cannot move a mean. So a bias is the one model input that should
+    /// reach pricing.
+    ///
+    /// "Should" is doing work there, and [`ErrorModel::release_mean_offset`]'s own note
+    /// records the trap: sweeping *that* offset moved only the reference-side fit, so its
+    /// entire effect landed in the denominator of `window_scalar`'s
+    /// `played.skill / reference.skill` and *lowered* pp on exactly the maps it was meant to
+    /// raise. If this channel does the same thing, it is worth nothing no matter how well
+    /// measured the curve is.
+    ///
+    /// The reason to expect otherwise, stated in advance so the measurement can refute it:
+    /// `release_mean_offset` reaches only long-note units, so on a mostly-rice map it is
+    /// diluted to nothing on the played side, whereas a gap offset applies to every note.
+    ///
+    /// Reports both fits separately rather than only the ratio, so a ratio artefact is
+    /// visible as such instead of appearing as a null result.
+    ///
+    /// Run with
+    /// `cargo test --release does_a_mean_offset_move_pp -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn does_a_mean_offset_move_pp() {
+        use crate::mania_accuracy::ln_sigma_scale_for_duration;
+
+        let Ok(text) = std::fs::read_to_string("local-fixtures/multiuser.tsv") else {
+            println!("no fixtures present (local-fixtures/multiuser.tsv); nothing to report");
+            return;
+        };
+
+        // Sweep the amplitude to find what the count data actually supports.
+        // tau fixed at the replay-fitted 72.40.
+        let candidates = [
+            ("off (shipped)", 0.0, 0.0),
+            ("A =  5 ms", 5.0, -3.19),
+            ("A = 10 ms", 10.0, -3.19),
+            ("A = 15 ms", 15.0, -3.19),
+            ("A = 20 ms", 20.0, -3.19),
+            ("A = 25 ms", 25.0, -3.19),
+        ];
+
+        struct Row {
+            keys: u32,
+            ln_fraction: f64,
+            /// Median same-column gap, the axis the offset acts on.
+            median_gap: f64,
+            played_g: Vec<f64>,
+            reference_g: Vec<f64>,
+            played_skill: Vec<f64>,
+            reference_skill: Vec<f64>,
+            scalar: Vec<f64>,
+        }
+
+        let mut rows: Vec<Row> = Vec::new();
+
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+
+            if f.len() < 18 || f[0] == "uid" {
+                continue;
+            }
+
+            let u = |s: &str| s.parse::<u32>().unwrap_or(0);
+            let counts = [u(f[7]), u(f[8]), u(f[9]), u(f[10]), u(f[11]), u(f[12])];
+            let total = counts.iter().sum::<u32>();
+
+            if total == 0 {
+                continue;
+            }
+
+            let Some(map) = parse(&format!("local-fixtures/maps/{}.osu", f[2])) else {
+                continue;
+            };
+
+            let (mods, clock_rate) = mods_for(f[3]);
+            let Some(attrs) = calculate(&map, &mods, clock_rate, Some(false), None) else {
+                continue;
+            };
+
+            // Rebuild the note data so per-note difficulty and per-note gap can be paired.
+            // Mirrors `calculate`'s setup; `passed_objects` is not used by these fixtures.
+            let total_columns = map.cs.round_ties_even().max(1.0) as usize;
+            let (notes, _) = build_notes(clock_rate, map.hit_objects.iter(), total_columns);
+
+            if notes.len() < 2 {
+                continue;
+            }
+
+            let windows = hit_windows(&map, &mods, clock_rate, false);
+            let great = get_hit_window_300(&map, clock_rate, has_mod(&mods, "HR"), has_mod(&mods, "EZ"));
+            let data = RebirthData::new(
+                notes,
+                total_columns,
+                hit_leniency_from_window(great),
+                windows.good,
+            );
+
+            let Some((_, _, per_note)) = per_note_difficulty(&map) else {
+                continue;
+            };
+
+            if per_note.len() != data.notes.len() {
+                continue;
+            }
+
+            let gaps = same_column_gaps(&data);
+            let mut sorted_gaps: Vec<f64> = gaps.iter().copied().filter(|g| g.is_finite()).collect();
+            sorted_gaps.sort_by(f64::total_cmp);
+
+            let median_gap = if sorted_gaps.is_empty() {
+                f64::NAN
+            } else {
+                sorted_gaps[sorted_gaps.len() / 2]
+            };
+
+            let reference = reference_windows(&attrs);
+            let per_unit = f64::from(total) / per_note.len() as f64;
+
+            let mut row = Row {
+                keys: u(f[6]),
+                ln_fraction: if attrs.n_objects > 0 {
+                    attrs.n_long_notes as f64 / attrs.n_objects as f64
+                } else {
+                    0.0
+                },
+                median_gap,
+                played_g: Vec::new(),
+                reference_g: Vec::new(),
+                played_skill: Vec::new(),
+                reference_skill: Vec::new(),
+                scalar: Vec::new(),
+            };
+
+            for (_, amplitude, plateau) in candidates {
+                let model = ErrorModel {
+                    recovery_offset: amplitude,
+                    anticipation_offset: plateau,
+                    ..Default::default()
+                };
+
+                // Exact per-note units: one per distinct (difficulty, sigma_scale, offset),
+                // which is ground truth for the effect rather than a binned approximation.
+                // Cost is why this is a report and not the shipping path.
+                let mut merged: HashMap<(u64, u64, u64), f64> = HashMap::new();
+
+                for (idx, &(difficulty, duration)) in per_note.iter().enumerate() {
+                    let gap_offset = model.recovery_mean_offset(gaps[idx]);
+
+                    let (sigma_scale, offset) = match duration {
+                        // A long note under V1 is one judgement carrying both the press and
+                        // the release, so it takes both offsets.
+                        Some(duration) if attrs.ln_judged_as_one => (
+                            ln_sigma_scale_for_duration(&model, duration),
+                            gap_offset + model.release_mean_offset,
+                        ),
+                        _ => (1.0, gap_offset),
+                    };
+
+                    *merged
+                        .entry((difficulty.to_bits(), sigma_scale.to_bits(), offset.to_bits()))
+                        .or_insert(0.0) += per_unit;
+                }
+
+                let units: Vec<JudgementUnit> = merged
+                    .into_iter()
+                    .map(|((difficulty, sigma_scale, offset), weight)| JudgementUnit {
+                        difficulty: f64::from_bits(difficulty),
+                        weight,
+                        sigma_scale: f64::from_bits(sigma_scale),
+                        mean_offset: f64::from_bits(offset),
+                    })
+                    .collect();
+
+                let played = fit_with_quality(&counts, &units, &attrs.hit_windows, &model);
+                let reference_fit = fit_with_quality(&counts, &units, &reference, &model);
+
+                row.played_g.push(played.g_timing);
+                row.reference_g.push(reference_fit.g_timing);
+                row.played_skill.push(played.skill);
+                row.reference_skill.push(reference_fit.skill);
+                row.scalar.push(if played.skill > 0.0 && reference_fit.skill > 0.0 {
+                    played.skill / reference_fit.skill
+                } else {
+                    1.0
+                });
+            }
+
+            rows.push(row);
+        }
+
+        if rows.is_empty() {
+            println!("no fixture scores loaded");
+            return;
+        }
+
+        fn median(values: &[f64]) -> f64 {
+            let mut finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+
+            if finite.is_empty() {
+                return f64::NAN;
+            }
+
+            finite.sort_by(f64::total_cmp);
+
+            finite[finite.len() / 2]
+        }
+
+        fn mean(values: &[f64]) -> f64 {
+            let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+
+            if finite.is_empty() {
+                return f64::NAN;
+            }
+
+            finite.iter().sum::<f64>() / finite.len() as f64
+        }
+
+        let column = |extract: &dyn Fn(&Row) -> f64| -> Vec<f64> { rows.iter().map(extract).collect() };
+
+        println!(
+            "\n{} scores, exact per-note units. Median same-column gap across maps: {:.0} ms \
+             (the axis the offset acts on).\n",
+            rows.len(),
+            median(&column(&|row| row.median_gap))
+        );
+
+        println!(
+            "  {:<16} {:>9} {:>9} {:>10} {:>10} {:>9} {:>9}",
+            "candidate", "g played", "g ref", "skill pl", "skill ref", "scalar", "pp %"
+        );
+
+        let baseline_scalar = median(&column(&|row| row.scalar[0]));
+
+        for (index, (label, _, _)) in candidates.iter().enumerate() {
+            let scalar = median(&column(&|row| row.scalar[index]));
+            // pp moves as scalar^2.2, the exponent fitted skill enters pricing through.
+            let pp = ((scalar / baseline_scalar).powf(2.2) - 1.0) * 100.0;
+
+            println!(
+                "  {label:<16} {:>9.2} {:>9.2} {:>10.3} {:>10.3} {:>9.4} {:>+9.2}",
+                median(&column(&|row| row.played_g[index])),
+                median(&column(&|row| row.reference_g[index])),
+                median(&column(&|row| row.played_skill[index])),
+                median(&column(&|row| row.reference_skill[index])),
+                scalar,
+                pp
+            );
+        }
+
+        println!(
+            "\n  All medians over scores. 'pp %' is the median scalar against the shipped \
+             row's,\n  which is what a score's pp is multiplied by."
+        );
+
+        // Per-score pp deltas for the fitted curve, since a median of medians can hide a
+        // spread that matters, and the direction per score is what players would see.
+        let fitted = candidates.len() - 1;
+        let deltas: Vec<f64> = rows
+            .iter()
+            .filter(|row| row.scalar[0] > 0.0)
+            .map(|row| (row.scalar[fitted] / row.scalar[0]).powf(2.2) - 1.0)
+            .collect();
+        let raised = deltas.iter().filter(|d| **d > 0.001).count();
+        let lowered = deltas.iter().filter(|d| **d < -0.001).count();
+
+        println!(
+            "\nFITTED CURVE, per score: median {:+.2}%, mean {:+.2}%, {raised} raised, \
+             {lowered} lowered, {} unchanged",
+            median(&deltas) * 100.0,
+            mean(&deltas) * 100.0,
+            deltas.len() - raised - lowered
+        );
+
+        // Where the offset should act most: dense maps have short gaps, so more of their
+        // notes sit in the late regime. A mechanism that is real should sort by this.
+        println!("\nBY MEDIAN SAME-COLUMN GAP (dense maps first — the late regime)");
+        println!(
+            "  {:<14} {:>4} {:>9} {:>9} {:>9} {:>9}",
+            "gap band", "n", "g played", "g ref", "pp %", "raised"
+        );
+
+        for (label, low, high) in [
+            ("<120 ms", 0.0, 120.0),
+            ("120-200 ms", 120.0, 200.0),
+            ("200-320 ms", 200.0, 320.0),
+            (">320 ms", 320.0, f64::INFINITY),
+        ] {
+            let group: Vec<&Row> = rows
+                .iter()
+                .filter(|row| row.median_gap >= low && row.median_gap < high)
+                .collect();
+
+            if group.is_empty() {
+                continue;
+            }
+
+            let group_deltas: Vec<f64> = group
+                .iter()
+                .filter(|row| row.scalar[0] > 0.0)
+                .map(|row| (row.scalar[fitted] / row.scalar[0]).powf(2.2) - 1.0)
+                .collect();
+
+            println!(
+                "  {label:<14} {:>4} {:>9.2} {:>9.2} {:>+9.2} {:>9}",
+                group.len(),
+                median(&group.iter().map(|row| row.played_g[fitted]).collect::<Vec<_>>()),
+                median(&group.iter().map(|row| row.reference_g[fitted]).collect::<Vec<_>>()),
+                median(&group_deltas) * 100.0,
+                group_deltas.iter().filter(|d| **d > 0.001).count(),
+            );
+        }
+
+        println!("\nBY KEYMODE AND LN SHARE");
+
+        for (label, keys) in [("4K", 4u32), ("7K", 7)] {
+            let group: Vec<&Row> = rows.iter().filter(|row| row.keys == keys).collect();
+
+            if group.is_empty() {
+                continue;
+            }
+
+            let group_deltas: Vec<f64> = group
+                .iter()
+                .filter(|row| row.scalar[0] > 0.0)
+                .map(|row| (row.scalar[fitted] / row.scalar[0]).powf(2.2) - 1.0)
+                .collect();
+
+            println!(
+                "  {label:<14} {:>4} median gap {:>5.0} ms   pp {:>+6.2}%   g played {:>7.2}",
+                group.len(),
+                median(&group.iter().map(|row| row.median_gap).collect::<Vec<_>>()),
+                median(&group_deltas) * 100.0,
+                median(&group.iter().map(|row| row.played_g[fitted]).collect::<Vec<_>>()),
+            );
+        }
+
+        for (label, low, high) in [("LN <15%", 0.0, 0.15), ("LN >35%", 0.35, 1.01)] {
+            let group: Vec<&Row> = rows
+                .iter()
+                .filter(|row| row.ln_fraction >= low && row.ln_fraction < high)
+                .collect();
+
+            if group.is_empty() {
+                continue;
+            }
+
+            let group_deltas: Vec<f64> = group
+                .iter()
+                .filter(|row| row.scalar[0] > 0.0)
+                .map(|row| (row.scalar[fitted] / row.scalar[0]).powf(2.2) - 1.0)
+                .collect();
+
+            println!(
+                "  {label:<14} {:>4} median gap {:>5.0} ms   pp {:>+6.2}%   g played {:>7.2}",
+                group.len(),
+                median(&group.iter().map(|row| row.median_gap).collect::<Vec<_>>()),
+                median(&group_deltas) * 100.0,
+                median(&group.iter().map(|row| row.played_g[fitted]).collect::<Vec<_>>()),
             );
         }
     }

@@ -470,6 +470,64 @@ pub struct ErrorModel {
     /// fitted now is fitted to that artefact. Read the sweep as evidence about the
     /// *mechanism*, not as a reason to pick a constant.
     pub release_mean_offset: f64,
+    /// Peak lateness in ms of a press whose column was tapped immediately before it,
+    /// decaying with the gap over [`Self::recovery_tau`] toward
+    /// [`Self::anticipation_offset`]. Zero disables the whole mechanism.
+    ///
+    /// The second mean-offset channel, and the one that is *measured* rather than
+    /// guessed. `tools/input_state.py` paired 285 replays into 629,418 notes and grouped
+    /// their timing errors by the state the note's column was in. Per-score offsets — each
+    /// group's mean against that same score's own mean, so the player and the map divide
+    /// out — trace a clean curve against same-column gap:
+    ///
+    /// | gap ms | 115 | 145 | 175 | 210 | 255 | 310 | 380 | 470 | 585 | 750 |
+    /// |---|---|---|---|---|---|---|---|---|---|---|
+    /// | offset | +13.5 | +5.5 | +3.6 | +1.1 | +0.1 | −2.8 | −3.1 | −3.0 | −3.3 | −3.0 |
+    ///
+    /// `73.12 * exp(-gap / 72.40) - 3.19` fits that to a weighted RMSE of 0.73 ms over a
+    /// 16.5 ms range. Two regimes, both physical: a finger that must lift and re-press
+    /// lands **late** when rushed, and one with time to spare **anticipates** and lands
+    /// early. Zero crossing at 227 ms.
+    ///
+    /// **Why a mean and not a width.** The same measurement finds width effects too, but
+    /// they mostly vanish once each score is compared against itself, and what survives is
+    /// gauge: skill enters only through `sigma`, so it rescales spread exactly and absorbs
+    /// any width change. It cannot move a mean. See [`Self::release_mean_offset`] for the
+    /// same argument.
+    ///
+    /// **Why the sign test matters more than the size.** 46 of 46 scores agree on the
+    /// direction in the shortest bin, and agreement collapses to 91/181 exactly at the zero
+    /// crossing — which is what a real curve does and a step function cannot.
+    ///
+    /// **The artefact this had to survive.** The replay parser's pairing gives a press the
+    /// frontmost note whose GOOD window is still open, so in a pattern tighter than that
+    /// window a press meant for the next note is booked against this one, manufacturing
+    /// late bias from nothing. Restricting to notes whose predecessor lies beyond that
+    /// window shows the artefact inflates the effect about 2.5x (+24.4 vs +9.7 ms) without
+    /// causing it, and the curve keeps decaying smoothly to 850 ms — an order of magnitude
+    /// past a boundary fixed at 100–140 ms.
+    ///
+    /// **Defaults to 0.0, i.e. off.** Enabling it changes what every score is worth, and
+    /// [`Self::release_mean_offset`]'s own note records why an offset must not be
+    /// calibrated while pp reads a ratio of two fits: that sweep's entire gain landed in
+    /// the denominator and *lowered* pp on the maps it was meant to raise. This channel is
+    /// not obviously subject to the same artefact, since it applies to every note rather
+    /// than only to long notes and so cannot be diluted away on the played side — but that
+    /// is a prediction, and it ships off until measured.
+    pub recovery_offset: f64,
+    /// The gap in ms over which [`Self::recovery_offset`] decays, `e`-folding.
+    ///
+    /// 72.4 ms as fitted. Physically the lift-and-repress cycle time, which is why the
+    /// value is plausible rather than merely convenient: it is the same order as the
+    /// fastest sustained same-column tapping in these maps.
+    pub recovery_tau: f64,
+    /// Where [`Self::recovery_offset`] decays *to*, in ms, at long gaps. Negative is early.
+    ///
+    /// −3.19 ms as fitted, and it is not a nuisance term: with a whole beat of warning
+    /// players consistently press early, and the plateau is flat from 280 ms out to 850 ms
+    /// across 240k notes. Applies to every press with a predecessor, so on a sparse map it
+    /// is the only part of this mechanism that acts.
+    pub anticipation_offset: f64,
 }
 
 impl Default for ErrorModel {
@@ -488,11 +546,51 @@ impl Default for ErrorModel {
             short_hold_scale: 120.0,
             slip_rate: 0.0,
             release_mean_offset: 8.0,
+            // Off, so the shipped model is unchanged until the pp effect is measured. The
+            // other two carry their fitted values so that enabling this is a one-field
+            // change and cannot accidentally combine a real amplitude with a placeholder
+            // shape.
+            recovery_offset: 0.0,
+            recovery_tau: 72.40,
+            anticipation_offset: -3.19,
         }
     }
 }
 
 impl ErrorModel {
+    /// The mean timing offset in ms of a press whose column last saw a press `gap_ms`
+    /// earlier. Positive is late.
+    ///
+    /// `recovery_offset * exp(-gap / recovery_tau) + anticipation_offset`, the curve
+    /// measured on 629,418 paired replay notes — see [`Self::recovery_offset`] for the
+    /// data, the fit, and the artefact controls.
+    ///
+    /// A non-finite or negative gap returns the long-gap plateau rather than extrapolating,
+    /// and an infinite gap (a column's first note, which has no predecessor to recover
+    /// from) returns zero: there is no prior press to be late against, so the note carries
+    /// no offset from this mechanism at all.
+    pub fn recovery_mean_offset(&self, gap_ms: f64) -> f64 {
+        if self.recovery_offset == 0.0 && self.anticipation_offset == 0.0 {
+            return 0.0;
+        }
+
+        if !gap_ms.is_finite() {
+            return 0.0;
+        }
+
+        if gap_ms <= 0.0 {
+            return self.recovery_offset + self.anticipation_offset;
+        }
+
+        let tau = if self.recovery_tau > 0.0 {
+            self.recovery_tau
+        } else {
+            return self.anticipation_offset;
+        };
+
+        self.recovery_offset * (-gap_ms / tau).exp() + self.anticipation_offset
+    }
+
     /// The timing error standard deviation, in ms, for local difficulty
     /// `difficulty` at player skill `skill`.
     ///
