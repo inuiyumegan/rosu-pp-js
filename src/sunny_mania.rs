@@ -313,6 +313,13 @@ impl JsSunnyManiaPerformance {
                 } else {
                     sunny::modal_ln_duration_histogram(js_attrs.n_long_notes as usize)
                 },
+                // Lost on a JS round-trip for the same reason as the histogram, and *not*
+                // reconstructed: unlike the LN buckets there is no defensible stand-in,
+                // since the whole content of this field is how per-note difficulty spreads
+                // around `stars` and a round-tripped attribute set carries no trace of it.
+                // Inventing a spread would price maps on a guess. `None` falls back to the
+                // uniform list, which is what this path already did.
+                note_difficulty_bins: None,
                 // Not carried through JS: it is a property of how the score was
                 // played, not of the map, so it is re-derived from the mods that
                 // came back with the attributes. `lazer` is not part of the shape

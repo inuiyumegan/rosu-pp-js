@@ -6,15 +6,48 @@ and write into `target/surface/`, which is gitignored.
 
 ## Fixture fetchers
 
-Both write into `local-fixtures/` (gitignored — not redistributable, not needed to
+All write into `local-fixtures/` (gitignored — not redistributable, not needed to
 build) and need the bancho.py MySQL container reachable.
 
+- **`fetch_cohorts.sh` — use this one.** Deep per-player cohorts with no accuracy filter.
+  Supersedes `fetch_ladder.sh`; see the section below for why the other two mislead.
 - `fetch_batch.sh` — scores ranked by pp across players, with an EZ cohort and a no-mod
   control. The set the mod response was measured on.
 - `fetch_ladder.sh` — *difficulty ladders*: many scores from one player inside one
   quarter, stratified across star rating. `fetch_batch.sh` cannot fit sigma's difficulty
   response because it returns roughly one score per player, and the error model has one
   free skill each; a ladder holds skill roughly fixed while difficulty sweeps.
+
+### `fetch_cohorts.sh`, and what the older two get wrong
+
+```sh
+tools/fetch_cohorts.sh survey 200                    # eligible cohorts, fetches nothing
+tools/fetch_cohorts.sh fetch 2057:2020:3 1326:2020:2 # scores + beatmaps
+tools/fetch_cohorts.sh fetch --replays 2768:2021:1   # also .osr, for a per-note fit
+```
+
+Three defects it fixes, each of which cost a round of bad fitting:
+
+- **`status = 2` hides the entire low-accuracy population.** It is best-per-map, and it
+  contains *zero* mania scores below 80% acc — HP drain censors them, so they survive only
+  as non-best submissions. Including `status = 1` restores 5178 scores at 80-88%, 2490 at
+  60-80% and 281 below 60%. The share of NF rises 0.2% → 4.0% → 17.1% → 72.6% across those
+  bands, which is the drain mechanism showing up directly in the data.
+- **`status = 0` looks like the low-acc tail but is not.** Failed plays average **31.6%**
+  of the map's hit count; only 3632 of 121k reach 98%. A part-map play is a different map
+  at a different difficulty. Filter on `hits / max_hits_for_that_map > 0.98`, never on
+  `status` alone.
+- **The `acc between 88 and 99.5` bound in `fetch_ladder.sh` was the binding constraint**,
+  not sample size. Across 152 cohorts of 150+ scores, 12022 of 38439 rows sit below 94%.
+  `fetch_cohorts.sh` applies no accuracy filter.
+
+Also: `fetch_ladder.sh` always wrote `local-fixtures/ladder.tsv`, so a second cohort
+destroyed the first. `fetch_cohorts.sh` writes `local-fixtures/cohorts/<uid>-<year>Q<q>.tsv`
+and is idempotent. Replays are opt-in (`--replays`) because the counts-side fit needs only
+beatmaps, and replays are one HTTP request per score.
+
+Scale, for calibration of expectations: 1.18M mania rows total; ~171k ranked full-map
+scores over 1940 players; 528 EZ scores over 118 players.
 
 ```sh
 tools/fetch_ladder.sh 30                            # 4 default cohorts x 30 scores

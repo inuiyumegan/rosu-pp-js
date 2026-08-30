@@ -114,6 +114,107 @@ fn ln_duration_histogram(long_notes: &[Note]) -> [usize; LN_DURATION_BUCKETS] {
     buckets
 }
 
+/// How many equal-count bins the per-note difficulty distribution is compressed into.
+///
+/// Chosen by measurement, not taste — `per_note_binning_cost` refits counts that the exact
+/// per-note unit list generated, and reports how far each candidate list lands from the
+/// skill that produced them, on the 218 of 234 map/skill points where the exact list
+/// recovers its own generating skill:
+///
+/// | bins | median skill err | p90 | max | units/map | us/fit |
+/// |------|------------------|-----|-----|-----------|--------|
+/// | 8    | 0.174% | 0.407% | 2.884% | 13.7 | 1034 |
+/// | **16** | **0.052%** | **0.158%** | **1.164%** | **26.6** | **1975** |
+/// | 24   | 0.027% | 0.096% | 0.829% | 38.8 | 2853 |
+///
+/// The error halves with each doubling, so the residual is the difficulty binning rather
+/// than the mean-hold-duration substitution below. 16 is where the residual becomes ~100x
+/// smaller than the error it removes: the single-unit-at-`sr` list this replaces misses by
+/// **5.37% median and 22.05% at p90**, which is the real reason any of this is here.
+///
+/// Also the reason it is not one unit per note: per-note `d_all` takes 105-895 distinct
+/// values per map, and folding hold duration in pushes distinct `(d, duration)` pairs to
+/// 4284, making the exact fit cost 98.8 ms against 2.0 ms here.
+pub const NOTE_DIFFICULTY_BINS: usize = 16;
+
+/// One equal-count slice of a map's per-note difficulty distribution.
+///
+/// Deliberately *raw*: this is structural map data, cached per map alongside the star
+/// rating, so it must not depend on any [`ErrorModel`] parameter. The collapse of
+/// difficulty and hold duration onto a single sigma axis happens later, in
+/// [`judgement_units`], where the model is in hand.
+///
+/// Equal-count bins are what make this cheap to carry — `rice + long` is the same for
+/// every bin up to integer division, so no weight has to be stored, and the whole
+/// distribution is 16 of these.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NoteDifficultyBin {
+    /// Mean local difficulty (`d_all` at the note's head corner) of the bin's notes.
+    pub difficulty: f64,
+    /// How many of the bin's notes are plain notes.
+    pub rice: u32,
+    /// How many are long notes.
+    pub long: u32,
+    /// Mean hold duration in ms of the bin's long notes, or 0 when it has none.
+    ///
+    /// A mean, where the exact per-note list knows every hold individually. Measured cost
+    /// of that substitution: nothing detectable — see the table on
+    /// [`NOTE_DIFFICULTY_BINS`], where error falls with bin count rather than plateauing,
+    /// which is what rules the substitution out as the binding term.
+    pub mean_duration: f64,
+}
+
+/// Compress a map's per-note difficulty into [`NOTE_DIFFICULTY_BINS`] equal-count bins.
+///
+/// `per_note` is `(local difficulty, hold duration if long)` per note, in any order.
+/// Returns `None` when there is nothing to bin, which the callers treat as "fall back to
+/// the uniform list" rather than as an error.
+fn note_difficulty_bins(
+    per_note: &[(f64, Option<f64>)],
+) -> Option<[NoteDifficultyBin; NOTE_DIFFICULTY_BINS]> {
+    if per_note.is_empty() {
+        return None;
+    }
+
+    let mut sorted: Vec<(f64, Option<f64>)> = per_note.to_vec();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let mut bins = [NoteDifficultyBin::default(); NOTE_DIFFICULTY_BINS];
+    let n = sorted.len();
+
+    for (bin, slot) in bins.iter_mut().enumerate() {
+        let start = bin * n / NOTE_DIFFICULTY_BINS;
+        let end = ((bin + 1) * n / NOTE_DIFFICULTY_BINS).max(start);
+
+        // Fewer notes than bins leaves trailing bins empty. They carry zero weight and so
+        // contribute nothing, rather than needing a special case downstream.
+        if end == start {
+            continue;
+        }
+
+        let slice = &sorted[start..end];
+        let difficulty = slice.iter().map(|&(d, _)| d).sum::<f64>() / slice.len() as f64;
+        let holds: Vec<f64> = slice
+            .iter()
+            .filter_map(|&(_, duration)| duration)
+            .filter(|&duration| duration > 0.0)
+            .collect();
+
+        *slot = NoteDifficultyBin {
+            difficulty,
+            rice: (slice.len() - holds.len()) as u32,
+            long: holds.len() as u32,
+            mean_duration: if holds.is_empty() {
+                0.0
+            } else {
+                holds.iter().sum::<f64>() / holds.len() as f64
+            },
+        };
+    }
+
+    Some(bins)
+}
+
 /// A single mania note (or hold-note) extracted from a beatmap.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Note {
@@ -173,6 +274,25 @@ pub struct SunnyManiaDifficultyAttributes {
     ///
     /// A fixed-size array because these attributes are `Copy`.
     pub ln_duration_buckets: [usize; LN_DURATION_BUCKETS],
+    /// The map's per-note difficulty distribution, in equal-count bins.
+    ///
+    /// `stars` is a weighted percentile blend of the same per-note `d_all` values this
+    /// bins, so it describes roughly where the distribution sits but nothing about its
+    /// width. Pricing every note at `stars` treats a map as uniformly difficult, and
+    /// measured against the exact per-note distribution that misfits skill by 5.37% at the
+    /// median and 22.05% at p90 — a *map-dependent* error, so unlike every width parameter
+    /// in [`ErrorModel`] the per-score `skill` cannot absorb it.
+    ///
+    /// `None` when the distribution was unavailable, which happens on a JS round-trip
+    /// (`serde(skip)`, since `wasm_bindgen` cannot carry a fixed-size array) and for
+    /// hand-built attributes in tests. [`judgement_units`] then falls back to the uniform
+    /// list, so this is a refinement of a working path rather than a new requirement.
+    ///
+    /// Raw map structure, carrying no [`ErrorModel`] parameter, because these attributes
+    /// are cached per map while the model is a calibration-time choice. Subsumes
+    /// [`Self::ln_duration_buckets`] when present: each bin carries its own long notes and
+    /// their mean hold duration.
+    pub note_difficulty_bins: Option<[NoteDifficultyBin; NOTE_DIFFICULTY_BINS]>,
     /// The map's own judgement windows with the window-affecting mods stripped.
     ///
     /// Identical to [`Self::hit_windows`] for a no-mod score, and narrower or wider than
@@ -283,6 +403,7 @@ pub fn calculate(
         n_objects: data.notes.len(),
         n_long_notes: data.long_notes.len(),
         ln_duration_buckets: ln_duration_histogram(&data.long_notes),
+        note_difficulty_bins: params.note_difficulty_bins,
         ln_judged_as_one: classic,
     })
 }
@@ -327,10 +448,10 @@ pub fn calculate_performance(
 
 /// OD 8 classic non-convert, the modal mania OD.
 ///
-/// No longer the pricing reference — see [`reference_windows`] for why the map's own
-/// windows replaced it. Still the fixed yardstick the calibration harnesses fit against,
-/// where a constant is what is wanted so that fit quality across maps is comparable, and
-/// still reachable for pricing via `SUNNY_FIXED_REFERENCE`.
+/// **The pricing default again** — see [`reference_windows`] for why the map-own
+/// reference this replaced had to be reverted. Also still the fixed yardstick the
+/// calibration harnesses fit against, where a constant is what is wanted so that fit
+/// quality across maps is comparable.
 ///
 /// A literal because it must be `const`; `reference_windows_match_od8_no_mod` pins
 /// it against [`hit_windows`] so the two cannot drift.
@@ -345,20 +466,18 @@ const REFERENCE_WINDOWS: ManiaHitWindows = ManiaHitWindows {
 
 /// The windows a score is priced *against*, which decides what the surface charges for.
 ///
-/// **The map's own windows**, which confines the surface to pricing *mods*: every no-mod
-/// score prices at exactly 1.0 at any OD or keymode, and a mod is charged for how far it
-/// moves the windows away from what the map itself asked for.
+/// **The fixed OD 8 [`REFERENCE_WINDOWS`], again.** Three candidates were measured
+/// against the same 143 live scores; the alternatives are kept behind env switches so
+/// the comparison can be rerun in one build, the way `SUNNY_NO_LN_SPLIT` is kept.
 ///
-/// Three candidates were measured against the same 143 live scores; the alternatives are
-/// kept behind env switches so the comparison can be rerun in one build, the way
-/// `SUNNY_NO_LN_SPLIT` is kept.
-///
-/// - **Fixed [`REFERENCE_WINDOWS`]** (OD 8, `SUNNY_FIXED_REFERENCE`) says a low-OD map is genuinely more lenient,
-///   so a score on it demonstrates less precision and should earn less. That claim is
-///   very hard to defend in mania, where OD is a charting convention rather than a
-///   difficulty setting: 7K charts in the fixture set average OD 4.8 against 4K's 8.2,
-///   and 7K LN maps average OD 4.2. Under this reference those maps lose 16.6% of their
-///   live pp for their OD alone.
+/// - **Fixed [`REFERENCE_WINDOWS`]** (OD 8, the default now — no env var needed) says a
+///   low-OD map is genuinely more lenient, so a score on it demonstrates less precision
+///   and should earn less. That claim is very hard to defend in mania, where OD is a
+///   charting convention rather than a difficulty setting: 7K charts in the fixture set
+///   average OD 4.8 against 4K's 8.2, and 7K LN maps average OD 4.2. Under this
+///   reference those maps lose 16.6% of their live pp
+///   for their OD alone. **This is still true and still the reason low-OD LN maps are a
+///   hazard under this default** — see below for what is meant to fix it.
 /// - **One-sided** (`SUNNY_ONESIDED_REFERENCE`), the wider of the two per window: a map
 ///   stricter than OD 8 keeps its bonus, a map more lenient than OD 8 pays no penalty.
 ///   Asymmetric by construction, and the asymmetry is not merely convenient — the two
@@ -373,6 +492,10 @@ const REFERENCE_WINDOWS: ManiaHitWindows = ManiaHitWindows {
 ///   survive testing: the low-OD 7K scores the fixed reference penalises average a 63.4%
 ///   320 share with none above 90%, so they are nowhere near the saturation the argument
 ///   needs. The asymmetry rests on the endogeneity of mania OD alone.
+/// - **The map's own windows** (`SUNNY_MAP_REFERENCE`, the *former* default), which
+///   confines the surface to pricing *mods*: every no-mod score prices at exactly 1.0 at
+///   any OD or keymode, and a mod is charged for how far it moves the windows away from
+///   what the map itself asked for.
 ///
 /// Measured against 143 live scores, as a fraction of live pp:
 ///
@@ -383,23 +506,39 @@ const REFERENCE_WINDOWS: ManiaHitWindows = ManiaHitWindows {
 /// | 4K no-mod OD≥8.9 (n=19) | +2.80% | +2.80% | +0.10% |
 /// | EZ on OD≥8.1 (n=9) | −32.68% | −32.68% | −39.75% |
 ///
-/// The map reference was chosen over the one-sided variant knowing it costs the high-OD
-/// 4K bonus (+2.80% to +0.10%), because a symmetric rule is defensible to players in a way
-/// "your OD only counts when it helps you" is not. It also repairs `EZ`: under a fixed
-/// reference, `EZ`'s widening and a high-OD map's narrowing partly cancelled, so the same
-/// mod cost 32.68% on high-OD maps and 39.06% on low-OD ones. Against the map's own
-/// windows `EZ` costs the same everywhere (−39.75% / −39.18%), which is what pricing a
-/// mod rather than a map means.
+/// **Why the map reference was reverted.** It was chosen over the one-sided variant
+/// because a symmetric rule is defensible to players in a way "your OD only counts when
+/// it helps you" is not, and it repaired `EZ`'s split cost (32.68% on high-OD maps vs
+/// 39.06% on low-OD ones under the fixed reference, vs a uniform −39.75% / −39.18% under
+/// the map reference). Both of those points are still true. But pricing every score
+/// against its own windows makes every no-mod score price at *exactly* 1.0, by
+/// construction — `a_no_mod_score_prices_at_one_under_the_map_reference` pins exactly
+/// that. That is not a nice property, it is the reference closing the OD channel
+/// entirely: no map property can ever move pricing, because the map is always compared
+/// to itself. The surface exists to price every OD, not to exempt OD from pricing, so a
+/// reference that makes OD unconditionally invisible defeats the reason this module
+/// exists. The fixed reference reopens that channel at the cost of the 16.6% low-OD LN
+/// hit above.
+///
+/// **What is meant to close that cost without reintroducing the map reference:**
+/// [`crate::mania_accuracy::ErrorModel::release_mean_offset`]. The 16.6% loss above is
+/// concentrated in low-OD *LN* maps specifically (7K LN averaging OD 4.2), and the
+/// mechanism is that a release lands systematically late relative to where the window is
+/// centred — a bias the model had no parameter for until now. A bias is not absorbed by
+/// the skill fit the way a width is, so it is a mean shift that survives being compared
+/// to a fixed reference in a way `release_sigma_ratio` alone cannot. The endogeneity
+/// argument for low-OD 7K maps is unaffected by any of this and remains the reason those
+/// maps are worth watching under the fixed default.
 fn reference_windows(attrs: &SunnyManiaDifficultyAttributes) -> ManiaHitWindows {
-    if std::env::var_os("SUNNY_FIXED_REFERENCE").is_some() {
-        return REFERENCE_WINDOWS;
+    if std::env::var_os("SUNNY_MAP_REFERENCE").is_some() {
+        return attrs.map_windows;
     }
 
     if std::env::var_os("SUNNY_ONESIDED_REFERENCE").is_some() {
         return REFERENCE_WINDOWS.widest_of(&attrs.map_windows);
     }
 
-    attrs.map_windows
+    REFERENCE_WINDOWS
 }
 
 /// Whether `SUNNY_NO_LN_SPLIT` is set, which collapses the LN mixture back to a
@@ -413,23 +552,51 @@ fn ln_split_disabled() -> bool {
     std::env::var_os("SUNNY_NO_LN_SPLIT").is_some()
 }
 
-/// The judgement units a score's counts are fitted against: the map split into a rice
-/// population and, under ScoreV1, one long-note population per duration bin.
+/// Whether `SUNNY_NO_PER_NOTE_D` is set, which prices every note at the map's star
+/// rating instead of its own local difficulty.
 ///
-/// Local difficulty is still uniform at the map's star rating — per-note difficulty is
-/// the separate, larger change — so the only structure here is the long notes. It
-/// matters because an LN chart is a *mixture*: fitting one sigma to a mixture of widths
-/// inflates it, which drives estimated skill down and, via the `^2.2` in pp, costs far
-/// more than the widening itself. 7K charts in the fixture set average 58% long notes
-/// against 4K's 3%, so this is where the two populations actually differ.
+/// The same kind of A/B switch as [`ln_split_disabled`], and for the same reason: feeding
+/// per-note difficulty in adds no free parameter, so the only way to attribute a change in
+/// fit quality or pp to it is to price the same fixtures both ways in one build. Unset in
+/// every normal run.
+fn per_note_difficulty_disabled() -> bool {
+    std::env::var_os("SUNNY_NO_PER_NOTE_D").is_some()
+}
+
+/// The judgement units a score's counts are fitted against: the map split by per-note
+/// local difficulty and, under ScoreV1, by long-note hold duration within each difficulty
+/// bin.
 ///
-/// **Why duration bins and not one LN population.** A release is harder to place than a
+/// **Per-note difficulty**, via [`SunnyManiaDifficultyAttributes::note_difficulty_bins`],
+/// when the map's distribution reached here. Pricing every note at the map's `stars`
+/// instead treats the map as uniformly difficult, and measured against the exact per-note
+/// distribution that misfits skill by 5.37% at the median and 22.05% at p90. That error is
+/// unlike every width parameter in [`ErrorModel`]: those are absorbed exactly by the
+/// per-score `skill` (see the module docs on gauge), whereas this one is a property of the
+/// *map*, so no per-score quantity can absorb it. Falls back to the uniform list when the
+/// distribution is absent, which is what a JS round-trip leaves behind.
+///
+/// Note that within a single map the distribution is fairly tight — `p90/p50` of per-note
+/// difficulty is under 1.2 on 126 of the 143 fixture scores. The wider `p90/p50` figures in
+/// `per_note_difficulty_distribution` (1.69 on 4K, 1.33 on 7K) are *pooled across maps* and
+/// so are mostly between-map variance; they are not what this path resolves. What it
+/// resolves is measured directly in `per_note_difficulty_on_real_scores`.
+///
+/// **The long-note mixture** matters on top of that, because an LN chart is a mixture of
+/// judgement *widths*: fitting one sigma to a mixture inflates it, which drives estimated
+/// skill down and, via the `^2.2` in pp, costs far more than the widening itself. 7K charts
+/// in the fixture set average 58% long notes against 4K's 3%, so this is where the two
+/// populations actually differ.
+///
+/// **Why duration matters and not one LN population.** A release is harder to place than a
 /// press, and a *short* hold is harder still because the press motion has not finished
 /// when the release is already due. Both effects live in
 /// [`crate::mania_accuracy::release_ratio_for_duration`], which is continuous in
-/// duration; the bins are the quadrature grid that lets a `Copy` attribute struct carry
-/// it. Sweeping a single LN width instead wanted two different answers on mixed-LN and
-/// LN-saturated maps, which is what forced duration into the model.
+/// duration. Sweeping a single LN width instead wanted two different answers on mixed-LN
+/// and LN-saturated maps, which is what forced duration into the model. Under the per-note
+/// path each difficulty bin carries its own long notes and their mean hold duration, so
+/// duration is still resolved; [`Self::ln_duration_buckets`] is the fallback path's
+/// quadrature grid for the same integral.
 ///
 /// Under ScoreV2 heads and releases are judged separately, so every judgement is a
 /// single press and there is no mixture; the units come back uniform and only the count
@@ -440,12 +607,30 @@ fn ln_split_disabled() -> bool {
 /// Everything read here comes from the `.osu` and the mod list. Nothing about how well
 /// the player did enters, which is the line that keeps a bad play from being re-read as
 /// a hard map.
+/// `per_note` selects the per-note path; production passes
+/// `!per_note_difficulty_disabled()`. It is a parameter rather than an env read inside
+/// because the reporting harnesses price the same score both ways in one process, and
+/// mutating the environment mid-test is unsound.
 fn judgement_units(
     attrs: &SunnyManiaDifficultyAttributes,
     total: f64,
     model: &ErrorModel,
+    per_note: bool,
 ) -> Vec<JudgementUnit> {
     let uniform = vec![JudgementUnit::repeated(attrs.stars, total)];
+
+    // Per-note difficulty when the map's distribution survived to here, which also
+    // subsumes the LN duration split below: each bin carries its own long notes.
+    if let Some(bins) = attrs
+        .note_difficulty_bins
+        .filter(|_| attrs.n_objects > 0 && per_note)
+    {
+        let units = units_from_difficulty_bins(&bins, attrs, total, model);
+
+        if !units.is_empty() {
+            return units;
+        }
+    }
 
     // Under V2 the head and release are two ordinary single-press judgements, so
     // there is no wide population to separate out.
@@ -499,6 +684,68 @@ fn judgement_units(
     units
 }
 
+/// Turn a map's per-note difficulty distribution into judgement units.
+///
+/// Each bin contributes up to two units: its plain notes, and its long notes widened and
+/// shifted for the release the same way [`JudgementUnit::long_note`] does everywhere else.
+/// This is where the model finally meets the raw bins, which is why the bins themselves can
+/// stay model-free and cacheable.
+///
+/// Weights are in shares of `total` — the score's own judgement total — rather than the
+/// map's raw counts, for the same reason the LN-split path works that way: a partial play,
+/// or a count vector that disagrees with our object parsing, must still produce weights
+/// summing to what was actually observed, since that is what the multinomial fit requires.
+///
+/// Under ScoreV2 a long note is two separate single-press judgements rather than one
+/// combined one, so its release is not widened; the bins still carry the per-note
+/// difficulty, which is the part V2 scores were missing before.
+fn units_from_difficulty_bins(
+    bins: &[NoteDifficultyBin; NOTE_DIFFICULTY_BINS],
+    attrs: &SunnyManiaDifficultyAttributes,
+    total: f64,
+    model: &ErrorModel,
+) -> Vec<JudgementUnit> {
+    let binned_notes: u32 = bins.iter().map(|bin| bin.rice + bin.long).sum();
+
+    if binned_notes == 0 {
+        return Vec::new();
+    }
+
+    // Rescale to the observed total rather than trusting the map's own note count, which a
+    // partial play or a parsing disagreement can contradict.
+    let per_note = total / f64::from(binned_notes);
+    let combined_long_notes = attrs.ln_judged_as_one && !ln_split_disabled();
+    let mut units = Vec::with_capacity(NOTE_DIFFICULTY_BINS * 2);
+
+    for bin in bins {
+        if bin.rice > 0 {
+            units.push(JudgementUnit::repeated(
+                bin.difficulty,
+                f64::from(bin.rice) * per_note,
+            ));
+        }
+
+        if bin.long == 0 {
+            continue;
+        }
+
+        let weight = f64::from(bin.long) * per_note;
+
+        if combined_long_notes && bin.mean_duration > 0.0 {
+            units.push(JudgementUnit::long_note(
+                bin.difficulty,
+                weight,
+                model,
+                bin.mean_duration,
+            ));
+        } else {
+            units.push(JudgementUnit::repeated(bin.difficulty, weight));
+        }
+    }
+
+    units
+}
+
 /// How much the windows a score was played under change what it is worth.
 ///
 /// This is where mods get priced, and it is the whole point of widening the windows
@@ -543,7 +790,12 @@ fn window_scalar(attrs: &SunnyManiaDifficultyAttributes, state: SunnyScoreState)
     ];
 
     let model = ErrorModel::default();
-    let units = judgement_units(attrs, f64::from(total), &model);
+    let units = judgement_units(
+        attrs,
+        f64::from(total),
+        &model,
+        !per_note_difficulty_disabled(),
+    );
 
     let played = fit_with_quality(&counts, &units, &attrs.hit_windows, &model);
     let reference = fit_with_quality(&counts, &units, &reference_windows(attrs), &model);
@@ -1584,6 +1836,9 @@ struct RebirthParams {
     spikiness: f64,
     switches: f64,
     variety: f64,
+    /// The per-note difficulty distribution the `sr` percentiles were taken from, kept
+    /// rather than discarded — see [`SunnyManiaDifficultyAttributes::note_difficulty_bins`].
+    note_difficulty_bins: Option<[NoteDifficultyBin; NOTE_DIFFICULTY_BINS]>,
 }
 
 fn calculate_from_data(data: &RebirthData, classic: bool) -> Option<RebirthParams> {
@@ -1711,11 +1966,26 @@ fn calculate_from_data(data: &RebirthData, classic: bool) -> Option<RebirthParam
     let switches = compute_switches(data, &keys, &effective_weights);
     let variety = compute_variety(data);
 
+    // Per-note difficulty, read off the same `d_all` the percentiles above came from. Every
+    // note head lands exactly on a corner, so this is a lookup and not an interpolation:
+    // verified on 1173541 heads across 466 fixture maps, max mismatch 0 ms, all keymodes.
+    let per_note: Vec<(f64, Option<f64>)> = data
+        .notes
+        .iter()
+        .map(|note| {
+            let idx = lower_bound(&data.all_corners, note.head).min(d_all.len() - 1);
+            let duration = note.tail.map(|tail| tail - note.head);
+
+            (d_all[idx], duration)
+        })
+        .collect();
+
     Some(RebirthParams {
         sr,
         spikiness,
         switches,
         variety,
+        note_difficulty_bins: note_difficulty_bins(&per_note),
     })
 }
 
@@ -2045,6 +2315,171 @@ mod tests {
         map
     }
 
+    /// As [`synthetic_map`], with every `hold_every`th note a hold of `hold_ms`.
+    ///
+    /// [`synthetic_map`] emits only circles, so on its output every bin's `long` count is
+    /// zero and the long-note branch of the per-note path never runs. Varying the hold
+    /// length with the index also gives the bins something to average, so
+    /// `mean_duration` is exercised rather than being one repeated value.
+    fn synthetic_map_with_holds(
+        od: f32,
+        notes: usize,
+        spacing: f64,
+        hold_every: usize,
+        hold_ms: f64,
+    ) -> Beatmap {
+        let mut map = synthetic_map(od, notes, spacing);
+
+        for (idx, object) in map.hit_objects.iter_mut().enumerate() {
+            if hold_every > 0 && idx % hold_every == 0 {
+                object.kind = HitObjectKind::Hold(rosu_pp::model::hit_object::HoldNote {
+                    duration: hold_ms + (idx % 5) as f64 * 40.0,
+                });
+            }
+        }
+
+        map
+    }
+
+    /// The per-note path must hand the fit exactly the score that was played.
+    ///
+    /// [`crate::mania_accuracy::skill_for_counts`] fits a multinomial, so the unit weights
+    /// are the trial count. If they sum to anything other than the observed judgement
+    /// total, the fit is answering a question about a different score — and because the
+    /// weights are derived from the *map's* note count while the total comes from the
+    /// *score*, the two can legitimately disagree: a partial play, or a count vector our
+    /// object parsing reads differently. Asserted rather than left to the reports because
+    /// the failure is silent and would misprice every score on the map.
+    #[test]
+    fn per_note_units_emit_exactly_the_observed_judgement_total() {
+        let model = ErrorModel::default();
+
+        // Rice-only and LN-bearing, and under both judgement regimes: a ScoreV1 long note
+        // is one widened judgement while a V2 one is two plain ones, so the weights are
+        // built differently in each case.
+        let cases = [
+            ("rice, V1", synthetic_map(8.0, 400, 120.0), true),
+            ("rice, V2", synthetic_map(8.0, 400, 120.0), false),
+            ("holds, V1", synthetic_map_with_holds(8.0, 400, 120.0, 3, 90.0), true),
+            ("holds, V2", synthetic_map_with_holds(8.0, 400, 120.0, 3, 90.0), false),
+            ("all holds, V1", synthetic_map_with_holds(8.0, 400, 120.0, 1, 300.0), true),
+        ];
+
+        for (label, map, classic) in cases {
+            let attrs = calculate(&map, &GameMods::default(), 1.0, Some(classic), None).unwrap();
+            let bins = attrs
+                .note_difficulty_bins
+                .unwrap_or_else(|| panic!("{label}: a 400-note map should carry a distribution"));
+
+            // Guards the guard: a case meant to exercise the long-note branch must actually
+            // contain long notes, or this test passes while testing nothing.
+            let long: u32 = bins.iter().map(|bin| bin.long).sum();
+
+            if label.contains("holds") {
+                assert!(long > 0, "{label}: expected long notes in the bins, found none");
+                assert!(
+                    bins.iter().any(|bin| bin.mean_duration > 0.0),
+                    "{label}: expected a non-zero mean hold duration"
+                );
+            } else {
+                assert_eq!(long, 0, "{label}: expected no long notes, found {long}");
+            }
+
+            // Deliberately includes totals that disagree with the map's own note count in
+            // both directions, since that disagreement is why the rescaling exists.
+            for total in [1u32, 137, 399, 400, 401, 812] {
+                let units = judgement_units(&attrs, f64::from(total), &model, true);
+                let weight: f64 = units.iter().map(|unit| unit.weight).sum();
+
+                assert!(
+                    (weight - f64::from(total)).abs() < 1e-9,
+                    "{label}: a {total}-hit score got {weight} units of weight"
+                );
+
+                let emitted = crate::mania_accuracy::expected_counts(
+                    &units,
+                    &attrs.hit_windows,
+                    &model,
+                    9.0,
+                );
+                let emitted_total: f64 = crate::mania_windows::ManiaJudgement::ALL
+                    .iter()
+                    .map(|&judgement| emitted.get(judgement))
+                    .sum();
+
+                assert!(
+                    (emitted_total - f64::from(total)).abs() < 1e-6,
+                    "{label}: a {total}-hit score got {emitted_total} predicted judgements"
+                );
+            }
+        }
+    }
+
+    /// Attributes without a per-note distribution keep working.
+    ///
+    /// A JS round-trip drops it (`serde(skip)`: `wasm_bindgen` cannot carry a fixed-size
+    /// array), and it is deliberately *not* reconstructed there, unlike
+    /// [`ln_duration_buckets`] — a stand-in would be inventing a difficulty spread the
+    /// attributes carry no trace of. So the fallback is load-bearing on a shipping path,
+    /// not just in tests.
+    #[test]
+    fn a_missing_per_note_distribution_falls_back_to_the_uniform_list() {
+        let map = synthetic_map(8.0, 400, 120.0);
+        let attrs = calculate(&map, &GameMods::default(), 1.0, Some(true), None).unwrap();
+        let model = ErrorModel::default();
+
+        let stripped = SunnyManiaDifficultyAttributes {
+            note_difficulty_bins: None,
+            ..attrs
+        };
+
+        let units = judgement_units(&stripped, 400.0, &model, true);
+        let weight: f64 = units.iter().map(|unit| unit.weight).sum();
+
+        assert!(
+            (weight - 400.0).abs() < 1e-9,
+            "the fallback list must still weigh the whole score, got {weight}"
+        );
+        assert!(
+            units.iter().all(|unit| unit.difficulty == stripped.stars),
+            "the fallback list prices every note at the map's star rating"
+        );
+
+        // And the pricing path survives it, which is the property the JS binding relies on.
+        let state = SunnyScoreState { n320: 380, n300: 20, n200: 0, n100: 0, n50: 0, misses: 0 };
+        let scalar = window_scalar(&stripped, state);
+
+        assert!(
+            scalar.is_finite() && scalar > 0.0,
+            "a stripped attribute set must still price, got {scalar}"
+        );
+    }
+
+    /// Equal-count bins, which is what lets the attribute omit per-bin weights.
+    #[test]
+    fn per_note_bins_partition_the_map() {
+        let map = synthetic_map(8.0, 400, 120.0);
+        let attrs = calculate(&map, &GameMods::default(), 1.0, Some(true), None).unwrap();
+        let bins = attrs.note_difficulty_bins.unwrap();
+
+        let counted: u32 = bins.iter().map(|bin| bin.rice + bin.long).sum();
+
+        assert_eq!(
+            counted as usize, attrs.n_objects,
+            "the bins must account for every note exactly once"
+        );
+
+        // Sorted by construction, which the p50/p90 reads in the reports depend on.
+        for pair in bins.windows(2) {
+            assert!(
+                pair[0].difficulty <= pair[1].difficulty,
+                "bins must be ordered by difficulty: {} then {}",
+                pair[0].difficulty,
+                pair[1].difficulty
+            );
+        }
+    }
+
     /// The Python reference (Star-Rating-Rebirth) uses the OD-based hit
     /// leniency while this port uses the C# great-hit-window based one, so
     /// the SR values differ by a small margin.
@@ -2264,16 +2699,38 @@ mod tests {
         );
     }
 
-    /// Every no-mod score is priced at 1, at any OD. This is the defining property of
-    /// pricing against the map's own windows — the two fits are then literally the same
-    /// fit — and it is what confines the surface to charging for mods.
+    /// Every no-mod score is priced at 1, at any OD, **under `SUNNY_MAP_REFERENCE`**.
+    ///
+    /// This is no longer the shipped default — [`reference_windows`] reverted to the
+    /// fixed OD 8 reference because pricing every score against its own windows makes
+    /// this property hold *unconditionally*, which closes the OD channel entirely: no
+    /// map property can ever move pricing if the map is always compared to itself. The
+    /// property below is still real and still the defining behaviour of the map
+    /// reference, it is just no longer what `reference_windows` returns by default, so
+    /// the env var is set explicitly to reach it.
     ///
     /// Swept across OD rather than checked at OD 8, because at OD 8 the map reference and
-    /// the retired fixed reference agree and the test cannot tell them apart. OD 0 and 10
-    /// are the extremes of the mania range, and 4.2 is the fixture mean for 7K LN charts —
-    /// the maps that lost 16.6% of their live pp to the fixed reference.
+    /// the fixed reference agree and the test cannot tell them apart. OD 0 and 10 are the
+    /// extremes of the mania range, and 4.2 is the fixture mean for 7K LN charts — the
+    /// maps that lose 16.6% of their live pp under the fixed default.
+    ///
+    /// **Env-var race.** `SUNNY_MAP_REFERENCE` is process-global and `cargo test` runs
+    /// tests in parallel by default; every other test in this module that prices a score
+    /// implicitly assumes the fixed default, so this test can in principle flake them
+    /// (and be flaked by them) if the runner interleaves it with them while the var is
+    /// set. No serial-test harness or env-scoping mechanism exists anywhere else in this
+    /// crate to borrow, and adding a new one just for this test was out of scope here —
+    /// noted rather than silently accepted.
     #[test]
-    fn a_no_mod_score_is_priced_at_one_whatever_the_od() {
+    fn a_no_mod_score_prices_at_one_under_the_map_reference() {
+        // Safety: single-threaded within this test's own lifetime is not actually
+        // guaranteed (see the doc comment above), but nothing here reads or writes
+        // any other environment variable, so the only possible unsoundness is the
+        // documented cross-test race, not a memory-safety one.
+        unsafe {
+            std::env::set_var("SUNNY_MAP_REFERENCE", "1");
+        }
+
         let state = SunnyScoreState {
             n320: 1400,
             n300: 480,
@@ -2290,11 +2747,21 @@ mod tests {
 
             let perf = calculate_performance(&attrs, &mods, state);
 
-            assert!(
-                (perf.window_scalar - 1.0).abs() < 1e-6,
-                "a no-mod score at OD {od} must price at 1, got {}",
-                perf.window_scalar
-            );
+            let ok = (perf.window_scalar - 1.0).abs() < 1e-6;
+
+            if !ok {
+                unsafe {
+                    std::env::remove_var("SUNNY_MAP_REFERENCE");
+                }
+                panic!(
+                    "a no-mod score at OD {od} must price at 1 under the map reference, got {}",
+                    perf.window_scalar
+                );
+            }
+        }
+
+        unsafe {
+            std::env::remove_var("SUNNY_MAP_REFERENCE");
         }
     }
 
@@ -3941,6 +4408,18 @@ mod tests {
         ln_fraction: f64,
         /// Whether the score's long notes were judged as one unit (V1) or two (V2).
         ln_judged_as_one: bool,
+        /// The skill [`window_scalar`] fits against the fixed reference windows, kept
+        /// separately from [`Self::skill`] (the played-windows fit) because
+        /// `window_scalar` is their *ratio* and can move in the opposite direction
+        /// from either fit alone — see `ln_offset_under_the_fixed_reference`.
+        reference_skill: f64,
+        /// The reference-side fit's `g_timing`, alongside [`Self::g_timing`] (the
+        /// played-side fit's). Neither is the fit quality of a real player against a
+        /// real map; the reference side grades the *same observed counts* against a
+        /// windows set the player never actually played under, so a bad reference
+        /// `g_timing` means the reference windows are a poor description of those
+        /// counts, not that the player misplayed.
+        reference_g_timing: f64,
     }
 
     /// Reproduces the pre-change pp for one score: the flat `EZ` `0.90` that
@@ -4067,8 +4546,15 @@ mod tests {
 
             let perf = calculate_performance(&attrs, &mods, state);
             let model = ErrorModel::default();
-            let units = judgement_units(&attrs, f64::from(state.total_hits()), &model);
+            let units = judgement_units(
+                &attrs,
+                f64::from(state.total_hits()),
+                &model,
+                !per_note_difficulty_disabled(),
+            );
             let fit = fit_with_quality(&row.counts, &units, &attrs.hit_windows, &model);
+            let reference_fit =
+                fit_with_quality(&row.counts, &units, &reference_windows(&attrs), &model);
 
             out.push(MultiPriced {
                 stars: attrs.stars,
@@ -4087,6 +4573,8 @@ mod tests {
                     0.0
                 },
                 ln_judged_as_one: attrs.ln_judged_as_one,
+                reference_skill: reference_fit.skill,
+                reference_g_timing: reference_fit.g_timing,
                 row,
             });
         }
@@ -4156,8 +4644,15 @@ mod tests {
 
             let perf = calculate_performance(&attrs, &GameMods::default(), state);
             let model = ErrorModel::default();
-            let units = judgement_units(&attrs, f64::from(state.total_hits()), &model);
+            let units = judgement_units(
+                &attrs,
+                f64::from(state.total_hits()),
+                &model,
+                !per_note_difficulty_disabled(),
+            );
             let fit = fit_with_quality(&row.counts, &units, &attrs.hit_windows, &model);
+            let reference_fit =
+                fit_with_quality(&row.counts, &units, &reference_windows(&attrs), &model);
 
             out.push(MultiPriced {
                 stars: attrs.stars,
@@ -4176,6 +4671,8 @@ mod tests {
                     0.0
                 },
                 ln_judged_as_one: attrs.ln_judged_as_one,
+                reference_skill: reference_fit.skill,
+                reference_g_timing: reference_fit.g_timing,
                 row,
             });
         }
@@ -4448,6 +4945,233 @@ mod tests {
             all.iter().filter(|r| r.plausible).count(),
             all.len()
         );
+    }
+
+    /// Reports how [`ErrorModel::release_mean_offset`] moves pricing under the fixed
+    /// OD 8 reference, using the same `local-fixtures/multiuser.tsv` fixtures and
+    /// [`load_multiuser`] harness `multiuser_report` uses.
+    ///
+    /// Per score: map id, keymode, OD, LN share, live pp, our pp, `window_scalar`,
+    /// `g_timing` (played side), `g_timing` (reference side), played skill, reference
+    /// skill.
+    ///
+    /// Aggregated several ways, all as counts and medians (plus `g_timing` p90):
+    /// - our-pp/live-pp by keymode (4K vs 7K) and by LN-share bucket (`[0, 0-30%,
+    ///   30-60%, >60%]`)
+    /// - `g_timing`, played-side and reference-side, by the same two cuts —
+    ///   [`Self::g_timing`]'s doc comment on why the reference side is not a claim
+    ///   about the player: it grades the same observed counts against windows the
+    ///   player never played under
+    /// - played skill, reference skill, and `window_scalar` for two specific cohorts
+    ///   (the low-OD 7K/LN-heavy target and the 4K/rice control), to separate what the
+    ///   ratio shows from what each fit shows on its own
+    ///
+    /// `livePP` is itself computed by a live sunny build (`2c2e8a1`-adjacent, not
+    /// today's `main`), so an our-pp/live-pp ratio close to 1 does not mean the offset
+    /// is doing nothing — it can equally mean live pricing has drifted to agree with a
+    /// no-op change. `g_timing` is the only figure here that is not contaminated by
+    /// that: it is a property of the fit against the *observed judgement counts*
+    /// alone and does not reference live pp at all. This report does **not** compute
+    /// the [`pp_before_change`] (`2c2e8a1`) baseline column — only `multiuser_report`
+    /// does that, and it was not added here; treat any comparison against that
+    /// baseline as absent, not as implicitly agreeing with it.
+    ///
+    /// This is the measurement, not the change: [`ErrorModel::release_mean_offset`]'s
+    /// default has to be edited and the crate rebuilt to see it move — this test only
+    /// reports whatever value is currently compiled in. Compare runs at 0.0, 4.0, 8.0,
+    /// 16.0.
+    ///
+    /// Run with `cargo test --release ln_offset_under_the_fixed_reference -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn ln_offset_under_the_fixed_reference() {
+        let scores = load_multiuser();
+        if scores.is_empty() {
+            println!("no fixtures present (local-fixtures/multiuser.tsv); nothing to report");
+            return;
+        }
+
+        println!(
+            "release_mean_offset = {:.1}",
+            ErrorModel::default().release_mean_offset
+        );
+
+        println!(
+            "\n{:>8} {:>4} {:>5} {:>6} {:>9} {:>9} {:>7} {:>9} {:>9} {:>8} {:>9}",
+            "map", "keys", "od", "ln%", "livePP", "ourPP", "scalar", "g_played",
+            "g_ref", "skill", "ref_skill"
+        );
+
+        let with_live: Vec<&MultiPriced> = scores.iter().filter(|r| r.row.live_pp > 0.0).collect();
+
+        for r in &with_live {
+            println!(
+                "{:>8} {:>4} {:>5.1} {:>6.1} {:>9.1} {:>9.1} {:>7.4} {:>9.2} {:>9.2} {:>8.3} {:>9.3}",
+                r.row.map_id,
+                r.row.keys,
+                r.od,
+                r.ln_fraction * 100.0,
+                r.row.live_pp,
+                r.after_pp,
+                r.scalar,
+                r.g_timing,
+                r.reference_g_timing,
+                r.skill,
+                r.reference_skill
+            );
+        }
+
+        fn median(values: &mut [f64]) -> f64 {
+            values.sort_by(f64::total_cmp);
+            values[values.len() / 2]
+        }
+
+        fn p90(values: &mut [f64]) -> f64 {
+            values.sort_by(f64::total_cmp);
+            values[values.len() * 9 / 10]
+        }
+
+        fn report_ratio(label: &str, rows: &[&MultiPriced]) {
+            if rows.is_empty() {
+                println!("  {label}: n=0");
+                return;
+            }
+            let mut ratios: Vec<f64> = rows.iter().map(|r| r.after_pp / r.row.live_pp).collect();
+            println!(
+                "  {label}: n={:<4} median ourPP/livePP {:.4}",
+                rows.len(),
+                median(&mut ratios)
+            );
+        }
+
+        fn report_g_timing(label: &str, rows: &[&MultiPriced]) {
+            if rows.is_empty() {
+                println!("  {label}: n=0");
+                return;
+            }
+            let mut played: Vec<f64> = rows.iter().map(|r| r.g_timing).collect();
+            let mut reference: Vec<f64> = rows.iter().map(|r| r.reference_g_timing).collect();
+            println!(
+                "  {label}: n={:<4} played g_timing median {:>8.2} p90 {:>8.2}  \
+                 reference g_timing median {:>8.2} p90 {:>8.2}",
+                rows.len(),
+                median(&mut played.clone()),
+                p90(&mut played),
+                median(&mut reference.clone()),
+                p90(&mut reference)
+            );
+        }
+
+        fn report_skills(label: &str, rows: &[&MultiPriced]) {
+            if rows.is_empty() {
+                println!("  {label}: n=0");
+                return;
+            }
+            let mut played: Vec<f64> = rows.iter().map(|r| r.skill).collect();
+            let mut reference: Vec<f64> = rows.iter().map(|r| r.reference_skill).collect();
+            let mut scalar: Vec<f64> = rows.iter().map(|r| r.scalar).collect();
+            println!(
+                "  {label}: n={:<4} median played_skill {:>7.3}  median reference_skill {:>7.3}  \
+                 median window_scalar {:>7.4}",
+                rows.len(),
+                median(&mut played),
+                median(&mut reference),
+                median(&mut scalar)
+            );
+        }
+
+        println!("\nby keymode (ourPP/livePP):");
+        for keys in [4u32, 7] {
+            let band: Vec<&MultiPriced> =
+                with_live.iter().copied().filter(|r| r.row.keys == keys).collect();
+            report_ratio(&format!("{keys}K"), &band);
+        }
+
+        println!("\nby keymode (g_timing, played vs reference):");
+        for keys in [4u32, 7] {
+            let band: Vec<&MultiPriced> =
+                with_live.iter().copied().filter(|r| r.row.keys == keys).collect();
+            report_g_timing(&format!("{keys}K"), &band);
+        }
+
+        println!("\nby LN share (ourPP/livePP):");
+        for (label, lo, hi) in [
+            ("0%", 0.0, 0.0),
+            ("0-30%", 0.0, 0.3),
+            ("30-60%", 0.3, 0.6),
+            (">60%", 0.6, 1.01),
+        ] {
+            let band: Vec<&MultiPriced> = with_live
+                .iter()
+                .copied()
+                .filter(|r| {
+                    if lo == hi {
+                        r.ln_fraction <= 0.0
+                    } else {
+                        r.ln_fraction > lo && r.ln_fraction < hi
+                    }
+                })
+                .collect();
+            report_ratio(label, &band);
+        }
+
+        println!("\nby LN share (g_timing, played vs reference):");
+        for (label, lo, hi) in [
+            ("0%", 0.0, 0.0),
+            ("0-30%", 0.0, 0.3),
+            ("30-60%", 0.3, 0.6),
+            (">60%", 0.6, 1.01),
+        ] {
+            let band: Vec<&MultiPriced> = with_live
+                .iter()
+                .copied()
+                .filter(|r| {
+                    if lo == hi {
+                        r.ln_fraction <= 0.0
+                    } else {
+                        r.ln_fraction > lo && r.ln_fraction < hi
+                    }
+                })
+                .collect();
+            report_g_timing(label, &band);
+        }
+
+        // The cohort the offset is meant to move: low-OD 7K, LN-heavy.
+        println!("\nlow-OD 7K, LN-heavy (the cohort the offset targets):");
+        let low_od_7k_ln: Vec<&MultiPriced> = with_live
+            .iter()
+            .copied()
+            .filter(|r| r.row.keys == 7 && f64::from(r.od) < 6.0 && r.ln_fraction > 0.3)
+            .collect();
+        report_ratio("OD<6 7K LN>30% (ratio)", &low_od_7k_ln);
+        report_g_timing("OD<6 7K LN>30% (g_timing)", &low_od_7k_ln);
+        report_skills("OD<6 7K LN>30% (skills+scalar)", &low_od_7k_ln);
+
+        // Rice control: the offset only reaches long-note units, so this cohort must
+        // not move at all when the offset changes between runs.
+        println!("\n4K rice control (must not move when the offset changes):");
+        let rice_4k: Vec<&MultiPriced> = with_live
+            .iter()
+            .copied()
+            .filter(|r| r.row.keys == 4 && r.ln_fraction < 0.05)
+            .collect();
+        report_ratio("4K LN<5% (ratio)", &rice_4k);
+        report_g_timing("4K LN<5% (g_timing)", &rice_4k);
+        report_skills("4K LN<5% (skills+scalar)", &rice_4k);
+
+        // Star rating must never move with this parameter — the surface does not feed
+        // difficulty. Printed as a hash-free direct dump so a diff across offset runs
+        // catches any drift at all, not just drift big enough to change a rounded
+        // display value.
+        println!("\nstars (must be byte-identical across every release_mean_offset run):");
+        let mut by_map: Vec<(&str, f64)> =
+            scores.iter().map(|r| (r.row.map_id.as_str(), r.stars)).collect();
+        by_map.sort_by(|a, b| a.0.cmp(b.0).then(a.1.total_cmp(&b.1)));
+        by_map.dedup();
+        for (map_id, stars) in &by_map {
+            println!("  {map_id:>8}  {stars:.17}");
+        }
     }
 
     /// Sweeps [`ErrorModel::release_sigma_ratio`] and reports fit quality by long-note
@@ -4795,7 +5519,12 @@ mod tests {
                 continue;
             }
 
-            let units = judgement_units(&attrs, f64::from(total), &model);
+            let units = judgement_units(
+                &attrs,
+                f64::from(total),
+                &model,
+                !per_note_difficulty_disabled(),
+            );
             let fit = fit_with_quality(&counts, &units, &attrs.hit_windows, &model);
 
             let total_columns = map.cs.round_ties_even().max(1.0) as usize;
@@ -5814,10 +6543,10 @@ mod tests {
 
         // --- (c) no-mod pricing is untouched. ---
         println!(
-            "\nno-mod window_scalar == 1.0 is covered by \
-             `a_no_mod_score_is_priced_at_one_whatever_the_od`, which is unaffected by this \
-             change (it does not touch `window_scalar`, only `d` via `compute_rbar`); see the \
-             full `cargo test --release` run for its pass/fail status."
+            "\nno-mod window_scalar == 1.0 under the map reference is covered by \
+             `a_no_mod_score_prices_at_one_under_the_map_reference`, which is unaffected by \
+             this change (it does not touch `window_scalar`, only `d` via `compute_rbar`); see \
+             the full `cargo test --release` run for its pass/fail status."
         );
     }
 
@@ -6161,7 +6890,7 @@ mod tests {
 
         // Cross-tab: keymode.
         println!("\nby keymode:");
-        let keymode_preds: [(&str, fn(usize) -> bool); 3] = [
+        let keymode_preds: [KeymodeGroup; 3] = [
             ("4K", |k| k == 4),
             ("7K", |k| k == 7),
             ("other", |k| k != 4 && k != 7),
@@ -6203,9 +6932,385 @@ mod tests {
         }
     }
 
-    /// How often a release's judgement window reaches past the next press in the same
-    /// column, which is the collision 反键 charting creates.
+    /// Distribution of PER-NOTE local difficulty (`d_all`, indexed by `all_corners`) on
+    /// real fixture maps, checking two claims previously measured only on synthetic
+    /// patterns: that every note head already lands exactly on a corner (so per-note
+    /// difficulty can be read off `d_all` without interpolation), and that the
+    /// note-count-weighted mean of `d_all` sits at 0.96-0.98x the map's final `sr`.
     ///
+    /// `d_all` construction is copied verbatim from `calculate_from_data` (the `s_all` /
+    /// `t_all` expression); production code is not touched or refactored to expose it.
+    /// Corner lookup for a note head uses the same `lower_bound(all_corners, head)` as
+    /// `compute_switches`.
+    ///
+    /// Run with `cargo test --release per_note_difficulty_distribution -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn per_note_difficulty_distribution() {
+        use std::fs;
+
+        struct MapReport {
+            id: String,
+            keys: usize,
+            n_objects: usize,
+            ln_share: f64,
+            sr: f64,
+            /// Note heads out of `n_objects` where `all_corners[lower_bound(..)] == head`
+            /// exactly.
+            exact_heads: usize,
+            /// Max |all_corners[lower_bound(..)] - head| in ms, over all note heads.
+            max_head_mismatch_ms: f64,
+            /// Per-note d_all values (one per note head, looked up via lower_bound).
+            per_note_d: Vec<f64>,
+            /// Note-count-weighted mean of per-note d_all.
+            weighted_mean_d: f64,
+        }
+
+        fn report_for(map: &Beatmap) -> Option<MapReport> {
+            let total_columns = map.cs.round_ties_even().max(1.0) as usize;
+            let (notes, _) = build_notes(1.0, map.hit_objects.iter(), total_columns);
+
+            if notes.len() < 2 || total_columns == 0 {
+                return None;
+            }
+
+            let n_long_notes = notes.iter().filter(|n| n.tail.is_some()).count();
+            let ln_share = n_long_notes as f64 / notes.len() as f64;
+
+            let windows = hit_windows(map, &GameMods::default(), 1.0, false);
+            let great_hit_window = get_hit_window_300(map, 1.0, false, false);
+            let hit_leniency = hit_leniency_from_window(great_hit_window);
+            let data = RebirthData::new(notes, total_columns, hit_leniency, windows.good);
+
+            if data.all_corners.len() < 2 {
+                return None;
+            }
+
+            // ---- verbatim `d_all` construction from `calculate_from_data` ----
+            let key_usage = get_key_usage(&data);
+            let active_columns: Vec<_> = (0..data.base_corners.len())
+                .map(|idx| {
+                    (0..data.total_columns)
+                        .filter(|&column| key_usage[column][idx])
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let key_usage_400 = get_key_usage_400(&data);
+            let anchor = compute_anchor(&key_usage_400);
+            let (_delta_by_column, jbar_base) = compute_jbar(&data);
+            let jbar = interp_values(&data.all_corners, &data.base_corners, &jbar_base);
+            let xbar_base = compute_xbar(&data, &active_columns);
+            let xbar = interp_values(&data.all_corners, &data.base_corners, &xbar_base);
+            let ln_rep = LongNoteBodyRepresentation::new(&data.long_notes, data.t_end);
+            let pbar_base = compute_pbar(&data, &ln_rep, &anchor);
+            let pbar = interp_values(&data.all_corners, &data.base_corners, &pbar_base);
+            let abar_awkwardness = compute_abar(&data, &active_columns, &_delta_by_column);
+            let abar = interp_values(
+                &data.all_corners,
+                &data.awkwardness_corners,
+                &abar_awkwardness,
+            );
+            let rbar_base = compute_rbar(&data);
+            let rbar = interp_values(&data.all_corners, &data.base_corners, &rbar_base);
+            let (density_base, _density_v2_base, keys_base) =
+                compute_density_and_keys(&data, &key_usage);
+            let density = step_interp(&data.all_corners, &data.base_corners, &density_base);
+            let keys = step_interp(&data.all_corners, &data.base_corners, &keys_base);
+
+            let d_all: Vec<f64> = (0..data.all_corners.len())
+                .map(|idx| {
+                    let s_all = (0.4
+                        * (abar[idx].powf(3.0 / keys[idx]) * jbar[idx].min(8.0 + 0.85 * jbar[idx]))
+                            .powf(1.5)
+                        + (1.0 - 0.4)
+                            * (abar[idx].powf(2.0 / 3.0)
+                                * (0.8 * pbar[idx] + rbar[idx] * release_density_weight(density[idx])))
+                                .powf(1.5))
+                    .powf(2.0 / 3.0);
+                    let t_all =
+                        (abar[idx].powf(3.0 / keys[idx]) * xbar[idx]) / (xbar[idx] + s_all + 1.0);
+
+                    2.7 * s_all.powf(0.5) * t_all.powf(1.5) + s_all * 0.27
+                })
+                .collect();
+            // ---- end verbatim construction ----
+
+            let heads: Vec<f64> = data.notes.iter().map(|note| note.head).collect();
+            let mut exact_heads = 0usize;
+            let mut max_head_mismatch_ms = 0.0f64;
+            let mut per_note_d = Vec::with_capacity(heads.len());
+
+            for &head in &heads {
+                let idx = lower_bound(&data.all_corners, head).min(data.all_corners.len() - 1);
+                let corner = data.all_corners[idx];
+                let mismatch = (corner - head).abs();
+
+                if mismatch == 0.0 {
+                    exact_heads += 1;
+                } else {
+                    max_head_mismatch_ms = max_head_mismatch_ms.max(mismatch);
+                }
+
+                per_note_d.push(d_all[idx]);
+            }
+
+            let weighted_mean_d = per_note_d.iter().sum::<f64>() / per_note_d.len() as f64;
+
+            let attrs = calculate(map, &GameMods::default(), 1.0, Some(false), None)?;
+
+            Some(MapReport {
+                id: String::new(),
+                keys: total_columns,
+                n_objects: data.notes.len(),
+                ln_share,
+                sr: attrs.stars,
+                exact_heads,
+                max_head_mismatch_ms,
+                per_note_d,
+                weighted_mean_d,
+            })
+        }
+
+        let Ok(entries) = fs::read_dir("local-fixtures/maps") else {
+            println!("no fixture maps present; nothing to report");
+            return;
+        };
+
+        let mut rows = Vec::new();
+        let mut parse_failures = 0usize;
+        let mut none_results = 0usize;
+        let mut total_osu_files = 0usize;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("osu") {
+                continue;
+            }
+            total_osu_files += 1;
+            let Some(path_str) = path.to_str() else {
+                parse_failures += 1;
+                continue;
+            };
+            let Some(map) = parse(path_str) else {
+                parse_failures += 1;
+                continue;
+            };
+            let Some(mut report) = report_for(&map) else {
+                none_results += 1;
+                continue;
+            };
+            report.id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_owned();
+            rows.push(report);
+        }
+
+        println!(
+            "{total_osu_files} .osu files found; {} parsed and measured, {parse_failures} \
+             failed to parse, {none_results} returned None from setup.",
+            rows.len()
+        );
+
+        if rows.is_empty() {
+            println!("no parseable fixture maps; nothing to report");
+            return;
+        }
+
+        // ---------------------------------------------------------------
+        // (a) Corner exactness
+        // ---------------------------------------------------------------
+        let total_notes: usize = rows.iter().map(|r| r.n_objects).sum();
+        let total_exact: usize = rows.iter().map(|r| r.exact_heads).sum();
+        let overall_exact_frac = total_exact as f64 / total_notes as f64;
+        let overall_max_mismatch = rows
+            .iter()
+            .map(|r| r.max_head_mismatch_ms)
+            .fold(0.0, f64::max);
+
+        println!("\n(a) CORNER EXACTNESS");
+        println!(
+            "  overall: {total_exact}/{total_notes} heads exact ({:.6}%), max mismatch \
+             {overall_max_mismatch:.6} ms",
+            overall_exact_frac * 100.0
+        );
+
+        let mut by_mismatch: Vec<&MapReport> = rows.iter().collect();
+        by_mismatch.sort_by(|a, b| b.max_head_mismatch_ms.total_cmp(&a.max_head_mismatch_ms));
+        println!("  worst 10 maps by max head mismatch:");
+        for row in by_mismatch.iter().take(10) {
+            let frac_exact = row.exact_heads as f64 / row.n_objects as f64;
+            println!(
+                "    {:>9} {:>4}K n={:<6} exact={:>6.2}%  max_mismatch={:.6} ms",
+                row.id,
+                row.keys,
+                row.n_objects,
+                frac_exact * 100.0,
+                row.max_head_mismatch_ms
+            );
+        }
+
+        // ---------------------------------------------------------------
+        // (b) Distinct values (rounded to 0.01 and 0.05)
+        // ---------------------------------------------------------------
+        fn distinct_count(vals: &[f64], round_to: f64) -> usize {
+            let mut rounded: Vec<i64> = vals
+                .iter()
+                .map(|&v| (v / round_to).round() as i64)
+                .collect();
+            rounded.sort_unstable();
+            rounded.dedup();
+            rounded.len()
+        }
+
+        let distinct_001: Vec<usize> = rows
+            .iter()
+            .map(|r| distinct_count(&r.per_note_d, 0.01))
+            .collect();
+        let distinct_005: Vec<usize> = rows
+            .iter()
+            .map(|r| distinct_count(&r.per_note_d, 0.05))
+            .collect();
+
+        println!("\n(b) DISTINCT PER-NOTE d_all VALUES (per map)");
+        println!(
+            "  @0.01 rounding: max={}, min={}, mean={:.1}",
+            distinct_001.iter().copied().max().unwrap_or(0),
+            distinct_001.iter().copied().min().unwrap_or(0),
+            distinct_001.iter().sum::<usize>() as f64 / distinct_001.len() as f64
+        );
+        println!(
+            "  @0.05 rounding: max={}, min={}, mean={:.1}",
+            distinct_005.iter().copied().max().unwrap_or(0),
+            distinct_005.iter().copied().min().unwrap_or(0),
+            distinct_005.iter().sum::<usize>() as f64 / distinct_005.len() as f64
+        );
+
+        // ---------------------------------------------------------------
+        // (c) Spread of per-note d_all, pooled across all maps
+        // ---------------------------------------------------------------
+        fn percentile(sorted: &[f64], p: f64) -> f64 {
+            if sorted.is_empty() {
+                return 0.0;
+            }
+            let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+            sorted[idx.min(sorted.len() - 1)]
+        }
+
+        let mut pooled_d: Vec<f64> = rows.iter().flat_map(|r| r.per_note_d.iter().copied()).collect();
+        pooled_d.sort_by(f64::total_cmp);
+        let p50 = percentile(&pooled_d, 0.50);
+        let p90 = percentile(&pooled_d, 0.90);
+        let p99 = percentile(&pooled_d, 0.99);
+        let max_d = pooled_d.last().copied().unwrap_or(0.0);
+
+        println!("\n(c) SPREAD of per-note d_all (pooled across {} notes, {} maps)", pooled_d.len(), rows.len());
+        println!(
+            "  p50={p50:.4}  p90={p90:.4}  p99={p99:.4}  max={max_d:.4}  p90/p50={:.4}",
+            if p50 != 0.0 { p90 / p50 } else { f64::NAN }
+        );
+
+        // ---------------------------------------------------------------
+        // (d) Scale: note-count-weighted mean d_all vs final sr, per map
+        // ---------------------------------------------------------------
+        let ratios: Vec<f64> = rows
+            .iter()
+            .filter(|r| r.sr > 0.0)
+            .map(|r| r.weighted_mean_d / r.sr)
+            .collect();
+        let mut sorted_ratios = ratios.clone();
+        sorted_ratios.sort_by(f64::total_cmp);
+        let ratio_mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+        let ratio_median = sorted_ratios[sorted_ratios.len() / 2];
+        let ratio_min = sorted_ratios.first().copied().unwrap_or(f64::NAN);
+        let ratio_max = sorted_ratios.last().copied().unwrap_or(f64::NAN);
+
+        println!("\n(d) SCALE: weighted-mean(d_all) / final sr, across {} maps", ratios.len());
+        println!(
+            "  mean={ratio_mean:.4}  median={ratio_median:.4}  min={ratio_min:.4}  max={ratio_max:.4}"
+        );
+
+        // ---------------------------------------------------------------
+        // Cross-tabs by keymode and LN-share bucket
+        // ---------------------------------------------------------------
+        fn print_group_stats(label: &str, group: &[&MapReport]) {
+            if group.is_empty() {
+                println!("  {label:>7}: n=0");
+                return;
+            }
+            let total_notes: usize = group.iter().map(|r| r.n_objects).sum();
+            let total_exact: usize = group.iter().map(|r| r.exact_heads).sum();
+            let exact_frac = total_exact as f64 / total_notes as f64;
+            let max_mismatch = group.iter().map(|r| r.max_head_mismatch_ms).fold(0.0, f64::max);
+
+            let distinct_005: Vec<usize> = group
+                .iter()
+                .map(|r| distinct_count(&r.per_note_d, 0.05))
+                .collect();
+            let max_distinct = distinct_005.iter().copied().max().unwrap_or(0);
+            let min_distinct = distinct_005.iter().copied().min().unwrap_or(0);
+
+            let mut pooled: Vec<f64> = group.iter().flat_map(|r| r.per_note_d.iter().copied()).collect();
+            pooled.sort_by(f64::total_cmp);
+            let p50 = percentile(&pooled, 0.50);
+            let p90 = percentile(&pooled, 0.90);
+            let p99 = percentile(&pooled, 0.99);
+            let max_d = pooled.last().copied().unwrap_or(0.0);
+
+            let ratios: Vec<f64> = group
+                .iter()
+                .filter(|r| r.sr > 0.0)
+                .map(|r| r.weighted_mean_d / r.sr)
+                .collect();
+            let ratio_mean = ratios.iter().sum::<f64>() / ratios.len().max(1) as f64;
+            let mut sorted_ratios = ratios.clone();
+            sorted_ratios.sort_by(f64::total_cmp);
+            let ratio_median = sorted_ratios.get(sorted_ratios.len() / 2).copied().unwrap_or(f64::NAN);
+
+            println!(
+                "  {label:>7}: n={:<4} exact={:>6.2}% max_mismatch={:.4}ms  distinct@0.05[min={min_distinct},max={max_distinct}]  \
+                 d_all[p50={p50:.3},p90={p90:.3},p99={p99:.3},max={max_d:.3},p90/p50={:.3}]  ratio[mean={ratio_mean:.4},median={ratio_median:.4}]",
+                group.len(),
+                exact_frac * 100.0,
+                max_mismatch,
+                if p50 != 0.0 { p90 / p50 } else { f64::NAN }
+            );
+        }
+
+        println!("\nby keymode:");
+        let keymode_preds: [KeymodeGroup; 3] = [
+            ("4K", |k| k == 4),
+            ("7K", |k| k == 7),
+            ("other", |k| k != 4 && k != 7),
+        ];
+        for (label, pred) in keymode_preds {
+            let group: Vec<&MapReport> = rows.iter().filter(|r| pred(r.keys)).collect();
+            print_group_stats(label, &group);
+        }
+
+        println!("\nby LN-share bucket:");
+        let ln_buckets = [("<15%", 0.0, 0.15), ("15-35%", 0.15, 0.35), (">35%", 0.35, f64::INFINITY)];
+        for (label, lo, hi) in ln_buckets {
+            let group: Vec<&MapReport> = rows
+                .iter()
+                .filter(|r| r.ln_share >= lo && r.ln_share < hi)
+                .collect();
+            print_group_stats(label, &group);
+        }
+
+        println!("\nby keymode x LN-share bucket:");
+        for (kl, kpred) in keymode_preds {
+            for (ll, lo, hi) in ln_buckets {
+                let group: Vec<&MapReport> = rows
+                    .iter()
+                    .filter(|r| kpred(r.keys) && r.ln_share >= lo && r.ln_share < hi)
+                    .collect();
+                print_group_stats(&format!("{kl}/{ll}"), &group);
+            }
+        }
+    }
+
     /// The surface treats every judgement as an independent draw from a timing
     /// distribution. That assumption needs each judgement to have its own window to land
     /// in. When the gap between a release and the next press in the same column is
@@ -6269,8 +7374,9 @@ mod tests {
                 continue;
             }
 
-            // The map's own windows, no mods — the same set `reference_windows` now
-            // prices against.
+            // The map's own windows, no mods — used to bucket releases by their own
+            // map's judgement bands. `reference_windows` prices against the fixed OD
+            // 8 set by default now; this report is independent of that switch.
             let windows = hit_windows(&map, &GameMods::default(), 1.0, true);
 
             let mut by_column: Vec<Vec<Note>> = vec![Vec::new(); total_columns];
@@ -6902,7 +8008,12 @@ mod tests {
             let (mods, clock_rate) = mods_for(&point.mods);
             let attrs = calculate(&map, &mods, clock_rate, Some(false), None)?;
             let total = point.counts.iter().sum::<u32>();
-            let units = judgement_units(&attrs, f64::from(total), model);
+            let units = judgement_units(
+                &attrs,
+                f64::from(total),
+                model,
+                !per_note_difficulty_disabled(),
+            );
             let fit = fit_with_quality(&point.counts, &units, &attrs.hit_windows, model);
             (fit.skill > 0.0).then_some(fit.skill)
         }
@@ -7683,5 +8794,1176 @@ mod tests {
                  skill_exponent from this fixture set."
             ),
         }
+    }
+
+    /// A named keymode group and the predicate selecting it, for report cross-tabs.
+    type KeymodeGroup = (&'static str, fn(usize) -> bool);
+
+    /// A map's star rating, keymode, and per-note `(difficulty, hold duration if long)`.
+    type PerNoteDifficulty = (f64, usize, Vec<(f64, Option<f64>)>);
+
+    /// Per-note local difficulty for one map: `(d_all_at_head, hold_duration_ms)` per note.
+    ///
+    /// The `d_all` expression is copied from `calculate_from_data` rather than exposed by
+    /// refactoring production code, and the head lookup uses the same
+    /// `lower_bound(all_corners, head)` as `compute_switches`. That lookup is exact on
+    /// every fixture map -- 1173541/1173541 heads, max mismatch 0 ms -- so no
+    /// interpolation is involved.
+    ///
+    /// Returns `(sr, keymode, per-note (difficulty, hold duration if long))`.
+    fn per_note_difficulty(map: &Beatmap) -> Option<PerNoteDifficulty> {
+        let total_columns = map.cs.round_ties_even().max(1.0) as usize;
+        let (notes, _) = build_notes(1.0, map.hit_objects.iter(), total_columns);
+
+        if notes.len() < 2 || total_columns == 0 {
+            return None;
+        }
+
+        let windows = hit_windows(map, &GameMods::default(), 1.0, false);
+        let great_hit_window = get_hit_window_300(map, 1.0, false, false);
+        let hit_leniency = hit_leniency_from_window(great_hit_window);
+        let data = RebirthData::new(notes, total_columns, hit_leniency, windows.good);
+
+        if data.all_corners.len() < 2 {
+            return None;
+        }
+
+        let key_usage = get_key_usage(&data);
+        let active_columns: Vec<_> = (0..data.base_corners.len())
+            .map(|idx| {
+                (0..data.total_columns)
+                    .filter(|&column| key_usage[column][idx])
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let key_usage_400 = get_key_usage_400(&data);
+        let anchor = compute_anchor(&key_usage_400);
+        let (delta_by_column, jbar_base) = compute_jbar(&data);
+        let jbar = interp_values(&data.all_corners, &data.base_corners, &jbar_base);
+        let xbar_base = compute_xbar(&data, &active_columns);
+        let xbar = interp_values(&data.all_corners, &data.base_corners, &xbar_base);
+        let ln_rep = LongNoteBodyRepresentation::new(&data.long_notes, data.t_end);
+        let pbar_base = compute_pbar(&data, &ln_rep, &anchor);
+        let pbar = interp_values(&data.all_corners, &data.base_corners, &pbar_base);
+        let abar_awkwardness = compute_abar(&data, &active_columns, &delta_by_column);
+        let abar = interp_values(
+            &data.all_corners,
+            &data.awkwardness_corners,
+            &abar_awkwardness,
+        );
+        let rbar_base = compute_rbar(&data);
+        let rbar = interp_values(&data.all_corners, &data.base_corners, &rbar_base);
+        let (density_base, _density_v2_base, keys_base) =
+            compute_density_and_keys(&data, &key_usage);
+        let density = step_interp(&data.all_corners, &data.base_corners, &density_base);
+        let keys = step_interp(&data.all_corners, &data.base_corners, &keys_base);
+
+        let d_all: Vec<f64> = (0..data.all_corners.len())
+            .map(|idx| {
+                let s_all = (0.4
+                    * (abar[idx].powf(3.0 / keys[idx]) * jbar[idx].min(8.0 + 0.85 * jbar[idx]))
+                        .powf(1.5)
+                    + (1.0 - 0.4)
+                        * (abar[idx].powf(2.0 / 3.0)
+                            * (0.8 * pbar[idx] + rbar[idx] * release_density_weight(density[idx])))
+                            .powf(1.5))
+                .powf(2.0 / 3.0);
+                let t_all = (abar[idx].powf(3.0 / keys[idx]) * xbar[idx]) / (xbar[idx] + s_all + 1.0);
+
+                2.7 * s_all.powf(0.5) * t_all.powf(1.5) + s_all * 0.27
+            })
+            .collect();
+
+        let per_note: Vec<(f64, Option<f64>)> = data
+            .notes
+            .iter()
+            .map(|note| {
+                let idx = lower_bound(&data.all_corners, note.head).min(data.all_corners.len() - 1);
+
+                (d_all[idx], note.tail.map(|tail| tail - note.head))
+            })
+            .collect();
+
+        let attrs = calculate(map, &GameMods::default(), 1.0, Some(false), None)?;
+
+        Some((attrs.stars, total_columns, per_note))
+    }
+
+    /// What it costs to feed per-note difficulty into the surface, and how few bins that
+    /// needs.
+    ///
+    /// Motivation: per-note `d_all` takes 105-895 distinct values per map (mean 415 at
+    /// 0.01 rounding), so one [`JudgementUnit`] per distinct value would multiply the
+    /// fit's inner loop by two to three orders of magnitude. But the collapse is *exact*,
+    /// not approximate. With `sigma_floor = 0`,
+    ///
+    /// ```text
+    /// sigma = sigma_ref * scale * ((d + floor)/skill)^p
+    ///       = sigma_ref * ((d_eff + floor)/skill)^p,
+    ///   where d_eff = (d + floor) * scale^(1/p) - floor
+    /// ```
+    ///
+    /// so a unit's `(difficulty, sigma_scale)` pair is indistinguishable from a plain unit
+    /// at `d_eff`. Two-dimensional structure (per-note difficulty x LN hold duration) is
+    /// therefore one-dimensional per distinct `mean_offset`, of which the model has
+    /// exactly two: rice at 0 and releases at [`ErrorModel::release_mean_offset`].
+    ///
+    /// This measures whether quantising that axis into a fixed number of bins is
+    /// detectable. Ground truth is the exact per-note unit list; counts are generated from
+    /// it at a known skill, then refitted with the binned list. The error reported is in
+    /// *skill*, and in pp via the `^2.2` that skill enters pricing through, since a skill
+    /// error that survives the exponent is the only kind that matters.
+    ///
+    /// `uniform` is the shipped [`judgement_units`] behaviour -- one unit at the map's
+    /// `sr` -- and is the baseline the change has to beat.
+    ///
+    /// Run with `cargo test --release per_note_binning_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn per_note_binning_cost() {
+        use crate::mania_accuracy::{
+            expected_counts, ln_sigma_scale_for_duration, skill_for_counts, JudgementUnit,
+        };
+        use std::fs;
+        use std::time::Instant;
+
+        const BIN_COUNTS: [usize; 4] = [4, 8, 16, 32];
+        /// Bin counts swept for the candidate *attribute* representation measured below.
+        /// If its error stops falling as these rise, the residual is the mean-hold-duration
+        /// substitution rather than the difficulty binning.
+        const ATTRIBUTE_BINS: [usize; 4] = [8, 12, 16, 24];
+        const TRUE_SKILLS: [f64; 3] = [6.0, 10.0, 18.0];
+        /// Every 6th map, so the report covers the whole fixture set in a runnable time.
+        const MAP_STRIDE: usize = 6;
+
+        let model = ErrorModel::default();
+
+        // `d_eff`: the plain-unit difficulty that reproduces a scaled unit exactly.
+        let effective_difficulty = |difficulty: f64, sigma_scale: f64| -> f64 {
+            let floor = model.difficulty_floor;
+
+            ((difficulty.max(0.0) + floor) * sigma_scale.powf(1.0 / model.skill_exponent) - floor)
+                .max(0.0)
+        };
+
+        /// Exact unit list: one unit per distinct `(d_eff, mean_offset)`, weights summed.
+        /// Identical to one unit per note, but without paying for duplicates.
+        fn dedup(pairs: &[(f64, f64)]) -> Vec<JudgementUnit> {
+            let mut map: HashMap<(u64, u64), f64> = HashMap::new();
+
+            for &(d_eff, offset) in pairs {
+                *map.entry((d_eff.to_bits(), offset.to_bits())).or_insert(0.0) += 1.0;
+            }
+
+            map.into_iter()
+                .map(|((d_bits, offset_bits), weight)| JudgementUnit {
+                    difficulty: f64::from_bits(d_bits),
+                    weight,
+                    sigma_scale: 1.0,
+                    mean_offset: f64::from_bits(offset_bits),
+                })
+                .collect()
+        }
+
+        /// The candidate *attribute* representation, in units.
+        ///
+        /// Unlike [`quantile_bins`], this bins on **raw `d`** and cannot fold hold duration
+        /// into the difficulty axis, because a difficulty attribute is cached per map and
+        /// must not depend on [`ErrorModel`] parameters. So it carries, per bin, the mean
+        /// `d`, how many of the bin's notes are rice, how many are long, and the long
+        /// notes' *mean hold duration* — and the model is applied later, here, exactly as
+        /// `judgement_units` would.
+        ///
+        /// That mean duration is the second approximation under test: it stands in for
+        /// every hold in the bin, where [`quantile_bins`] knew each one exactly.
+        ///
+        /// Equal-count bins make the per-bin total implicit, so only the shape has to be
+        /// stored: `[(f64, u32, u32, f64); 12]` is 288 bytes, and this also subsumes
+        /// `ln_duration_buckets`, which becomes redundant.
+        fn attribute_shaped(
+            per_note: &[(f64, Option<f64>)],
+            bins: usize,
+            model: &ErrorModel,
+        ) -> Vec<JudgementUnit> {
+            let mut sorted: Vec<(f64, Option<f64>)> = per_note.to_vec();
+            sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+            let n = sorted.len();
+            let mut units = Vec::with_capacity(bins * 2);
+
+            for bin in 0..bins {
+                let start = bin * n / bins;
+                let end = ((bin + 1) * n / bins).max(start);
+
+                if end == start {
+                    continue;
+                }
+
+                let slice = &sorted[start..end];
+                let mean_difficulty = slice.iter().map(|&(d, _)| d).sum::<f64>() / slice.len() as f64;
+
+                let holds: Vec<f64> = slice.iter().filter_map(|&(_, hold)| hold).collect();
+                let rice = slice.len() - holds.len();
+
+                if rice > 0 {
+                    units.push(JudgementUnit::repeated(mean_difficulty, rice as f64));
+                }
+
+                if !holds.is_empty() {
+                    let mean_duration = holds.iter().sum::<f64>() / holds.len() as f64;
+
+                    units.push(JudgementUnit::long_note(
+                        mean_difficulty,
+                        holds.len() as f64,
+                        model,
+                        mean_duration,
+                    ));
+                }
+            }
+
+            units
+        }
+
+        /// Equal-count (quantile) bins on `d_eff`, one unit per bin at the bin's mean.
+        /// Applied separately per `mean_offset` population, since those cannot merge.
+        fn quantile_bins(pairs: &[(f64, f64)], bins: usize) -> Vec<JudgementUnit> {
+            let mut units = Vec::new();
+
+            for &offset in &[0.0, ErrorModel::default().release_mean_offset] {
+                let mut population: Vec<f64> = pairs
+                    .iter()
+                    .filter(|&&(_, o)| o == offset)
+                    .map(|&(d, _)| d)
+                    .collect();
+
+                if population.is_empty() {
+                    continue;
+                }
+
+                population.sort_by(f64::total_cmp);
+
+                let n = population.len();
+
+                for bin in 0..bins {
+                    let start = bin * n / bins;
+                    let end = ((bin + 1) * n / bins).max(start);
+
+                    if end == start {
+                        continue;
+                    }
+
+                    let slice = &population[start..end];
+                    let mean = slice.iter().sum::<f64>() / slice.len() as f64;
+
+                    units.push(JudgementUnit {
+                        difficulty: mean,
+                        weight: slice.len() as f64,
+                        sigma_scale: 1.0,
+                        mean_offset: offset,
+                    });
+                }
+            }
+
+            units
+        }
+
+        let Ok(entries) = fs::read_dir("local-fixtures/maps") else {
+            println!("no fixture maps present; nothing to report");
+            return;
+        };
+
+        let mut paths: Vec<_> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "osu"))
+            .collect();
+        paths.sort();
+
+        // skill errors, indexed by BIN_COUNTS position; plus the uniform baseline.
+        // Split on whether the *exact* refit recovered the skill that generated the
+        // counts: where it did not, the likelihood has saturated and every list is
+        // refitting a plateau, so a disagreement there is not a binning error.
+        let mut binned_skill_error: Vec<Vec<f64>> = vec![Vec::new(); BIN_COUNTS.len()];
+        let mut uniform_skill_error: Vec<f64> = Vec::new();
+        let mut binned_error_saturated: Vec<Vec<f64>> = vec![Vec::new(); BIN_COUNTS.len()];
+        let mut uniform_error_saturated: Vec<f64> = Vec::new();
+        let mut attribute_skill_error: Vec<Vec<f64>> = vec![Vec::new(); ATTRIBUTE_BINS.len()];
+        let mut attribute_unit_counts: Vec<Vec<f64>> = vec![Vec::new(); ATTRIBUTE_BINS.len()];
+        let mut attribute_fit_micros: Vec<Vec<f64>> = vec![Vec::new(); ATTRIBUTE_BINS.len()];
+        let mut saturated_fits = 0usize;
+        let mut identified_fits = 0usize;
+        let mut full_unit_counts: Vec<usize> = Vec::new();
+        let mut full_fit_micros: Vec<f64> = Vec::new();
+        let mut binned_fit_micros: Vec<f64> = Vec::new();
+        let mut uniform_fit_micros: Vec<f64> = Vec::new();
+        let mut maps_measured = 0usize;
+
+        for path in paths.iter().step_by(MAP_STRIDE) {
+            let Ok(bytes) = fs::read(path) else { continue };
+            let Ok(map) = Beatmap::from_bytes(&bytes) else {
+                continue;
+            };
+
+            if map.mode != GameMode::Mania {
+                continue;
+            }
+
+            let Some((sr, _keys, per_note)) = per_note_difficulty(&map) else {
+                continue;
+            };
+
+            let windows = hit_windows(&map, &GameMods::default(), 1.0, false);
+            let total = per_note.len() as f64;
+
+            // Per-note (d_eff, mean_offset). A ScoreV1 long note is one judgement whose
+            // spread is widened by hold duration, which `effective_difficulty` folds into
+            // the difficulty axis.
+            let pairs: Vec<(f64, f64)> = per_note
+                .iter()
+                .map(|&(difficulty, duration)| match duration {
+                    Some(duration) => {
+                        let scale = ln_sigma_scale_for_duration(&model, duration);
+
+                        (
+                            effective_difficulty(difficulty, scale),
+                            model.release_mean_offset,
+                        )
+                    }
+                    None => (effective_difficulty(difficulty, 1.0), 0.0),
+                })
+                .collect();
+
+            let full = dedup(&pairs);
+            let uniform = vec![JudgementUnit::repeated(sr, total)];
+            let binned: Vec<Vec<JudgementUnit>> = BIN_COUNTS
+                .iter()
+                .map(|&bins| quantile_bins(&pairs, bins))
+                .collect();
+            let attributes: Vec<Vec<JudgementUnit>> = ATTRIBUTE_BINS
+                .iter()
+                .map(|&bins| attribute_shaped(&per_note, bins, &model))
+                .collect();
+
+            for (index, units) in attributes.iter().enumerate() {
+                attribute_unit_counts[index].push(units.len() as f64);
+            }
+
+            full_unit_counts.push(full.len());
+            maps_measured += 1;
+
+            for &true_skill in &TRUE_SKILLS {
+                // Ground truth counts, generated by the exact per-note list.
+                let counts = expected_counts(&full, &windows, &model, true_skill)
+                    .round_to_hits(total as u32);
+
+                let started = Instant::now();
+                let full_skill = skill_for_counts(&counts, &full, &windows, &model);
+                full_fit_micros.push(started.elapsed().as_secs_f64() * 1e6);
+
+                // Whether the exact list recovered the skill that generated the counts. If
+                // it did not, the likelihood is flat here (see `SKILL_SATURATION_RATIO`)
+                // and no unit list can be scored against another on this point.
+                let identified = (full_skill / true_skill - 1.0).abs() <= 0.02;
+
+                if identified {
+                    identified_fits += 1;
+                } else {
+                    saturated_fits += 1;
+                }
+
+                for (index, units) in binned.iter().enumerate() {
+                    let started = Instant::now();
+                    let skill = skill_for_counts(&counts, units, &windows, &model);
+                    let elapsed = started.elapsed().as_secs_f64() * 1e6;
+
+                    if index == BIN_COUNTS.len() - 1 {
+                        binned_fit_micros.push(elapsed);
+                    }
+
+                    let error = skill / full_skill - 1.0;
+
+                    if identified {
+                        binned_skill_error[index].push(error);
+                    } else {
+                        binned_error_saturated[index].push(error);
+                    }
+                }
+
+                for (index, units) in attributes.iter().enumerate() {
+                    let started = Instant::now();
+                    let skill = skill_for_counts(&counts, units, &windows, &model);
+                    attribute_fit_micros[index].push(started.elapsed().as_secs_f64() * 1e6);
+
+                    if identified {
+                        attribute_skill_error[index].push(skill / full_skill - 1.0);
+                    }
+                }
+
+                let started = Instant::now();
+                let uniform_skill = skill_for_counts(&counts, &uniform, &windows, &model);
+                uniform_fit_micros.push(started.elapsed().as_secs_f64() * 1e6);
+
+                let uniform_error = uniform_skill / full_skill - 1.0;
+
+                if identified {
+                    uniform_skill_error.push(uniform_error);
+                } else {
+                    uniform_error_saturated.push(uniform_error);
+                }
+            }
+        }
+
+        if maps_measured == 0 {
+            println!("no mania fixture maps measured");
+            return;
+        }
+
+        fn summarise(label: &str, errors: &[f64]) {
+            let mut absolute: Vec<f64> = errors.iter().map(|error| error.abs()).collect();
+            absolute.sort_by(f64::total_cmp);
+
+            let mean_signed = errors.iter().sum::<f64>() / errors.len() as f64;
+            let percentile = |q: f64| absolute[((absolute.len() - 1) as f64 * q).round() as usize];
+            let max = *absolute.last().unwrap_or(&0.0);
+
+            // Skill enters pricing as `skill^2.2`, so this is what the error is worth.
+            let pp_max = (1.0 + max).powf(2.2) - 1.0;
+
+            println!(
+                "  {label:<12} |err| p50={:.4}%  p90={:.4}%  max={:.4}%   signed mean={:+.4}%   \
+                 max pp impact={:+.3}%",
+                percentile(0.5) * 100.0,
+                percentile(0.9) * 100.0,
+                max * 100.0,
+                mean_signed * 100.0,
+                pp_max * 100.0
+            );
+        }
+
+        fn mean(values: &[f64]) -> f64 {
+            if values.is_empty() {
+                return 0.0;
+            }
+
+            values.iter().sum::<f64>() / values.len() as f64
+        }
+
+        println!(
+            "\n{maps_measured} maps (every {MAP_STRIDE}th fixture) x {} skills, refit against \
+             counts the exact per-note unit list generated.\n",
+            TRUE_SKILLS.len()
+        );
+
+        let mut sorted_units = full_unit_counts.clone();
+        sorted_units.sort_unstable();
+
+        println!(
+            "EXACT UNIT COUNT (distinct d_eff, both offsets): min={} p50={} max={} mean={:.1}",
+            sorted_units.first().copied().unwrap_or(0),
+            sorted_units[sorted_units.len() / 2],
+            sorted_units.last().copied().unwrap_or(0),
+            mean(&full_unit_counts.iter().map(|&c| c as f64).collect::<Vec<_>>())
+        );
+
+        println!(
+            "\nSKILL ERROR vs the exact per-note fit, on the {identified_fits} points where the \
+             exact refit recovered the generating skill within 2%"
+        );
+
+        for (index, &bins) in BIN_COUNTS.iter().enumerate() {
+            summarise(&format!("{bins} bins"), &binned_skill_error[index]);
+        }
+
+        for (index, &bins) in ATTRIBUTE_BINS.iter().enumerate() {
+            summarise(&format!("attr {bins}b"), &attribute_skill_error[index]);
+        }
+
+        summarise("uniform(sr)", &uniform_skill_error);
+
+        println!(
+            "\n  attr = the shippable form: bins raw d, applies the model later, and stands one \
+             mean hold duration in for every hold in a bin."
+        );
+
+        for (index, &bins) in ATTRIBUTE_BINS.iter().enumerate() {
+            println!(
+                "    attr {bins}b: mean {:.1} units/map, {:.0}us/fit",
+                mean(&attribute_unit_counts[index]),
+                mean(&attribute_fit_micros[index])
+            );
+        }
+
+        println!(
+            "\nthe other {saturated_fits} points, where the likelihood had saturated and the exact \
+             refit did not recover its own generating skill (no list can be judged here)"
+        );
+
+        for (index, &bins) in BIN_COUNTS.iter().enumerate() {
+            if binned_error_saturated[index].is_empty() {
+                continue;
+            }
+
+            summarise(&format!("{bins} bins"), &binned_error_saturated[index]);
+        }
+
+        if !uniform_error_saturated.is_empty() {
+            summarise("uniform(sr)", &uniform_error_saturated);
+        }
+
+        println!(
+            "\nFIT COST per skill_for_counts call: exact={:.0}us  32 bins={:.0}us  \
+             uniform={:.0}us",
+            mean(&full_fit_micros),
+            mean(&binned_fit_micros),
+            mean(&uniform_fit_micros)
+        );
+    }
+
+    /// What per-note difficulty does to the fit and to pp on **real scores**.
+    ///
+    /// `per_note_binning_cost` establishes only that the two unit lists disagree, since
+    /// there the per-note list is ground truth by construction. This is the test that can
+    /// be wrong: it grades both lists against the real ppy.sb scores in
+    /// `local-fixtures/multiuser.tsv`, where the counts came from a human and neither list
+    /// is privileged.
+    ///
+    /// `g_timing` is the discriminator -- the timing-channel G statistic, measuring how far
+    /// the fitted judgement distribution lands from the observed counts. It does not grow
+    /// with map length (`per_judgement_g_falls_with_length_and_is_not_a_threshold` pins
+    /// that), so a mean over scores is meaningful, and *lower is better*.
+    ///
+    /// pp is reported separately because a fit improvement need not move pricing:
+    /// [`window_scalar`] is a *ratio* of two fits against different windows, and whatever
+    /// the unit list does to both cancels out of it. Reporting both is what distinguishes
+    /// "the model describes players better" from "players get different numbers".
+    ///
+    /// Run with
+    /// `cargo test --release per_note_difficulty_on_real_scores -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn per_note_difficulty_on_real_scores() {
+        use crate::mania_accuracy::expected_counts;
+        use crate::mania_windows::ManiaJudgement;
+
+        struct Compared {
+            map_id: String,
+            mods: String,
+            keys: u32,
+            ln_fraction: f64,
+            acc: f64,
+            /// `p90/p50` of the map's per-note difficulty, from its own bins. The width of
+            /// the distribution the change is *about*: at a ratio near 1 the two unit lists
+            /// describe the same map and nothing should move.
+            spread: f64,
+            uniform_g: f64,
+            per_note_g: f64,
+            uniform_skill: f64,
+            per_note_skill: f64,
+            uniform_scalar: f64,
+            per_note_scalar: f64,
+            uniform_plausible: bool,
+            per_note_plausible: bool,
+            bins_present: bool,
+            unit_count: usize,
+        }
+
+        let Ok(text) = std::fs::read_to_string("local-fixtures/multiuser.tsv") else {
+            println!("no fixtures present (local-fixtures/multiuser.tsv); nothing to report");
+            return;
+        };
+
+        let model = ErrorModel::default();
+        let mut rows = Vec::new();
+
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+
+            if f.len() < 18 || f[0] == "uid" {
+                continue;
+            }
+
+            let u = |s: &str| s.parse::<u32>().unwrap_or(0);
+            let counts = [u(f[7]), u(f[8]), u(f[9]), u(f[10]), u(f[11]), u(f[12])];
+            let total = counts.iter().sum::<u32>();
+
+            if total == 0 {
+                continue;
+            }
+
+            let Some(map) = parse(&format!("local-fixtures/maps/{}.osu", f[2])) else {
+                continue;
+            };
+
+            let (mods, clock_rate) = mods_for(f[3]);
+
+            // `lazer: false` -- these are stable ppy.sb scores, and getting this wrong
+            // silently reclassifies every long note's judgement regime.
+            let Some(attrs) = calculate(&map, &mods, clock_rate, Some(false), None) else {
+                continue;
+            };
+
+            let reference = reference_windows(&attrs);
+
+            // The two unit lists, from the same attributes, differing only in whether the
+            // per-note difficulty distribution is used.
+            let uniform_units = judgement_units(&attrs, f64::from(total), &model, false);
+            let per_note_units = judgement_units(&attrs, f64::from(total), &model, true);
+
+            let uniform_fit = fit_with_quality(&counts, &uniform_units, &attrs.hit_windows, &model);
+            let per_note_fit =
+                fit_with_quality(&counts, &per_note_units, &attrs.hit_windows, &model);
+            let uniform_reference = fit_with_quality(&counts, &uniform_units, &reference, &model);
+            let per_note_reference = fit_with_quality(&counts, &per_note_units, &reference, &model);
+
+            let scalar = |played: f64, reference: f64| {
+                if played > 0.0 && reference > 0.0 {
+                    played / reference
+                } else {
+                    1.0
+                }
+            };
+
+            // The per-note list must still emit weights summing to what was observed, or
+            // the fit is being handed a different score than the player played.
+            let emitted = expected_counts(&per_note_units, &attrs.hit_windows, &model, 10.0);
+            let emitted_total: f64 = ManiaJudgement::ALL
+                .iter()
+                .map(|&judgement| emitted.get(judgement))
+                .sum();
+
+            assert!(
+                (emitted_total - f64::from(total)).abs() < 1e-6,
+                "map {}: per-note units emit {emitted_total} judgements for a {total}-hit score",
+                f[2]
+            );
+
+            // Equal-count bins, so bin 14 of 16 is the p90 of the distribution and bin 8
+            // is the p50 -- the spread is readable straight off the bins.
+            let spread = attrs
+                .note_difficulty_bins
+                .map(|bins| {
+                    let p50 = bins[NOTE_DIFFICULTY_BINS / 2].difficulty;
+                    let p90 = bins[(NOTE_DIFFICULTY_BINS * 9) / 10].difficulty;
+
+                    if p50 > 0.0 {
+                        p90 / p50
+                    } else {
+                        1.0
+                    }
+                })
+                .unwrap_or(1.0);
+
+            rows.push(Compared {
+                map_id: f[2].to_owned(),
+                mods: f[3].to_owned(),
+                keys: u(f[6]),
+                ln_fraction: if attrs.n_objects > 0 {
+                    attrs.n_long_notes as f64 / attrs.n_objects as f64
+                } else {
+                    0.0
+                },
+                acc: f[13].parse().unwrap_or(0.0),
+                spread,
+                uniform_g: uniform_fit.g_timing,
+                per_note_g: per_note_fit.g_timing,
+                uniform_skill: uniform_fit.skill,
+                per_note_skill: per_note_fit.skill,
+                uniform_scalar: scalar(uniform_fit.skill, uniform_reference.skill),
+                per_note_scalar: scalar(per_note_fit.skill, per_note_reference.skill),
+                uniform_plausible: uniform_fit.is_plausible(),
+                per_note_plausible: per_note_fit.is_plausible(),
+                bins_present: attrs.note_difficulty_bins.is_some(),
+                unit_count: per_note_units.len(),
+            });
+        }
+
+        if rows.is_empty() {
+            println!("no fixture scores loaded");
+            return;
+        }
+
+        fn median(values: &[f64]) -> f64 {
+            if values.is_empty() {
+                return f64::NAN;
+            }
+
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+
+            sorted[sorted.len() / 2]
+        }
+
+        fn mean(values: &[f64]) -> f64 {
+            if values.is_empty() {
+                return f64::NAN;
+            }
+
+            values.iter().sum::<f64>() / values.len() as f64
+        }
+
+        /// Fit quality and pricing for one group, both ways.
+        fn report(label: &str, group: &[&Compared]) {
+            if group.is_empty() {
+                return;
+            }
+
+            let uniform_g: Vec<f64> = group
+                .iter()
+                .map(|row| row.uniform_g)
+                .filter(|g| g.is_finite())
+                .collect();
+            let per_note_g: Vec<f64> = group
+                .iter()
+                .map(|row| row.per_note_g)
+                .filter(|g| g.is_finite())
+                .collect();
+
+            // Per-score, so an improvement is not an artefact of one group mean moving.
+            let improved = group
+                .iter()
+                .filter(|row| row.per_note_g.is_finite() && row.uniform_g.is_finite())
+                .filter(|row| row.per_note_g < row.uniform_g)
+                .count();
+            let comparable = group
+                .iter()
+                .filter(|row| row.per_note_g.is_finite() && row.uniform_g.is_finite())
+                .count();
+
+            let scalar_delta: Vec<f64> = group
+                .iter()
+                .filter(|row| row.uniform_scalar > 0.0)
+                .map(|row| row.per_note_scalar / row.uniform_scalar - 1.0)
+                .collect();
+            // pp moves as scalar^2.2, since the scalar multiplies fitted skill.
+            let pp_delta: Vec<f64> = scalar_delta
+                .iter()
+                .map(|delta| (1.0 + delta).powf(2.2) - 1.0)
+                .collect();
+            let skill_delta: Vec<f64> = group
+                .iter()
+                .filter(|row| row.uniform_skill > 0.0)
+                .map(|row| row.per_note_skill / row.uniform_skill - 1.0)
+                .collect();
+
+            println!(
+                "  {label:<18} n={:<4} g_timing mean {:>7.2} -> {:>7.2}  median {:>6.2} -> {:>6.2}  \
+                 improved {improved}/{comparable}",
+                group.len(),
+                mean(&uniform_g),
+                mean(&per_note_g),
+                median(&uniform_g),
+                median(&per_note_g),
+            );
+            println!(
+                "  {:<18}      skill {:+.2}% median   scalar {:+.3}% median   pp {:+.2}% median, \
+                 {:+.2}% mean   plausible {} -> {}",
+                "",
+                median(&skill_delta) * 100.0,
+                median(&scalar_delta) * 100.0,
+                median(&pp_delta) * 100.0,
+                mean(&pp_delta) * 100.0,
+                group.iter().filter(|row| row.uniform_plausible).count(),
+                group.iter().filter(|row| row.per_note_plausible).count(),
+            );
+        }
+
+        let missing_bins = rows.iter().filter(|row| !row.bins_present).count();
+
+        println!(
+            "\n{} real scores, {} carrying a per-note distribution ({missing_bins} fell back to \
+             uniform). Per-note lists average {:.1} units/score.",
+            rows.len(),
+            rows.len() - missing_bins,
+            mean(&rows.iter().map(|row| row.unit_count as f64).collect::<Vec<_>>())
+        );
+        println!("\ng_timing: lower is better. pp delta is per-note relative to uniform.\n");
+
+        let all: Vec<&Compared> = rows.iter().collect();
+        report("all", &all);
+
+        println!();
+
+        for (label, keys) in [("4K", 4u32), ("7K", 7)] {
+            let group: Vec<&Compared> = rows.iter().filter(|row| row.keys == keys).collect();
+            report(label, &group);
+        }
+
+        println!();
+
+        // The axis the change is expected to act on: per-note spread is widest on rice
+        // charts (p90/p50 1.64) and narrowest on LN-saturated ones (1.21), so if the
+        // mechanism is real the two ends should not move alike.
+        for (label, low, high) in [
+            ("LN <15%", 0.0, 0.15),
+            ("LN 15-35%", 0.15, 0.35),
+            ("LN >35%", 0.35, 1.01),
+        ] {
+            let group: Vec<&Compared> = rows
+                .iter()
+                .filter(|row| row.ln_fraction >= low && row.ln_fraction < high)
+                .collect();
+            report(label, &group);
+        }
+
+        println!();
+
+        // The falsification test. A per-note list has ~23 units against uniform's 1, so it
+        // predicts a smoother judgement distribution and could post a lower `g_timing` for
+        // that reason alone, with no bearing on whether per-note difficulty is real. If the
+        // mechanism *is* real the gain has to track the width of the distribution being
+        // resolved: near-uniform maps must not move, and the widest must move most. A flat
+        // profile down this table means the improvement is a smoothing artefact.
+        for (label, low, high) in [
+            ("spread <1.2", 0.0, 1.2),
+            ("spread 1.2-1.5", 1.2, 1.5),
+            ("spread 1.5-2.0", 1.5, 2.0),
+            ("spread >2.0", 2.0, f64::INFINITY),
+        ] {
+            let group: Vec<&Compared> = rows
+                .iter()
+                .filter(|row| row.spread >= low && row.spread < high)
+                .collect();
+            report(label, &group);
+        }
+
+        // The regressions, since the LN group's mean got worse while its median improved.
+        let mut worst: Vec<&Compared> = rows
+            .iter()
+            .filter(|row| row.per_note_g.is_finite() && row.uniform_g.is_finite())
+            .collect();
+        worst.sort_by(|a, b| {
+            (b.per_note_g - b.uniform_g).total_cmp(&(a.per_note_g - a.uniform_g))
+        });
+
+        println!("\nWORST 10 REGRESSIONS (g_timing rose most)");
+        println!(
+            "  {:>8} {:>9} {:>3} {:>6} {:>7} {:>7} {:>8} {:>8} {:>7}",
+            "map", "mods", "k", "LN%", "spread", "acc%", "g unif", "g pnote", "skill%"
+        );
+
+        for row in worst.iter().take(10) {
+            println!(
+                "  {:>8} {:>9} {:>3} {:>6.1} {:>7.3} {:>7.2} {:>8.2} {:>8.2} {:>+7.2}",
+                row.map_id,
+                if row.mods.is_empty() { "-" } else { &row.mods },
+                row.keys,
+                row.ln_fraction * 100.0,
+                row.spread,
+                row.acc,
+                row.uniform_g,
+                row.per_note_g,
+                if row.uniform_skill > 0.0 {
+                    (row.per_note_skill / row.uniform_skill - 1.0) * 100.0
+                } else {
+                    0.0
+                }
+            );
+        }
+
+        println!("\nBEST 10 IMPROVEMENTS (g_timing fell most)");
+
+        for row in worst.iter().rev().take(10) {
+            println!(
+                "  {:>8} {:>9} {:>3} {:>6.1} {:>7.3} {:>7.2} {:>8.2} {:>8.2} {:>+7.2}",
+                row.map_id,
+                if row.mods.is_empty() { "-" } else { &row.mods },
+                row.keys,
+                row.ln_fraction * 100.0,
+                row.spread,
+                row.acc,
+                row.uniform_g,
+                row.per_note_g,
+                if row.uniform_skill > 0.0 {
+                    (row.per_note_skill / row.uniform_skill - 1.0) * 100.0
+                } else {
+                    0.0
+                }
+            );
+        }
+    }
+
+    /// Which of the three things per-note difficulty changes at once is doing the work.
+    ///
+    /// `per_note_difficulty_on_real_scores` shows `g_timing` swinging by an order of
+    /// magnitude in both directions while fitted skill barely moves, and rules out the
+    /// obvious explanation: per-map spread is under 1.2 on 126 of 143 scores, far too tight
+    /// to account for it. So the mechanism is not the one the change was named after, and
+    /// three candidates are confounded in the shipped comparison:
+    ///
+    /// 1. **Level.** Note-weighted mean per-note difficulty is 0.95x `stars`, so every unit
+    ///    moves down together. Pure gauge — `skill` should absorb it exactly.
+    /// 2. **Spread.** Within-map heterogeneity of difficulty. Real but tight.
+    /// 3. **LN-vs-rice difficulty.** The uniform path prices a long note at `stars`, the
+    ///    same as a plain note, and separates the two populations *only* by sigma width. The
+    ///    per-note path gives each long note its own bin's difficulty. If long notes sit
+    ///    systematically higher or lower in a map's difficulty distribution than its plain
+    ///    notes, this is a repricing of the LN population that nothing in the shipped
+    ///    comparison separates from (2).
+    ///
+    /// Each variant below switches on exactly one of those, against the same scores and the
+    /// same fit, so the columns are attributable.
+    ///
+    /// Run with
+    /// `cargo test --release per_note_mechanism_decomposition -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn per_note_mechanism_decomposition() {
+        let Ok(text) = std::fs::read_to_string("local-fixtures/multiuser.tsv") else {
+            println!("no fixtures present (local-fixtures/multiuser.tsv); nothing to report");
+            return;
+        };
+
+        let model = ErrorModel::default();
+
+        struct Variant {
+            label: &'static str,
+            g_timing: Vec<f64>,
+            skill: Vec<f64>,
+            plausible: usize,
+        }
+
+        // Column order matters: each adds one mechanism to the one before it.
+        let mut variants = vec![
+            Variant { label: "uniform(stars)", g_timing: Vec::new(), skill: Vec::new(), plausible: 0 },
+            Variant { label: "+level only", g_timing: Vec::new(), skill: Vec::new(), plausible: 0 },
+            Variant { label: "+LN difficulty", g_timing: Vec::new(), skill: Vec::new(), plausible: 0 },
+            Variant { label: "+spread (full)", g_timing: Vec::new(), skill: Vec::new(), plausible: 0 },
+        ];
+
+        let mut ln_higher = 0usize;
+        let mut ln_lower = 0usize;
+        let mut ln_ratios: Vec<f64> = Vec::new();
+        let mut scored = 0usize;
+
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+
+            if f.len() < 18 || f[0] == "uid" {
+                continue;
+            }
+
+            let u = |s: &str| s.parse::<u32>().unwrap_or(0);
+            let counts = [u(f[7]), u(f[8]), u(f[9]), u(f[10]), u(f[11]), u(f[12])];
+            let total = counts.iter().sum::<u32>();
+
+            if total == 0 {
+                continue;
+            }
+
+            let Some(map) = parse(&format!("local-fixtures/maps/{}.osu", f[2])) else {
+                continue;
+            };
+
+            let (mods, clock_rate) = mods_for(f[3]);
+
+            let Some(attrs) = calculate(&map, &mods, clock_rate, Some(false), None) else {
+                continue;
+            };
+
+            let Some(bins) = attrs.note_difficulty_bins else {
+                continue;
+            };
+
+            let binned: f64 = bins.iter().map(|bin| f64::from(bin.rice + bin.long)).sum();
+
+            if binned <= 0.0 {
+                continue;
+            }
+
+            let per_unit = f64::from(total) / binned;
+            let weighted_mean = bins
+                .iter()
+                .map(|bin| bin.difficulty * f64::from(bin.rice + bin.long))
+                .sum::<f64>()
+                / binned;
+
+            // Mean difficulty of the map's long notes against its plain notes, which is the
+            // quantity mechanism (3) turns on.
+            let long_weight: f64 = bins.iter().map(|bin| f64::from(bin.long)).sum();
+            let rice_weight: f64 = bins.iter().map(|bin| f64::from(bin.rice)).sum();
+
+            if long_weight > 0.0 && rice_weight > 0.0 {
+                let long_mean = bins
+                    .iter()
+                    .map(|bin| bin.difficulty * f64::from(bin.long))
+                    .sum::<f64>()
+                    / long_weight;
+                let rice_mean = bins
+                    .iter()
+                    .map(|bin| bin.difficulty * f64::from(bin.rice))
+                    .sum::<f64>()
+                    / rice_weight;
+
+                if rice_mean > 0.0 {
+                    ln_ratios.push(long_mean / rice_mean);
+
+                    if long_mean > rice_mean {
+                        ln_higher += 1;
+                    } else {
+                        ln_lower += 1;
+                    }
+                }
+            }
+
+            let combined_long_notes = attrs.ln_judged_as_one && !ln_split_disabled();
+
+            // (0) Shipped fallback: one difficulty for everything, LN separated by width
+            // only, via the duration histogram.
+            let uniform = judgement_units(&attrs, f64::from(total), &model, false);
+
+            // (1) Level only: the same list, moved to the note-weighted mean difficulty.
+            // Isolates the 0.95x shift, which `skill` should absorb and nothing else.
+            let level: Vec<JudgementUnit> = uniform
+                .iter()
+                .map(|unit| JudgementUnit {
+                    difficulty: weighted_mean,
+                    ..*unit
+                })
+                .collect();
+
+            // (2) Level + LN difficulty: every unit still at one difficulty, except long
+            // notes, which move to the mean difficulty of the map's *long* notes. Adds
+            // mechanism (3) without any within-map spread.
+            let mut ln_difficulty = Vec::with_capacity(2 + LN_DURATION_BUCKETS);
+
+            {
+                let long_mean = if long_weight > 0.0 {
+                    bins.iter()
+                        .map(|bin| bin.difficulty * f64::from(bin.long))
+                        .sum::<f64>()
+                        / long_weight
+                } else {
+                    weighted_mean
+                };
+                let rice_mean = if rice_weight > 0.0 {
+                    bins.iter()
+                        .map(|bin| bin.difficulty * f64::from(bin.rice))
+                        .sum::<f64>()
+                        / rice_weight
+                } else {
+                    weighted_mean
+                };
+
+                if rice_weight > 0.0 {
+                    ln_difficulty.push(JudgementUnit::repeated(rice_mean, rice_weight * per_unit));
+                }
+
+                if long_weight > 0.0 {
+                    // Mean hold duration over the whole map, so duration resolution is the
+                    // same as the uniform path's rather than better.
+                    let hold_weight: f64 = bins
+                        .iter()
+                        .filter(|bin| bin.mean_duration > 0.0)
+                        .map(|bin| f64::from(bin.long))
+                        .sum();
+                    let mean_duration = if hold_weight > 0.0 {
+                        bins.iter()
+                            .filter(|bin| bin.mean_duration > 0.0)
+                            .map(|bin| bin.mean_duration * f64::from(bin.long))
+                            .sum::<f64>()
+                            / hold_weight
+                    } else {
+                        0.0
+                    };
+
+                    if combined_long_notes && mean_duration > 0.0 {
+                        ln_difficulty.push(JudgementUnit::long_note(
+                            long_mean,
+                            long_weight * per_unit,
+                            &model,
+                            mean_duration,
+                        ));
+                    } else {
+                        ln_difficulty
+                            .push(JudgementUnit::repeated(long_mean, long_weight * per_unit));
+                    }
+                }
+            }
+
+            // (3) The shipped per-note list: adds within-map spread on top.
+            let full = judgement_units(&attrs, f64::from(total), &model, true);
+
+            for (index, units) in [uniform, level, ln_difficulty, full].iter().enumerate() {
+                if units.is_empty() {
+                    continue;
+                }
+
+                let fit = fit_with_quality(&counts, units, &attrs.hit_windows, &model);
+
+                if fit.g_timing.is_finite() {
+                    variants[index].g_timing.push(fit.g_timing);
+                }
+
+                variants[index].skill.push(fit.skill);
+
+                if fit.is_plausible() {
+                    variants[index].plausible += 1;
+                }
+            }
+
+            scored += 1;
+        }
+
+        if scored == 0 {
+            println!("no fixture scores loaded");
+            return;
+        }
+
+        fn mean(values: &[f64]) -> f64 {
+            if values.is_empty() {
+                return f64::NAN;
+            }
+
+            values.iter().sum::<f64>() / values.len() as f64
+        }
+
+        fn median(values: &[f64]) -> f64 {
+            if values.is_empty() {
+                return f64::NAN;
+            }
+
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+
+            sorted[sorted.len() / 2]
+        }
+
+        println!("\n{scored} scores. Each row adds one mechanism to the row above it.\n");
+        println!(
+            "  {:<16} {:>10} {:>10} {:>12} {:>12}",
+            "variant", "g mean", "g median", "skill median", "plausible"
+        );
+
+        let baseline_skill = median(&variants[0].skill);
+
+        for variant in &variants {
+            println!(
+                "  {:<16} {:>10.2} {:>10.2} {:>12.3} {:>9}/{}",
+                variant.label,
+                mean(&variant.g_timing),
+                median(&variant.g_timing),
+                median(&variant.skill),
+                variant.plausible,
+                scored,
+            );
+        }
+
+        println!(
+            "\n  (baseline median skill {baseline_skill:.3}; a variant that only rescales \
+             difficulty moves skill and leaves g_timing alone)"
+        );
+
+        println!(
+            "\nLN-vs-RICE DIFFICULTY, the quantity mechanism (3) turns on:\n  \
+             {} of {} maps with both populations put long notes at HIGHER mean difficulty than \
+             plain notes, {} lower. Ratio: median {:.4}, mean {:.4}, min {:.4}, max {:.4}",
+            ln_higher,
+            ln_higher + ln_lower,
+            ln_lower,
+            median(&ln_ratios),
+            mean(&ln_ratios),
+            ln_ratios.iter().copied().fold(f64::INFINITY, f64::min),
+            ln_ratios.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        );
     }
 }

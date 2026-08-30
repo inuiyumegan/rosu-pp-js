@@ -431,6 +431,45 @@ pub struct ErrorModel {
     /// dropped-input rate, and read the result as a population statement rather
     /// than a claim about any one score.
     pub slip_rate: f64,
+    /// The mean timing offset, in ms, of a long-note release judgement. Positive
+    /// means late.
+    ///
+    /// Every other field in this struct is a *width*: it scales `sigma`, and a
+    /// change in fitted skill can always undo a pure scaling, which is exactly why
+    /// [`Self::sigma_floor`] turned out to be unidentifiable. A release is not a
+    /// wider press, it is a different motor act — the press is cued by the beat and
+    /// timed against it, but the release is cued by the hold *ending*, which the
+    /// player tracks less precisely and tends to let run long. That gives it a
+    /// systematic lateness a press does not have, and lateness is a shift in the
+    /// mean of the error distribution, not a change in its spread.
+    ///
+    /// **Why this is identifiable where the widths are not.** Skill enters the model
+    /// only through `sigma(d, skill)`; it multiplies spread and cannot move a mean.
+    /// So a nonzero mean here changes the *shape* of the release population relative
+    /// to the press population — pushing PERFECTs to GREATs and GREATs to GOODs on
+    /// one side of the window while doing nothing on the other — in a way no
+    /// per-score skill fit can absorb by scaling. It is visible to the counts
+    /// specifically as an asymmetry that a symmetric width parameter cannot produce.
+    ///
+    /// **`8.0` is an unfitted starting guess**, chosen as roughly half the PERFECT
+    /// window (16 ms in the classic scheme, flat across OD), not a measured value.
+    /// It only reaches the model through long-note units — see
+    /// [`JudgementUnit::mean_offset`] and [`JudgementUnit::long_note`] — so rice notes
+    /// are untouched.
+    ///
+    /// **Measured, and deliberately left unfitted.** Sweeping it over `0/4/8/16` on the
+    /// 143-score multiuser set halves the *reference-side* median fit on maps above 60%
+    /// long notes (`g_timing` 66.6 to 34.0 at `16.0`), so the late-release mechanism is
+    /// real and the counts can see it. But the *played-side* fit does not move at all
+    /// (40.95 at every value, on both that cohort and the low-OD 7K one), and pp is
+    /// priced on the played side. The whole gain therefore lands in the denominator of
+    /// `window_scalar`'s `played.skill / reference.skill`, which *lowers* pp on exactly
+    /// the maps the offset was meant to raise — a ratio artefact, not a modelling error.
+    ///
+    /// So this value must not be calibrated until pp stops reading a ratio: any number
+    /// fitted now is fitted to that artefact. Read the sweep as evidence about the
+    /// *mechanism*, not as a reason to pick a constant.
+    pub release_mean_offset: f64,
 }
 
 impl Default for ErrorModel {
@@ -448,6 +487,7 @@ impl Default for ErrorModel {
             short_hold_penalty: 0.0,
             short_hold_scale: 120.0,
             slip_rate: 0.0,
+            release_mean_offset: 8.0,
         }
     }
 }
@@ -494,6 +534,58 @@ impl ErrorModel {
         let ratio = self.lapse_ratio.max(1.0);
 
         (1.0 - weight) * tail(bound, sigma) + weight * tail(bound, sigma * ratio)
+    }
+
+    /// As [`Self::exceedance`], but for an error distribution shifted by a mean
+    /// `mu` rather than centred at zero: the probability that a release lands
+    /// outside `[-bound, +bound]` when its offset is drawn from `N(mu, sigma)`.
+    ///
+    /// **The algebra.** Write `Z = X - mu`, so `Z ~ N(0, sigma)` and
+    /// [`one_sided_tail`] gives `P(Z > x)` directly. Then
+    ///
+    /// ```text
+    /// P(X > bound)  = P(Z > bound - mu)         = one_sided_tail(bound - mu, sigma)
+    /// P(X < -bound) = P(Z < -bound - mu)
+    ///               = P(-Z > bound + mu)         (negate both sides)
+    ///               = P(Z > bound + mu)           (Z is symmetric about 0)
+    ///               = one_sided_tail(bound + mu, sigma)
+    /// ```
+    ///
+    /// so the two-sided tail is `one_sided_tail(bound - mu, sigma) + one_sided_tail(bound
+    /// + mu, sigma)`. At `mu = 0` both terms equal `one_sided_tail(bound, sigma)`, and
+    /// their sum is `2 * one_sided_tail(bound, sigma) = tail(bound, sigma)` by
+    /// [`one_sided_tail`]'s own definition — exactly [`Self::exceedance`]'s zero-mean
+    /// case. Callers take that equivalence on faith and call [`Self::exceedance`]
+    /// directly when `mu == 0.0`, rather than routing through here, so that the
+    /// zero-offset path is bit-for-bit whatever it was before this function existed.
+    ///
+    /// The offset is applied to *both* mixture components with the same `mu`: a lapse
+    /// is still a release, cued by the same hold ending, so there is no reason its
+    /// mean should differ from the core component's.
+    fn exceedance_with_offset(&self, bound: f64, sigma: f64, mu: f64) -> f64 {
+        if mu == 0.0 {
+            return self.exceedance(bound, sigma);
+        }
+
+        // Mirrors `tail`'s own guard: a non-positive bound is a zero-width window,
+        // which nothing lands inside of, however the distribution is shifted. Left
+        // unguarded, the two-term sum below can exceed 1 for a negative bound, which
+        // never occurs on a real hit window but is worth clamping defensively.
+        if bound <= 0.0 {
+            return 1.0;
+        }
+
+        let two_sided = |s: f64| one_sided_tail(bound - mu, s) + one_sided_tail(bound + mu, s);
+
+        let weight = self.lapse_weight.clamp(0.0, 1.0);
+
+        if weight <= 0.0 {
+            return two_sided(sigma);
+        }
+
+        let ratio = self.lapse_ratio.max(1.0);
+
+        (1.0 - weight) * two_sided(sigma) + weight * two_sided(sigma * ratio)
     }
 }
 
@@ -560,6 +652,53 @@ fn tail(bound: f64, sigma: f64) -> f64 {
     erfc(bound / (sigma * std::f64::consts::SQRT_2))
 }
 
+/// The probability that a zero-mean normal with standard deviation `sigma`
+/// exceeds `x` — not in absolute value, unlike [`tail`].
+///
+/// `x` may be negative. This is needed by
+/// [`ErrorModel::exceedance_with_offset`], where a window bound shifted by a
+/// release's mean offset can land on either side of zero even though the
+/// window itself never does. [`crate::mania_accuracy::erfc`] is a true
+/// complementary error function (correct for negative arguments, not just
+/// mirrored around a `bound <= 0` guard the way [`tail`] is), so this is a
+/// thin wrapper rather than a second approximation:
+///
+/// ```text
+/// P(Z > x) = 1 - Phi(x / sigma) = 0.5 * erfc(x / (sigma * sqrt(2)))
+/// ```
+///
+/// For `x > 0` and finite positive `sigma`, `tail(x, sigma) == 2.0 *
+/// one_sided_tail(x, sigma)`: the two-sided tail is exactly the sum of the two
+/// one-sided tails at `x` and `-x`, and by `erfc`'s symmetry those two terms
+/// are equal.
+fn one_sided_tail(x: f64, sigma: f64) -> f64 {
+    if x.is_infinite() {
+        return if x > 0.0 { 0.0 } else { 1.0 };
+    }
+
+    if sigma.is_infinite() {
+        // An infinitely wide distribution places no more than half its mass on
+        // either side of any finite point — the same convention `tail` uses,
+        // where the two-sided version of this (`1.0`) means "assume everything
+        // escapes", i.e. certain miss.
+        return 0.5;
+    }
+
+    // Zero (or degenerate) spread means a point mass at 0: certain to be found
+    // on whichever side of `x` contains the origin.
+    if sigma.is_nan() || sigma <= 0.0 {
+        return if x > 0.0 {
+            0.0
+        } else if x < 0.0 {
+            1.0
+        } else {
+            0.5
+        };
+    }
+
+    0.5 * erfc(x / (sigma * std::f64::consts::SQRT_2))
+}
+
 /// The complementary error function, via the Numerical Recipes rational
 /// approximation.
 ///
@@ -597,11 +736,12 @@ pub fn judgement_probabilities(
     difficulty: f64,
     skill: f64,
 ) -> JudgementProbabilities {
-    judgement_probabilities_scaled(windows, model, difficulty, skill, 1.0)
+    judgement_probabilities_scaled(windows, model, difficulty, skill, 1.0, 0.0)
 }
 
 /// As [`judgement_probabilities`], with the unit's timing spread multiplied by
-/// `sigma_scale`.
+/// `sigma_scale` and its error distribution's mean shifted by `mean_offset` ms
+/// (positive = late).
 ///
 /// The scale exists for judgement units whose spread differs from a plain note's
 /// by a factor *derived from the map*, not fitted: a ScoreV1 long note, whose head
@@ -609,12 +749,18 @@ pub fn judgement_probabilities(
 /// at `sqrt(2)`. Because it multiplies sigma rather than replacing it, the unit
 /// still tracks `difficulty / skill`, so nothing becomes unrepresentable at high
 /// skill the way a fixed sigma floor would.
+///
+/// `mean_offset` is unrelated to `sigma_scale` and is *not* multiplied by it: a
+/// release's lateness is a fixed number of milliseconds
+/// ([`ErrorModel::release_mean_offset`]), not a fraction of its spread, so the two
+/// travel independently — see [`JudgementUnit::mean_offset`].
 pub fn judgement_probabilities_scaled(
     windows: &ManiaHitWindows,
     model: &ErrorModel,
     difficulty: f64,
     skill: f64,
     sigma_scale: f64,
+    mean_offset: f64,
 ) -> JudgementProbabilities {
     // A non-positive or NaN scale would silently turn a hard unit into a free one,
     // so it is treated as "no scaling" rather than propagated.
@@ -622,6 +768,14 @@ pub fn judgement_probabilities_scaled(
         sigma_scale
     } else {
         1.0
+    };
+
+    // A non-finite offset is treated as "no shift" rather than propagated, for the
+    // same reason: it must not silently turn into a NaN that poisons every band.
+    let mu = if mean_offset.is_finite() {
+        mean_offset
+    } else {
+        0.0
     };
 
     let sigma = model.sigma(difficulty, skill) * scale;
@@ -632,7 +786,7 @@ pub fn judgement_probabilities_scaled(
 
     for judgement in ManiaJudgement::ALL {
         let (_, upper) = windows.band(judgement);
-        let outside = model.exceedance(upper, sigma).min(remaining);
+        let outside = model.exceedance_with_offset(upper, sigma, mu).min(remaining);
         // Bands are nested, so each judgement claims the mass that falls inside
         // its window but outside every tighter one. Differencing tails rather
         // than cumulatives keeps the sub-PERFECT judgements accurate at high
@@ -757,6 +911,15 @@ pub struct JudgementUnit {
     /// read off the map's own structure, never fitted to the score — see
     /// [`Self::long_note`].
     pub sigma_scale: f64,
+    /// A shift, in ms, applied to this unit's error distribution mean (positive =
+    /// late).
+    ///
+    /// Zero for an ordinary note. [`ErrorModel::release_mean_offset`] for a ScoreV1
+    /// long note — see [`Self::long_note`]. Unlike [`Self::sigma_scale`] this is
+    /// never itself scaled by `sigma_scale`: a release's lateness is a fixed
+    /// millisecond offset, not a fraction of the unit's spread, so a duration bucket
+    /// that widens `sigma_scale` does not also widen this.
+    pub mean_offset: f64,
 }
 
 /// How much wider a ScoreV1 long note's effective timing spread is than a plain
@@ -884,6 +1047,7 @@ impl JudgementUnit {
             difficulty,
             weight: 1.0,
             sigma_scale: 1.0,
+            mean_offset: 0.0,
         }
     }
 
@@ -893,20 +1057,24 @@ impl JudgementUnit {
             difficulty,
             weight: count,
             sigma_scale: 1.0,
+            mean_offset: 0.0,
         }
     }
 
     /// `count` ScoreV1 long-note judgements of the given local difficulty, widened
-    /// for the model's release asymmetry.
+    /// for the model's release asymmetry and shifted by its release lateness.
     ///
-    /// Takes the model rather than a bare scale so the release ratio cannot drift
-    /// apart from the one the fit is using. `duration_ms` is how long the hold lasts in
-    /// map time, which decides how much of the short-hold surcharge it pays.
+    /// Takes the model rather than bare numbers so neither the release ratio nor the
+    /// mean offset can drift apart from the ones the fit is using. `duration_ms` is
+    /// how long the hold lasts in map time, which decides how much of the
+    /// short-hold surcharge the *width* pays — [`ErrorModel::release_mean_offset`]
+    /// is not duration-dependent, so it applies in full regardless of hold length.
     pub fn long_note(difficulty: f64, count: f64, model: &ErrorModel, duration_ms: f64) -> Self {
         Self {
             difficulty,
             weight: count,
             sigma_scale: ln_sigma_scale_for_duration(model, duration_ms),
+            mean_offset: model.release_mean_offset,
         }
     }
 
@@ -935,6 +1103,7 @@ pub fn expected_counts(
             unit.difficulty,
             skill,
             unit.sigma_scale,
+            unit.mean_offset,
         );
 
         for judgement in ManiaJudgement::ALL {
@@ -1493,7 +1662,7 @@ mod tests {
 
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let probabilities =
-                judgement_probabilities_scaled(&windows, &model, 6.0, 7.0, bad);
+                judgement_probabilities_scaled(&windows, &model, 6.0, 7.0, bad, 0.0);
 
             assert_eq!(
                 probabilities.get(ManiaJudgement::Perfect),
@@ -1501,6 +1670,69 @@ mod tests {
                 "a {bad} scale must fall back to no scaling, not a free PERFECT"
             );
         }
+    }
+
+    /// `release_mean_offset: 0.0` must reproduce, bit-for-bit, whatever
+    /// [`expected_counts`] computed before the offset existed.
+    ///
+    /// This is the regression guard for [`ErrorModel::exceedance_with_offset`]: the
+    /// zero-offset branch short-circuits to [`ErrorModel::exceedance`] rather than
+    /// going through the two-`one_sided_tail`-term algebra, specifically so that a
+    /// mixture with a hundredth-of-an-ulp rounding difference from the sum-of-two-halves
+    /// path can never appear when the offset is off. The right-hand side here is
+    /// built by hand from the *pre-offset* nested-tail loop — differencing
+    /// `model.exceedance(upper, sigma)` directly, with no `mu` term anywhere — so
+    /// this test would fail if that short-circuit were ever removed, even though the
+    /// algebra it replaces is mathematically equal at `mu = 0`.
+    #[test]
+    fn zero_release_offset_is_bit_identical_to_the_old_path() {
+        let windows = od9_windows();
+        let model = ErrorModel {
+            release_mean_offset: 0.0,
+            ..ErrorModel::default()
+        };
+        let scale = ln_sigma_scale_for_duration(&model, 150.0);
+
+        let units = [
+            JudgementUnit::repeated(6.0, 300.0),
+            JudgementUnit::long_note(6.0, 700.0, &model, 150.0),
+        ];
+
+        let skill = 6.3;
+        let actual = expected_counts(&units, &windows, &model, skill).as_array();
+
+        // The old algorithm, spelled out independently: no `mu`, no
+        // `exceedance_with_offset`, just the original nested-tail loop over
+        // `model.exceedance`.
+        let old_probabilities = |difficulty: f64, sigma_scale: f64| -> [f64; 6] {
+            let sigma = model.sigma(difficulty, skill) * sigma_scale;
+            let mut probabilities = [0.0; 6];
+            let mut remaining = 1.0;
+
+            for judgement in ManiaJudgement::ALL {
+                let (_, upper) = windows.band(judgement);
+                let outside = model.exceedance(upper, sigma).min(remaining);
+                probabilities[judgement as usize] = remaining - outside;
+                remaining = outside;
+            }
+
+            probabilities
+        };
+
+        let mut expected = [0.0; 6];
+
+        for (difficulty, weight, unit_scale) in [(6.0, 300.0, 1.0), (6.0, 700.0, scale)] {
+            let probabilities = old_probabilities(difficulty, unit_scale);
+
+            for judgement in ManiaJudgement::ALL {
+                expected[judgement as usize] += weight * probabilities[judgement as usize];
+            }
+        }
+
+        assert_eq!(
+            actual, expected,
+            "mu = 0.0 must be bit-for-bit identical to the pre-offset code path"
+        );
     }
 
     #[test]
