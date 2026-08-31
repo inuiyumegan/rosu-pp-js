@@ -31,3 +31,10 @@ lto = true
 panic = "abort"
 codegen-units = 1
 strip = true
+
+# The mania calibration tests are numerical fits over ~1200 real scores, which is
+# hours in an unoptimized build and minutes here. Kept separate from
+# `[profile.release]` so the shipped wasm artifact is unaffected, and without `lto`
+# so the compile step itself stays quick.
+[profile.test]
+opt-level = 3

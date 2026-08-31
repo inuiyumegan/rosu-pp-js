@@ -414,6 +414,21 @@ pub fn calculate_performance(
     mods: &GameMods,
     state: SunnyScoreState,
 ) -> SunnyManiaPerformanceAttributes {
+    calculate_performance_with_model(attrs, mods, state, &ErrorModel::default())
+}
+
+/// [`calculate_performance`] under an explicit [`ErrorModel`].
+///
+/// The model reaches pp only through [`window_scalar`], so this differs from the
+/// public entry point in exactly one term. Production calls
+/// [`calculate_performance`]; this exists so a calibration candidate can be priced
+/// against the shipped default on identical scores.
+pub(crate) fn calculate_performance_with_model(
+    attrs: &SunnyManiaDifficultyAttributes,
+    mods: &GameMods,
+    state: SunnyScoreState,
+    model: &ErrorModel,
+) -> SunnyManiaPerformanceAttributes {
     // NF still gets a flat factor: failing is a scoring matter that the timing
     // surface says nothing about, so there is nothing for it to price. EZ has no
     // factor here on purpose — see `compute_difficulty_value`.
@@ -424,7 +439,7 @@ pub fn calculate_performance(
     }
 
     let score_accuracy = custom_accuracy(state);
-    let window_scalar = window_scalar(attrs, state);
+    let window_scalar = window_scalar_with_model(attrs, state, model);
     let difficulty_value = compute_difficulty_value(attrs.stars, score_accuracy, window_scalar);
     let variety_multiplier = variety_multiplier(attrs.variety);
     let acc_multiplier = acc_multiplier(score_accuracy, attrs.acc_scalar);
@@ -773,7 +788,16 @@ fn units_from_difficulty_bins(
 ///
 /// Returns 1.0 only when there is nothing to measure: an empty score, or a fit that
 /// did not produce a usable positive skill on both sides.
-fn window_scalar(attrs: &SunnyManiaDifficultyAttributes, state: SunnyScoreState) -> f64 {
+///
+/// The `model` is explicit so a calibration candidate can be priced against the
+/// shipped default on the same score. Production passes [`ErrorModel::default`] via
+/// [`calculate_performance`]; the A/B report is the only caller that passes anything
+/// else.
+fn window_scalar_with_model(
+    attrs: &SunnyManiaDifficultyAttributes,
+    state: SunnyScoreState,
+    model: &ErrorModel,
+) -> f64 {
     let total = state.total_hits();
 
     if total == 0 || attrs.n_objects == 0 || attrs.stars <= 0.0 {
@@ -789,16 +813,15 @@ fn window_scalar(attrs: &SunnyManiaDifficultyAttributes, state: SunnyScoreState)
         state.misses,
     ];
 
-    let model = ErrorModel::default();
     let units = judgement_units(
         attrs,
         f64::from(total),
-        &model,
+        model,
         !per_note_difficulty_disabled(),
     );
 
-    let played = fit_with_quality(&counts, &units, &attrs.hit_windows, &model);
-    let reference = fit_with_quality(&counts, &units, &reference_windows(attrs), &model);
+    let played = fit_with_quality(&counts, &units, &attrs.hit_windows, model);
+    let reference = fit_with_quality(&counts, &units, &reference_windows(attrs), model);
 
     if played.skill <= 0.0 || reference.skill <= 0.0 {
         return 1.0;
@@ -2447,7 +2470,7 @@ mod tests {
 
         // And the pricing path survives it, which is the property the JS binding relies on.
         let state = SunnyScoreState { n320: 380, n300: 20, n200: 0, n100: 0, n50: 0, misses: 0 };
-        let scalar = window_scalar(&stripped, state);
+        let scalar = window_scalar_with_model(&stripped, state, &ErrorModel::default());
 
         assert!(
             scalar.is_finite() && scalar > 0.0,
@@ -3212,6 +3235,140 @@ mod tests {
         println!();
         summarise("EZ", &ez);
         summarise("NM", &nm);
+    }
+
+    /// Calibrate lapse parameters on the full multiuser dataset rather than the
+    /// hardcoded REAL_SCORES. The multiuser dataset is larger and more diverse.
+    ///
+    /// Run with `cargo test calibrate_lapse_on_multiuser -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn calibrate_lapse_on_multiuser() {
+        let Ok(text) = std::fs::read_to_string("local-fixtures/multiuser.tsv") else {
+            println!("no fixtures present");
+            return;
+        };
+
+        // Parse TSV and prepare data for calibration
+        let mut data = Vec::new();
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 18 || f[0] == "uid" {
+                continue;
+            }
+
+            let u = |s: &str| s.parse::<u32>().unwrap_or(0);
+            let map_id = f[2];
+            let mods_str = f[3];
+
+            let Some(map) = parse(&format!("local-fixtures/maps/{}.osu", map_id)) else {
+                continue;
+            };
+
+            let (mods, clock_rate) = mods_for(mods_str);
+            let Some(attrs) = calculate(&map, &mods, clock_rate, Some(false), None) else {
+                continue;
+            };
+
+            let counts = [u(f[7]), u(f[8]), u(f[9]), u(f[10]), u(f[11]), u(f[12])];
+            let total = f64::from(counts.iter().sum::<u32>());
+
+            data.push((attrs, counts, total));
+        }
+
+        if data.is_empty() {
+            println!("no valid scores loaded");
+            return;
+        }
+
+        println!("loaded {} scores", data.len());
+
+        // Helper to compute mean g_timing with a candidate model
+        let mean_g = |model: &ErrorModel| {
+            let mut sum = 0.0;
+            let mut count = 0;
+
+            for (attrs, counts, total) in &data {
+                let units = judgement_units(attrs, *total, model, !per_note_difficulty_disabled());
+                let fit = fit_with_quality(counts, &units, &attrs.hit_windows, model);
+
+                if fit.g_timing.is_finite() {
+                    sum += fit.g_timing;
+                    count += 1;
+                }
+            }
+
+            if count == 0 { f64::INFINITY } else { sum / count as f64 }
+        };
+
+        let baseline = ErrorModel::default();
+        let single_normal = ErrorModel { lapse_weight: 0.0, ..baseline };
+
+        println!("single normal:   mean g_timing={:.2}", mean_g(&single_normal));
+        println!("current default: lapse_weight={:.4} lapse_ratio={:.3} mean g_timing={:.2}",
+            baseline.lapse_weight, baseline.lapse_ratio, mean_g(&baseline));
+
+        // Grid search (narrower range since multiuser might be different)
+        let mut best = single_normal;
+        let mut best_score = mean_g(&single_normal);
+
+        println!("\nGrid search...");
+        let mut weight = 0.0;
+        while weight <= 0.10 {
+            let mut ratio = 2.0;
+            while ratio <= 8.0 {
+                let candidate = ErrorModel {
+                    lapse_weight: weight,
+                    lapse_ratio: ratio,
+                    ..baseline
+                };
+                let value = mean_g(&candidate);
+
+                if value < best_score {
+                    best_score = value;
+                    best = candidate;
+                    println!("  new best: weight={:.4} ratio={:.2} g={:.2}",
+                        weight, ratio, value);
+                }
+
+                ratio += 0.25;
+            }
+            weight += 0.005;
+        }
+
+        println!("\nGrid best: lapse_weight={:.4} lapse_ratio={:.2} mean g_timing={:.2}",
+            best.lapse_weight, best.lapse_ratio, best_score);
+
+        // Refine
+        let mut step = [0.0025, 0.125];
+        for _ in 0..60 {
+            for (axis, &size) in step.iter().enumerate() {
+                for direction in [-1.0, 1.0] {
+                    let mut candidate = best;
+                    let delta = size * direction;
+
+                    if axis == 0 {
+                        candidate.lapse_weight = (best.lapse_weight + delta).clamp(0.0, 0.95);
+                    } else {
+                        candidate.lapse_ratio = (best.lapse_ratio + delta).max(1.0);
+                    }
+
+                    let value = mean_g(&candidate);
+
+                    if value < best_score {
+                        best_score = value;
+                        best = candidate;
+                    }
+                }
+            }
+
+            for entry in &mut step {
+                *entry *= 0.75;
+            }
+        }
+
+        println!("Refined:   lapse_weight={:.4} lapse_ratio={:.3} mean g_timing={:.2}",
+            best.lapse_weight, best.lapse_ratio, best_score);
     }
 
     /// Not an assertion — a report. Prices every real score through the current
@@ -4487,6 +4644,356 @@ mod tests {
         };
 
         (mods, clock_rate)
+    }
+
+    /// One score priced under two [`ErrorModel`]s, for before/after comparison of an
+    /// error-model change on a fixed dataset.
+    ///
+    /// This exists because [`multiuser_report`] compares *our* pp against the live
+    /// server's, which cannot answer "what did this parameter change do" — live pp is
+    /// itself sunny, so both sides move when the model does. Here both columns come
+    /// from this build and differ only in the model, so the delta is attributable.
+    struct AbPriced {
+        uid: String,
+        map_id: String,
+        mods: String,
+        keys: u32,
+        od: f32,
+        acc: f64,
+        notes: u32,
+        ln_fraction: f64,
+        before_pp: f64,
+        after_pp: f64,
+        before_g: f64,
+        after_g: f64,
+        before_plausible: bool,
+        after_plausible: bool,
+    }
+
+    /// Prices every `multiuser.tsv` row under `before` and `after`, so an error-model
+    /// change can be read as a pp delta and a fit delta on identical scores.
+    ///
+    /// Only the [`ErrorModel`] differs between the two columns — the map, mods, star
+    /// rating and counts are parsed once and shared, so nothing but the model can
+    /// explain a difference.
+    fn load_multiuser_ab(before: &ErrorModel, after: &ErrorModel) -> Vec<AbPriced> {
+        let Ok(text) = std::fs::read_to_string("local-fixtures/multiuser.tsv") else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 18 || f[0] == "uid" {
+                continue;
+            }
+
+            let u = |s: &str| s.parse::<u32>().unwrap_or(0);
+            let counts = [u(f[7]), u(f[8]), u(f[9]), u(f[10]), u(f[11]), u(f[12])];
+
+            let Some(map) = parse(&format!("local-fixtures/maps/{}.osu", f[2])) else {
+                continue;
+            };
+
+            let (mods, clock_rate) = mods_for(f[3]);
+
+            let Some(attrs) = calculate(&map, &mods, clock_rate, Some(false), None) else {
+                continue;
+            };
+
+            let state = SunnyScoreState {
+                n320: counts[0],
+                n300: counts[1],
+                n200: counts[2],
+                n100: counts[3],
+                n50: counts[4],
+                misses: counts[5],
+            };
+            let total = f64::from(state.total_hits());
+            let per_note = !per_note_difficulty_disabled();
+
+            // The only thing that varies across the pair.
+            let price = |model: &ErrorModel| {
+                let units = judgement_units(&attrs, total, model, per_note);
+                let fit = fit_with_quality(&counts, &units, &attrs.hit_windows, model);
+                let perf = calculate_performance_with_model(&attrs, &mods, state, model);
+
+                (perf.pp, fit.g_timing, fit.is_plausible())
+            };
+
+            let (before_pp, before_g, before_plausible) = price(before);
+            let (after_pp, after_g, after_plausible) = price(after);
+
+            out.push(AbPriced {
+                uid: f[0].to_owned(),
+                map_id: f[2].to_owned(),
+                mods: f[3].to_owned(),
+                keys: u(f[6]),
+                od: map.od,
+                acc: f[13].parse().unwrap_or(0.0),
+                notes: state.total_hits(),
+                ln_fraction: if attrs.n_objects > 0 {
+                    attrs.n_long_notes as f64 / attrs.n_objects as f64
+                } else {
+                    0.0
+                },
+                before_pp,
+                after_pp,
+                before_g,
+                after_g,
+                before_plausible,
+                after_plausible,
+            });
+        }
+
+        out
+    }
+
+    /// Summarises one cohort of [`AbPriced`] rows: pp movement and fit movement.
+    ///
+    /// Both are reported because they answer different questions and can disagree —
+    /// a change that moves pp while worsening `g_timing` is repricing on a worse fit,
+    /// which is what [[bias-channel-works-amplitude-wrong]] caught before.
+    fn summarise_ab(label: &str, rows: &[&AbPriced]) {
+        if rows.is_empty() {
+            return;
+        }
+
+        let n = rows.len() as f64;
+        let before_sum: f64 = rows.iter().map(|r| r.before_pp).sum();
+        let after_sum: f64 = rows.iter().map(|r| r.after_pp).sum();
+
+        let mut deltas: Vec<f64> = rows
+            .iter()
+            .filter(|r| r.before_pp > 0.0)
+            .map(|r| (r.after_pp / r.before_pp - 1.0) * 100.0)
+            .collect();
+        deltas.sort_by(f64::total_cmp);
+
+        let median = if deltas.is_empty() {
+            0.0
+        } else {
+            deltas[deltas.len() / 2]
+        };
+        let mean = if deltas.is_empty() {
+            0.0
+        } else {
+            deltas.iter().sum::<f64>() / deltas.len() as f64
+        };
+
+        let raised = deltas.iter().filter(|d| **d > 0.01).count();
+        let lowered = deltas.iter().filter(|d| **d < -0.01).count();
+
+        let before_g: f64 = rows.iter().map(|r| r.before_g).sum::<f64>() / n;
+        let after_g: f64 = rows.iter().map(|r| r.after_g).sum::<f64>() / n;
+
+        // Median alongside the mean, because a handful of pathological fits move the
+        // mean a long way and that is exactly where a shape change shows up first.
+        let median_of = |pick: fn(&AbPriced) -> f64| {
+            let mut v: Vec<f64> = rows
+                .iter()
+                .map(|r| pick(r))
+                .filter(|g| g.is_finite())
+                .collect();
+            v.sort_by(f64::total_cmp);
+            if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+        };
+        let before_g_med = median_of(|r| r.before_g);
+        let after_g_med = median_of(|r| r.after_g);
+
+        // `plausible` is a hard threshold on the same `g_timing` printed above, so it
+        // carries no information the g columns do not. Kept only as a rough count of
+        // how many fits sit near the cutoff; never treat a change in it as a result on
+        // its own.
+        let before_plaus = rows.iter().filter(|r| r.before_plausible).count();
+        let after_plaus = rows.iter().filter(|r| r.after_plausible).count();
+
+        println!(
+            "  {label}: n={:<4} pp {:.0} -> {:.0} ({:+.2}%)  med {:+.2}% mean {:+.2}%  \
+             up/down {raised}/{lowered}  g med {:.1} -> {:.1}  mean {:.1} -> {:.1}  \
+             (plaus {before_plaus} -> {after_plaus})",
+            rows.len(),
+            before_sum,
+            after_sum,
+            if before_sum > 0.0 {
+                (after_sum / before_sum - 1.0) * 100.0
+            } else {
+                0.0
+            },
+            median,
+            mean,
+            before_g_med,
+            after_g_med,
+            before_g,
+            after_g,
+        );
+    }
+
+    /// Before/after comparison of an [`ErrorModel`] change across the whole multiuser
+    /// dataset. Set the two models at the top of the test.
+    ///
+    /// This is the harness that was missing when the lapse refit shipped: the fit was
+    /// scored on the small hardcoded `REAL_SCORES` table, which said the change was a
+    /// 14.6x improvement, while the full dataset said it was worse than no lapse at
+    /// all. A calibration is only as good as the set it was scored on, so the set has
+    /// to be the same one production sees.
+    ///
+    /// Run with `cargo test model_ab_report -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn model_ab_report() {
+        use std::collections::BTreeMap;
+
+        // The pair under test. `before` should be the shipped default so the report
+        // reads as "what would this change do".
+        //
+        // `MODEL_AB_NULL=1` sets both sides to the default, which must print exactly
+        // 0.00% everywhere. That is the harness's own control: a non-zero delta there
+        // would mean the two columns differ by something other than the model.
+        let null_run = std::env::var_os("MODEL_AB_NULL").is_some();
+
+        let before = ErrorModel::default();
+        let after = if null_run {
+            ErrorModel::default()
+        } else {
+            ErrorModel {
+                lapse_weight: 0.435,
+                lapse_ratio: 2.59,
+                ..ErrorModel::default()
+            }
+        };
+
+        if null_run {
+            println!("NULL RUN: both sides are the shipped default; all deltas must be 0.00%");
+        }
+
+        println!(
+            "before: lapse_weight={:.4} lapse_ratio={:.3}",
+            before.lapse_weight, before.lapse_ratio
+        );
+        println!(
+            "after:  lapse_weight={:.4} lapse_ratio={:.3}",
+            after.lapse_weight, after.lapse_ratio
+        );
+
+        let scores = load_multiuser_ab(&before, &after);
+
+        if scores.is_empty() {
+            println!("no fixtures present (local-fixtures/multiuser.tsv); nothing to report");
+            return;
+        }
+
+        let all: Vec<&AbPriced> = scores.iter().collect();
+        let users: std::collections::BTreeSet<&str> =
+            scores.iter().map(|s| s.uid.as_str()).collect();
+
+        println!(
+            "\n=== overall ({} scores, {} users)",
+            all.len(),
+            users.len()
+        );
+        summarise_ab("all", &all);
+
+        // Per-user, because a pooled mean hides one player's odd shape driving the
+        // whole figure — the mistake [[three-players-cannot-fit-anything]] records.
+        println!("\nby user:");
+        let mut by_uid: BTreeMap<&str, Vec<&AbPriced>> = BTreeMap::new();
+        for s in &scores {
+            by_uid.entry(s.uid.as_str()).or_default().push(s);
+        }
+        for (uid, rows) in &by_uid {
+            summarise_ab(&format!("uid {uid}"), rows);
+        }
+
+        println!("\nby window-affecting mod:");
+        type Pred = fn(&&AbPriced) -> bool;
+        for (label, pred) in [
+            ("EZ (windows widened)", (|r| r.mods.contains("EZ")) as Pred),
+            ("HR (windows narrowed)", |r| r.mods.contains("HR")),
+            ("no window mod", |r| {
+                !r.mods.contains("EZ") && !r.mods.contains("HR")
+            }),
+        ] {
+            let group: Vec<&AbPriced> = all.iter().copied().filter(pred).collect();
+            summarise_ab(label, &group);
+        }
+
+        println!("\nby key count:");
+        for keys in [4u32, 5, 6, 7, 8, 9, 10] {
+            let group: Vec<&AbPriced> = all.iter().copied().filter(|r| r.keys == keys).collect();
+            summarise_ab(&format!("{keys}k"), &group);
+        }
+
+        println!("\nby long-note share:");
+        for (lo, hi) in [(0.0, 0.05), (0.05, 0.30), (0.30, 0.60), (0.60, 1.01)] {
+            let group: Vec<&AbPriced> = all
+                .iter()
+                .copied()
+                .filter(|r| r.ln_fraction >= lo && r.ln_fraction < hi)
+                .collect();
+            summarise_ab(
+                &format!("LN {:>3.0}-{:<3.0}%", lo * 100.0, hi * 100.0),
+                &group,
+            );
+        }
+
+        println!("\nby accuracy band:");
+        for (lo, hi) in [(0.0, 90.0), (90.0, 95.0), (95.0, 98.0), (98.0, 100.01)] {
+            let group: Vec<&AbPriced> = all
+                .iter()
+                .copied()
+                .filter(|r| r.acc >= lo && r.acc < hi)
+                .collect();
+            summarise_ab(&format!("acc {lo:>5.1}-{hi:<5.1}"), &group);
+        }
+
+        // The largest individual movers, since a cohort mean can hide a few scores
+        // being repriced hard in both directions.
+        let mut movers: Vec<&AbPriced> = all
+            .iter()
+            .copied()
+            .filter(|r| r.before_pp > 0.0)
+            .collect();
+        movers.sort_by(|a, b| {
+            let da = (a.after_pp / a.before_pp - 1.0).abs();
+            let db = (b.after_pp / b.before_pp - 1.0).abs();
+            db.total_cmp(&da)
+        });
+
+        println!("\nlargest 15 movers:");
+        println!(
+            "{:>8} {:>8} {:>9} {:>4} {:>4} {:>6} {:>7} {:>8} {:>8} {:>8} {:>7} {:>7}",
+            "uid",
+            "map",
+            "mods",
+            "k",
+            "od",
+            "notes",
+            "acc%",
+            "beforePP",
+            "afterPP",
+            "d%",
+            "g_bef",
+            "g_aft"
+        );
+        for r in movers.iter().take(15) {
+            println!(
+                "{:>8} {:>8} {:>9} {:>4} {:>4.1} {:>6} {:>7.3} {:>8.1} {:>8.1} {:>+8.2} {:>7.1} {:>7.1}",
+                r.uid,
+                r.map_id,
+                if r.mods.is_empty() { "NM" } else { &r.mods },
+                r.keys,
+                r.od,
+                r.notes,
+                r.acc,
+                r.before_pp,
+                r.after_pp,
+                (r.after_pp / r.before_pp - 1.0) * 100.0,
+                r.before_g,
+                r.after_g,
+            );
+        }
     }
 
     /// Reads `local-fixtures/multiuser.tsv` and prices every row twice.
