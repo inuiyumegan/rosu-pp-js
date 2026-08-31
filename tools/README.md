@@ -17,6 +17,18 @@ build) and need the bancho.py MySQL container reachable.
   quarter, stratified across star rating. `fetch_batch.sh` cannot fit sigma's difficulty
   response because it returns roughly one score per player, and the error model has one
   free skill each; a ladder holds skill roughly fixed while difficulty sweeps.
+- `build_full_osr.py` / `build_multiuser_tsv.py` — rebuild replays/`multiuser.tsv` from
+  bancho.py's on-disk partial replay blob + a row read via `docker exec` MySQL. Only
+  correct when the local docker-mysql mirror actually has the rows you need.
+- `build_osr_from_csv.py` / `build_multiuser_from_csv.py` / `compute_stars.mjs` — the
+  MySQL-free versions of the two above. Use these when the local mirror is a stale
+  backup (it will silently miss recent users/scores/maps rather than error). They take
+  a raw CSV export (scoreid, bid, score, pp, acc, max_combo, n300, n100, n50, nmiss,
+  ngeki, nkatu, grade, play_time, userid, username, bid, key_count, od, stars, mods) —
+  map_md5 is computed locally from the `.osu` file instead of trusted from `maps.md5`,
+  and star rating is computed with the vendored sunny wasm build
+  (`refactor/osu-server-ts/node_modules/rosu-pp-js-sunny`) instead of read from
+  `maps.diff`, which is bancho's own (different, often stale) calculation.
 
 ### `fetch_cohorts.sh`, and what the older two get wrong
 
