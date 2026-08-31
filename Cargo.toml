@@ -21,6 +21,7 @@ wasm-bindgen = "0.2.95"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.34"
+rayon = "1.10"
 
 # https://github.com/rustwasm/wasm-pack/issues/1501#issuecomment-2898697188
 [package.metadata.wasm-pack.profile.release]

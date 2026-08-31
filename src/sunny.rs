@@ -10326,6 +10326,9 @@ mod tests {
     #[test]
     #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
     fn does_a_mean_offset_move_pp() {
+        use rayon::join;
+        use rayon::prelude::*;
+        use std::sync::Mutex;
         use crate::mania_accuracy::ln_sigma_scale_for_duration;
 
         let Ok(text) = std::fs::read_to_string("local-fixtures/multiuser.tsv") else {
@@ -10337,9 +10340,7 @@ mod tests {
         // tau fixed at the replay-fitted 72.40.
         let candidates = [
             ("off (shipped)", 0.0, 0.0),
-            ("A =  5 ms", 5.0, -3.19),
             ("A = 10 ms", 10.0, -3.19),
-            ("A = 15 ms", 15.0, -3.19),
             ("A = 20 ms", 20.0, -3.19),
             ("A = 25 ms", 25.0, -3.19),
         ];
@@ -10436,7 +10437,9 @@ mod tests {
                 scalar: Vec::new(),
             };
 
-            for (_, amplitude, plateau) in candidates {
+            let row = Mutex::new(row);
+
+            candidates.par_iter().for_each(|&(_, amplitude, plateau)| {
                 let model = ErrorModel {
                     recovery_offset: amplitude,
                     anticipation_offset: plateau,
@@ -10476,9 +10479,12 @@ mod tests {
                     })
                     .collect();
 
-                let played = fit_with_quality(&counts, &units, &attrs.hit_windows, &model);
-                let reference_fit = fit_with_quality(&counts, &units, &reference, &model);
+                let (played, reference_fit) = join(
+                    || fit_with_quality(&counts, &units, &attrs.hit_windows, &model),
+                    || fit_with_quality(&counts, &units, &reference, &model),
+                );
 
+                let mut row = row.lock().expect("candidate result lock poisoned");
                 row.played_g.push(played.g_timing);
                 row.reference_g.push(reference_fit.g_timing);
                 row.played_skill.push(played.skill);
@@ -10488,9 +10494,9 @@ mod tests {
                 } else {
                     1.0
                 });
-            }
+            });
 
-            rows.push(row);
+            rows.push(row.into_inner().expect("candidate result lock poisoned"));
         }
 
         if rows.is_empty() {

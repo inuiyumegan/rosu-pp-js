@@ -1834,6 +1834,50 @@ mod tests {
     }
 
     #[test]
+    fn recovery_offset_is_disabled_by_default() {
+        let model = ErrorModel::default();
+
+        assert_eq!(model.recovery_offset, 0.0);
+        // The fitted long-gap anticipation plateau is retained, while the
+        // short-gap recovery amplitude remains disabled.
+        assert_eq!(model.recovery_mean_offset(50.0), model.anticipation_offset);
+        assert_eq!(model.recovery_mean_offset(500.0), model.anticipation_offset);
+    }
+
+    #[test]
+    fn recovery_offset_follows_the_fitted_gap_curve() {
+        let model = ErrorModel {
+            recovery_offset: 73.12,
+            recovery_tau: 72.40,
+            anticipation_offset: -3.19,
+            ..ErrorModel::default()
+        };
+
+        let at_zero = model.recovery_mean_offset(0.0);
+        let at_tau = model.recovery_mean_offset(model.recovery_tau);
+        let long_gap = model.recovery_mean_offset(850.0);
+
+        assert!((at_zero - 69.93).abs() < 1e-10);
+        assert!((at_tau - (73.12_f64 / std::f64::consts::E - 3.19)).abs() < 1e-10);
+        assert!((long_gap + 3.19).abs() < 0.01);
+        assert!(at_zero > at_tau);
+        assert!(at_tau > long_gap);
+    }
+
+    #[test]
+    fn recovery_offset_handles_missing_or_invalid_predecessors() {
+        let model = ErrorModel {
+            recovery_offset: 20.0,
+            anticipation_offset: -3.19,
+            ..ErrorModel::default()
+        };
+
+        assert_eq!(model.recovery_mean_offset(f64::INFINITY), 0.0);
+        assert_eq!(model.recovery_mean_offset(f64::NAN), 0.0);
+        assert_eq!(model.recovery_mean_offset(-1.0), 16.81);
+    }
+
+    #[test]
     fn erfc_matches_known_values() {
         for &(x, expected) in &[
             (0.0, 1.0),
