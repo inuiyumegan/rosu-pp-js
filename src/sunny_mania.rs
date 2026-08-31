@@ -113,8 +113,8 @@ impl JsSunnyManiaDifficultyAttributes {
     }
 }
 
-const INPUT_STATE_SERIAL_VERSION: f64 = 1.0;
-const INPUT_STATE_FIELDS_PER_BIN: usize = 8;
+const INPUT_STATE_SERIAL_VERSION: f64 = 2.0;
+const INPUT_STATE_FIELDS_PER_BIN: usize = 10;
 
 fn encode_input_state_bins(bins: Option<&[InputStateBin; INPUT_STATE_BINS]>) -> Vec<f64> {
     let Some(bins) = bins else {
@@ -132,6 +132,8 @@ fn encode_input_state_bins(bins: Option<&[InputStateBin; INPUT_STATE_BINS]>) -> 
             bin.mean_difficulty,
             bin.mean_duration_ms,
             bin.mean_gap_ms,
+            bin.mean_next_gap_ms,
+            f64::from(bin.next_operation_count),
             bin.mean_chord_width,
             bin.mean_other_held,
         ]);
@@ -141,15 +143,21 @@ fn encode_input_state_bins(bins: Option<&[InputStateBin; INPUT_STATE_BINS]>) -> 
 }
 
 fn decode_input_state_bins(encoded: &[f64]) -> Option<[InputStateBin; INPUT_STATE_BINS]> {
-    if encoded.len() != 1 + INPUT_STATE_BINS * INPUT_STATE_FIELDS_PER_BIN
-        || encoded[0] != INPUT_STATE_SERIAL_VERSION
+    let (fields_per_bin, version) = match encoded.first().copied() {
+        Some(1.0) => (8, 1.0),
+        Some(INPUT_STATE_SERIAL_VERSION) => {
+            (INPUT_STATE_FIELDS_PER_BIN, INPUT_STATE_SERIAL_VERSION)
+        }
+        _ => return None,
+    };
+    if encoded.len() != 1 + INPUT_STATE_BINS * fields_per_bin
         || encoded.iter().any(|value| !value.is_finite())
     {
         return None;
     }
 
     let bins = std::array::from_fn(|idx| {
-        let offset = 1 + idx * INPUT_STATE_FIELDS_PER_BIN;
+        let offset = 1 + idx * fields_per_bin;
         InputStateBin {
             class: match idx / NOTE_DIFFICULTY_BINS {
                 0 => InputClass::FreshPress,
@@ -166,8 +174,18 @@ fn decode_input_state_bins(encoded: &[f64]) -> Option<[InputStateBin; INPUT_STAT
             mean_difficulty: encoded[offset + 3],
             mean_duration_ms: encoded[offset + 4],
             mean_gap_ms: encoded[offset + 5],
-            mean_chord_width: encoded[offset + 6],
-            mean_other_held: encoded[offset + 7],
+            mean_next_gap_ms: if version >= 2.0 {
+                encoded[offset + 6]
+            } else {
+                0.0
+            },
+            next_operation_count: if version >= 2.0 {
+                encoded[offset + 7].clamp(0.0, f64::from(u32::MAX)) as u32
+            } else {
+                0
+            },
+            mean_chord_width: encoded[offset + if version >= 2.0 { 8 } else { 6 }],
+            mean_other_held: encoded[offset + if version >= 2.0 { 9 } else { 7 }],
         }
     });
 
@@ -617,6 +635,8 @@ mod tests {
             mean_difficulty: 8.25,
             mean_duration_ms: 123.0,
             mean_gap_ms: 91.0,
+            mean_next_gap_ms: 140.0,
+            next_operation_count: 11,
             mean_chord_width: 1.5,
             mean_other_held: 0.25,
         };

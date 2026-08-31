@@ -162,6 +162,8 @@ pub struct InputStateBin {
     pub mean_difficulty: f64,
     pub mean_duration_ms: f64,
     pub mean_gap_ms: f64,
+    pub mean_next_gap_ms: f64,
+    pub next_operation_count: u32,
     pub mean_chord_width: f64,
     pub mean_other_held: f64,
 }
@@ -195,6 +197,10 @@ struct ClassifiedOperation {
     operation: InputOperation,
     class: InputClass,
     previous_gap_ms: Option<f64>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    previous_operation_kind: Option<InputOperationKind>,
+    next_gap_ms: Option<f64>,
+    next_operation_kind: Option<InputOperationKind>,
     other_held: usize,
     chord_width: usize,
 }
@@ -311,6 +317,9 @@ fn classify_input_operations(notes: &[Note], total_columns: usize) -> Vec<Classi
             operation,
             class,
             previous_gap_ms,
+            previous_operation_kind: previous_operation.map(|op| op.kind),
+            next_gap_ms: None,
+            next_operation_kind: None,
             other_held,
             chord_width,
         });
@@ -336,6 +345,16 @@ fn classify_input_operations(notes: &[Note], total_columns: usize) -> Vec<Classi
 
         if let Some(slot) = previous.get_mut(operation.column) {
             *slot = Some(operation);
+        }
+    }
+
+    let mut next = vec![None::<InputOperation>; total_columns];
+    for current in classified.iter_mut().rev() {
+        let successor = next.get(current.operation.column).copied().flatten();
+        current.next_gap_ms = successor.map(|op| op.time_ms - current.operation.time_ms);
+        current.next_operation_kind = successor.map(|op| op.kind);
+        if let Some(slot) = next.get_mut(current.operation.column) {
+            *slot = Some(current.operation);
         }
     }
 
@@ -482,6 +501,16 @@ fn input_state_bins(
                 bin.mean_gap_ms =
                     (bin.mean_gap_ms * predecessor_count + gap) / (predecessor_count + 1.0);
                 bin.predecessor_count += 1;
+            }
+
+            if let Some(gap) = classified
+                .next_gap_ms
+                .filter(|gap| gap.is_finite() && *gap >= 0.0)
+            {
+                let successor_count = f64::from(bin.next_operation_count);
+                bin.mean_next_gap_ms =
+                    (bin.mean_next_gap_ms * successor_count + gap) / (successor_count + 1.0);
+                bin.next_operation_count += 1;
             }
 
             bin.count += 1;
@@ -2753,6 +2782,24 @@ mod tests {
         Note { column, head, tail }
     }
 
+    /// Evaluate a candidate transition model before operations are grouped into bins.
+    fn exact_transition_oracle<F>(
+        notes: &[Note],
+        total_columns: usize,
+        mut candidate: F,
+    ) -> Vec<(ClassifiedOperation, f64)>
+    where
+        F: FnMut(&ClassifiedOperation) -> f64,
+    {
+        classify_input_operations(notes, total_columns)
+            .into_iter()
+            .map(|operation| {
+                let offset = candidate(&operation);
+                (operation, offset)
+            })
+            .collect()
+    }
+
     #[test]
     fn input_operations_have_deterministic_order_and_classes() {
         let notes = vec![
@@ -2797,6 +2844,24 @@ mod tests {
         assert_eq!(class(7), InputClass::Jack);
         assert_eq!(class(8), InputClass::ChordEntryOrExit);
         assert_eq!(class(9), InputClass::ChordEntryOrExit);
+
+        let note_5 = classified
+            .iter()
+            .find(|op| op.operation.note_idx == 5 && op.operation.kind == InputOperationKind::Press)
+            .unwrap();
+        assert_eq!(note_5.previous_gap_ms, Some(300.0));
+        assert_eq!(note_5.next_gap_ms, Some(120.0));
+        assert_eq!(
+            note_5.previous_operation_kind,
+            Some(InputOperationKind::Press)
+        );
+        assert_eq!(note_5.next_operation_kind, Some(InputOperationKind::Press));
+
+        let note_6 = classified
+            .iter()
+            .find(|op| op.operation.note_idx == 6 && op.operation.kind == InputOperationKind::Press)
+            .unwrap();
+        assert_eq!(note_6.next_gap_ms, Some(280.0));
 
         let invalid = input_operations(&[
             input_note(0, 0.0, Some(0.0)),
@@ -12223,5 +12288,349 @@ mod tests {
             ln_ratios.iter().copied().fold(f64::INFINITY, f64::min),
             ln_ratios.iter().copied().fold(f64::NEG_INFINITY, f64::max),
         );
+    }
+
+    /// Experimental harness for calibrating input-state transition offset formulas.
+    ///
+    /// Tests candidate formulations using the exact per-operation oracle before committing
+    /// to any implementation. Reports cohort-level impact to verify that the formula
+    /// separates low-OD LN from low-OD rice patterns.
+    ///
+    /// Run with: `SUNNY_INPUT_STATE=1 cargo test transition_oracle_experiments -- --ignored --nocapture`
+    #[test]
+    #[ignore = "reads gitignored fixtures; expensive calibration research"]
+    fn transition_oracle_experiments() {
+        use crate::mania_accuracy::{ErrorModel, JudgementUnit};
+
+        let Ok(text) = std::fs::read_to_string("local-fixtures/multiuser.tsv") else {
+            println!("no fixtures present (local-fixtures/multiuser.tsv); nothing to report");
+            return;
+        };
+
+        let baseline = ErrorModel {
+            recovery_offset: INPUT_STATE_RECOVERY_OFFSET,
+            recovery_tau: 72.40,
+            anticipation_offset: -3.19,
+            ..ErrorModel::default()
+        };
+
+        // Candidate formulas to test
+        let candidates: Vec<(&str, Box<dyn Fn(&ClassifiedOperation, &ErrorModel) -> f64>)> = vec![
+            // 1. Baseline uniform recovery
+            (
+                "baseline_uniform",
+                Box::new(|op: &ClassifiedOperation, model: &ErrorModel| {
+                    if let Some(gap) = op.previous_gap_ms {
+                        model.recovery_mean_offset(gap)
+                    } else {
+                        0.0
+                    }
+                }),
+            ),
+            // 2. Class-modulated: different factors per InputClass
+            (
+                "class_modulated",
+                Box::new(|op: &ClassifiedOperation, model: &ErrorModel| {
+                    let base = if let Some(gap) = op.previous_gap_ms {
+                        model.recovery_mean_offset(gap)
+                    } else {
+                        0.0
+                    };
+
+                    let factor = match op.class {
+                        InputClass::RapidRepress => 1.0,
+                        InputClass::Jack => 0.8,
+                        InputClass::ReleaseToPress => 0.6,
+                        InputClass::PressUnderHold => 0.7,
+                        InputClass::ChordEntryOrExit => 0.5,
+                        InputClass::Release => 0.3,
+                        InputClass::FreshPress => 0.0,
+                    };
+
+                    base * factor
+                }),
+            ),
+            // 3. Lookahead-sensitive: modulate by gap_after to detect bursts
+            (
+                "lookahead_sensitive",
+                Box::new(|op: &ClassifiedOperation, model: &ErrorModel| {
+                    let base = if let Some(gap) = op.previous_gap_ms {
+                        model.recovery_mean_offset(gap)
+                    } else {
+                        0.0
+                    };
+
+                    if let Some(next_gap) = op.next_gap_ms {
+                        // In a burst (short gaps on both sides), apply less offset
+                        let lookahead_factor = if next_gap < 150.0 { 0.7 } else { 1.0 };
+                        base * lookahead_factor
+                    } else {
+                        base
+                    }
+                }),
+            ),
+            // 4. Chord-damped: divide by chord width
+            (
+                "chord_damped",
+                Box::new(|op: &ClassifiedOperation, model: &ErrorModel| {
+                    let base = if let Some(gap) = op.previous_gap_ms {
+                        model.recovery_mean_offset(gap)
+                    } else {
+                        0.0
+                    };
+
+                    base / (1.0 + op.chord_width as f64 * 0.2)
+                }),
+            ),
+            // 5. Hold-damped: divide by other_held count
+            (
+                "hold_damped",
+                Box::new(|op: &ClassifiedOperation, model: &ErrorModel| {
+                    let base = if let Some(gap) = op.previous_gap_ms {
+                        model.recovery_mean_offset(gap)
+                    } else {
+                        0.0
+                    };
+
+                    base / (1.0 + op.other_held as f64 * 0.3)
+                }),
+            ),
+            // 6. Combined: class × lookahead × hold
+            (
+                "combined",
+                Box::new(|op: &ClassifiedOperation, model: &ErrorModel| {
+                    let base = if let Some(gap) = op.previous_gap_ms {
+                        model.recovery_mean_offset(gap)
+                    } else {
+                        0.0
+                    };
+
+                    let class_factor = match op.class {
+                        InputClass::RapidRepress => 1.0,
+                        InputClass::Jack => 0.8,
+                        InputClass::ReleaseToPress => 0.6,
+                        InputClass::PressUnderHold => 0.7,
+                        InputClass::ChordEntryOrExit => 0.5,
+                        InputClass::Release => 0.3,
+                        InputClass::FreshPress => 0.0,
+                    };
+
+                    let lookahead_factor = if let Some(next_gap) = op.next_gap_ms {
+                        if next_gap < 150.0 { 0.7 } else { 1.0 }
+                    } else {
+                        1.0
+                    };
+
+                    let hold_damping = 1.0 / (1.0 + op.other_held as f64 * 0.3);
+
+                    base * class_factor * lookahead_factor * hold_damping
+                }),
+            ),
+        ];
+
+        for (name, formula) in &candidates {
+            println!("\n{:=<80}", "");
+            println!("CANDIDATE: {name}");
+            println!("{:=<80}\n", "");
+
+            let mut scores = Vec::new();
+
+            for line in text.lines() {
+                let f: Vec<&str> = line.split('\t').collect();
+                if f.len() < 18 || f[0] == "uid" {
+                    continue;
+                }
+
+                let u = |s: &str| s.parse::<u32>().unwrap_or(0);
+                let counts = [u(f[7]), u(f[8]), u(f[9]), u(f[10]), u(f[11]), u(f[12])];
+
+                let Some(map) = parse(&format!("local-fixtures/maps/{}.osu", f[2])) else {
+                    continue;
+                };
+
+                let (mods, clock_rate) = mods_for(f[3]);
+
+                let Some(attrs) = calculate(&map, &mods, clock_rate, Some(false), None) else {
+                    continue;
+                };
+
+                let state = SunnyScoreState {
+                    n320: counts[0],
+                    n300: counts[1],
+                    n200: counts[2],
+                    n100: counts[3],
+                    n50: counts[4],
+                    misses: counts[5],
+                };
+
+                // Price with baseline (no recovery)
+                let baseline_no_recovery = ErrorModel::default();
+                let units_before = judgement_units(
+                    &attrs,
+                    f64::from(state.total_hits()),
+                    &baseline_no_recovery,
+                    true,
+                );
+                let fit_before = fit_with_quality(
+                    &counts,
+                    &units_before,
+                    &attrs.hit_windows,
+                    &baseline_no_recovery,
+                );
+                let perf_before =
+                    calculate_performance_with_model(&attrs, &mods, state, &baseline_no_recovery);
+
+                // Price with exact oracle using this candidate formula
+                let total = f64::from(state.total_hits());
+                let units_after = (|| {
+                    let total_columns = map.cs.round_ties_even().max(1.0) as usize;
+                    let (notes, _) = build_notes(clock_rate, map.hit_objects.iter(), total_columns);
+                    let windows = hit_windows(&map, &mods, clock_rate, false);
+                    let great = get_hit_window_300(
+                        &map,
+                        clock_rate,
+                        has_mod(&mods, "HR"),
+                        has_mod(&mods, "EZ"),
+                    );
+                    let data = RebirthData::new(
+                        notes,
+                        total_columns,
+                        hit_leniency_from_window(great),
+                        windows.good,
+                    );
+                    let (_, _, per_note) = per_note_difficulty(&map)?;
+                    if per_note.len() != data.notes.len() {
+                        return None;
+                    }
+                    let classic = !attrs.ln_judged_as_one;
+
+                    let oracle_offsets =
+                        exact_transition_oracle(&data.notes, data.total_columns, |op| {
+                            formula(op, &baseline)
+                        });
+
+                    // Build units from oracle offsets
+                    let included = oracle_offsets
+                        .iter()
+                        .filter(|(op, _)| {
+                            !classic || op.operation.kind != InputOperationKind::Release
+                        })
+                        .count();
+                    if included == 0 {
+                        return None;
+                    }
+                    let mut units = Vec::with_capacity(included);
+                    let per_op = total / included as f64;
+
+                    for (op, offset) in &oracle_offsets {
+                        if classic && op.operation.kind == InputOperationKind::Release {
+                            continue;
+                        }
+
+                        let difficulty = per_note[op.operation.note_idx].0;
+
+                        let is_long = op.operation.kind == InputOperationKind::Press
+                            && op.operation.hold_duration_ms.is_some();
+
+                        let mut unit = if is_long && attrs.ln_judged_as_one {
+                            JudgementUnit::long_note(
+                                difficulty,
+                                per_op,
+                                &baseline_no_recovery,
+                                op.operation.hold_duration_ms.unwrap_or(0.0),
+                            )
+                        } else {
+                            JudgementUnit::repeated(difficulty, per_op)
+                        };
+
+                        unit.fading_mean_offset = *offset;
+                        units.push(unit);
+                    }
+
+                    Some(units)
+                })()
+                .unwrap_or_else(|| units_before.clone());
+
+                let fit_after = fit_with_quality(
+                    &counts,
+                    &units_after,
+                    &attrs.hit_windows,
+                    &baseline_no_recovery,
+                );
+                let perf_after =
+                    calculate_performance_with_model(&attrs, &mods, state, &baseline_no_recovery);
+
+                scores.push(AbPriced {
+                    uid: f[0].to_owned(),
+                    map_id: f[2].to_owned(),
+                    mods: f[3].to_owned(),
+                    keys: u(f[6]),
+                    od: map.od,
+                    acc: f[13].parse().unwrap_or(0.0),
+                    notes: state.total_hits(),
+                    ln_fraction: if attrs.n_objects > 0 {
+                        attrs.n_long_notes as f64 / attrs.n_objects as f64
+                    } else {
+                        0.0
+                    },
+                    live_pp: f[14].parse().unwrap_or(0.0),
+                    before_pp: perf_before.pp,
+                    after_pp: perf_after.pp,
+                    before_g: fit_before.g_timing,
+                    after_g: fit_after.g_timing,
+                    before_plausible: fit_before.is_plausible(),
+                    after_plausible: fit_after.is_plausible(),
+                });
+            }
+
+            if scores.is_empty() {
+                println!("no scores loaded");
+                continue;
+            }
+
+            let all: Vec<&AbPriced> = scores.iter().collect();
+
+            println!("\n=== overall ({} scores)", all.len());
+            summarise_ab("all", &all);
+
+            println!("\nlow-OD target and controls:");
+            type Pred = fn(&&AbPriced) -> bool;
+            for (label, pred) in [
+                (
+                    "low OD <7, rice <30% LN",
+                    (|r: &&AbPriced| r.od < 7.0 && r.ln_fraction < 0.30) as Pred,
+                ),
+                ("low OD <7, LN >=30%", |r: &&AbPriced| {
+                    r.od < 7.0 && r.ln_fraction >= 0.30
+                }),
+                ("OD >=8, rice <30% LN", |r: &&AbPriced| {
+                    r.od >= 8.0 && r.ln_fraction < 0.30
+                }),
+                ("OD >=8, LN >=30%", |r: &&AbPriced| {
+                    r.od >= 8.0 && r.ln_fraction >= 0.30
+                }),
+            ] {
+                let group: Vec<&AbPriced> = all.iter().copied().filter(pred).collect();
+                summarise_ab(label, &group);
+            }
+
+            println!("\nby key count:");
+            for keys in [4u32, 7] {
+                let group: Vec<&AbPriced> =
+                    all.iter().copied().filter(|r| r.keys == keys).collect();
+                summarise_ab(&format!("{keys}k"), &group);
+            }
+
+            println!("\nby window-affecting mod:");
+            for (label, pred) in [
+                ("EZ (windows widened)", (|r| r.mods.contains("EZ")) as Pred),
+                ("no window mod", |r| {
+                    !r.mods.contains("EZ") && !r.mods.contains("HR")
+                }),
+            ] {
+                let group: Vec<&AbPriced> = all.iter().copied().filter(pred).collect();
+                summarise_ab(label, &group);
+            }
+        }
     }
 }
