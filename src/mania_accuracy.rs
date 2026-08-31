@@ -537,8 +537,8 @@ impl Default for ErrorModel {
             skill_exponent: 1.7,
             difficulty_floor: 0.6,
             sigma_floor: 0.0,
-            lapse_weight: 0.034,
-            lapse_ratio: 4.4,
+            lapse_weight: 0.0296,
+            lapse_ratio: 3.339,
             // The no-asymmetry floor until the sweep says otherwise, so the shipped
             // default still rests on the derived `sqrt(2)` rather than on a guess.
             release_sigma_ratio: 1.0,
@@ -1985,6 +1985,19 @@ mod tests {
     /// that test guards the default; this one records the bound, so a future floor
     /// has a number to respect rather than having to rediscover it.
     #[test]
+    #[ignore = "scratch"]
+    fn print_floor_curve() {
+        let windows = od9_windows();
+        let units = uniform_units(2.0, 1506);
+        for &floor in &[0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0] {
+            let model = ErrorModel { sigma_floor: floor, ..Default::default() };
+            let share = expected_counts(&units, &windows, &model, 1.0e4)
+                .get(ManiaJudgement::Perfect) / 1506.0;
+            println!("floor {floor:>4.1} ms -> {:>9.3} notes off 320", 1506.0 * (1.0 - share));
+        }
+    }
+
+    #[test]
     fn the_counts_bound_a_floor_near_two_milliseconds() {
         let windows = od9_windows();
         let skill = 1.0e4;
@@ -2009,22 +2022,26 @@ mod tests {
             forced_off_320(1.0)
         );
 
-        // By 5 ms it is not survivable — tens of notes would have to have missed the
-        // window, and none did.
+        // By 5 ms it is not survivable — over one percent of the score would have to
+        // have missed the window, and none did. The bound was ~25 notes under the old
+        // 0.034/4.4 parameters; the narrower lapse tail (0.0296/3.339) lowers it to
+        // ~16 because sigma_floor elevates less mass from a thinner tail.
         assert!(
-            forced_off_320(5.0) > 20.0,
+            forced_off_320(5.0) > 15.0,
             "5ms should be clearly refuted, got {} notes",
             forced_off_320(5.0)
         );
 
         // Monotone in between, so "the bound" is a single crossing rather than a
-        // region, and 2 ms is where it starts costing whole notes.
+        // region. Under the new 0.0296/3.339 parameters, 2ms costs ~0.6 notes (starting
+        // to matter) and the 1-note crossing sits around 2.3-2.4ms.
         assert!(forced_off_320(2.0) > forced_off_320(1.0));
         assert!(forced_off_320(3.0) > forced_off_320(2.0));
         assert!(
-            forced_off_320(2.0) > 1.0 && forced_off_320(2.0) < 10.0,
-            "2ms is the boundary case, got {} notes",
-            forced_off_320(2.0)
+            forced_off_320(2.0) > 0.5 && forced_off_320(3.0) > 1.0,
+            "boundary should be between 2-3ms, got 2ms={} 3ms={}",
+            forced_off_320(2.0),
+            forced_off_320(3.0)
         );
     }
 

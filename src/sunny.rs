@@ -3237,8 +3237,101 @@ mod tests {
         summarise("NM", &nm);
     }
 
+    /// Where the lapse optimum sits when the objective is the *median* rather than the
+    /// mean, and whether the `EZ` cohort wants the same point as the pooled set.
+    ///
+    /// Both questions exist because `calibrate_lapse_on_multiuser` minimises a pooled
+    /// mean `g_timing`, and on this data the mean (42.3) is roughly 1.7x the median
+    /// (25.2). A mean objective is therefore steered by the worst tenth of fits. `EZ`
+    /// is broken out because it is the only cohort whose windows differ, so it is the
+    /// one the mod response is actually read from, and it is only ~5% of the rows.
+    ///
+    /// Run with `cargo test lapse_objective_disagreement -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
+    fn lapse_objective_disagreement() {
+        let Ok(text) = std::fs::read_to_string("local-fixtures/multiuser.tsv") else {
+            println!("no fixtures present");
+            return;
+        };
+
+        let mut data = Vec::new();
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 18 || f[0] == "uid" {
+                continue;
+            }
+
+            let u = |s: &str| s.parse::<u32>().unwrap_or(0);
+            let mods_str = f[3];
+            let Some(map) = parse(&format!("local-fixtures/maps/{}.osu", f[2])) else {
+                continue;
+            };
+            let (mods, clock_rate) = mods_for(mods_str);
+            let Some(attrs) = calculate(&map, &mods, clock_rate, Some(false), None) else {
+                continue;
+            };
+
+            let counts = [u(f[7]), u(f[8]), u(f[9]), u(f[10]), u(f[11]), u(f[12])];
+            let total = f64::from(counts.iter().sum::<u32>());
+            let is_ez = mods_str.contains("EZ");
+
+            data.push((attrs, counts, total, is_ez));
+        }
+
+        if data.is_empty() {
+            println!("no valid scores loaded");
+            return;
+        }
+
+        let stats = |model: &ErrorModel, ez_only: bool| {
+            let mut v: Vec<f64> = Vec::new();
+            for (attrs, counts, total, is_ez) in &data {
+                if ez_only && !is_ez {
+                    continue;
+                }
+                let units = judgement_units(attrs, *total, model, !per_note_difficulty_disabled());
+                let fit = fit_with_quality(counts, &units, &attrs.hit_windows, model);
+                if fit.g_timing.is_finite() {
+                    v.push(fit.g_timing);
+                }
+            }
+            v.sort_by(f64::total_cmp);
+            let n = v.len();
+            let mean = v.iter().sum::<f64>() / n as f64;
+            let median = v[n / 2];
+            (n, median, mean)
+        };
+
+        println!(
+            "loaded {} scores ({} EZ)",
+            data.len(),
+            data.iter().filter(|d| d.3).count()
+        );
+        println!("weight ratio |  pooled n   med    mean |     EZ n   med    mean");
+
+        for &weight in &[0.020, 0.0296, 0.034, 0.045] {
+            for &ratio in &[2.5, 3.0, 3.339, 3.75, 4.4, 5.0] {
+                let model = ErrorModel {
+                    lapse_weight: weight,
+                    lapse_ratio: ratio,
+                    ..ErrorModel::default()
+                };
+                let (pn, pmed, pmean) = stats(&model, false);
+                let (en, emed, emean) = stats(&model, true);
+                println!(
+                    "{weight:.4} {ratio:<5.3} | {pn:>8} {pmed:>6.1} {pmean:>7.1} | {en:>6} {emed:>6.1} {emean:>7.1}"
+                );
+            }
+        }
+    }
+
     /// Calibrate lapse parameters on the full multiuser dataset rather than the
     /// hardcoded REAL_SCORES. The multiuser dataset is larger and more diverse.
+    ///
+    /// Minimises a *pooled mean* `g_timing`. See [`lapse_objective_disagreement`] for
+    /// why that objective is not obviously the right one, and read its output before
+    /// shipping anything this test recommends.
     ///
     /// Run with `cargo test calibrate_lapse_on_multiuser -- --ignored --nocapture`.
     #[test]
@@ -4857,9 +4950,12 @@ mod tests {
         let after = if null_run {
             ErrorModel::default()
         } else {
+            // Refit on the 1204-score set by `calibrate_lapse_on_multiuser`:
+            // mean g_timing 42.29 -> 38.16, at an interior optimum rather than a
+            // grid corner.
             ErrorModel {
-                lapse_weight: 0.435,
-                lapse_ratio: 2.59,
+                lapse_weight: 0.0296,
+                lapse_ratio: 3.339,
                 ..ErrorModel::default()
             }
         };
