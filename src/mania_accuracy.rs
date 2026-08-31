@@ -814,16 +814,11 @@ pub(crate) fn erfc(x: f64) -> f64 {
                     + t * (-0.186_288_06
                         + t * (0.278_868_07
                             + t * (-1.135_203_98
-                                + t * (1.488_515_87
-                                    + t * (-0.822_152_23 + t * 0.170_872_77))))))));
+                                + t * (1.488_515_87 + t * (-0.822_152_23 + t * 0.170_872_77))))))));
 
     let value = t * (-z * z + poly).exp();
 
-    if x >= 0.0 {
-        value
-    } else {
-        2.0 - value
-    }
+    if x >= 0.0 { value } else { 2.0 - value }
 }
 
 /// The judgement distribution for a single hit of local difficulty `difficulty`
@@ -884,7 +879,9 @@ pub fn judgement_probabilities_scaled(
 
     for judgement in ManiaJudgement::ALL {
         let (_, upper) = windows.band(judgement);
-        let outside = model.exceedance_with_offset(upper, sigma, mu).min(remaining);
+        let outside = model
+            .exceedance_with_offset(upper, sigma, mu)
+            .min(remaining);
         // Bands are nested, so each judgement claims the mass that falls inside
         // its window but outside every tighter one. Differencing tails rather
         // than cumulatives keeps the sub-PERFECT judgements accurate at high
@@ -1018,6 +1015,11 @@ pub struct JudgementUnit {
     /// millisecond offset, not a fraction of the unit's spread, so a duration bucket
     /// that widens `sigma_scale` does not also widen this.
     pub mean_offset: f64,
+    /// A structural mean shift that fades with timing spread, reaching its full value
+    /// at `sigma_ref` and tending to zero as the player approaches perfect precision.
+    /// Used for recoverable press bias; unlike a fixed release offset it must not make
+    /// an all-PERFECT score mathematically unreachable.
+    pub fading_mean_offset: f64,
 }
 
 /// How much wider a ScoreV1 long note's effective timing spread is than a plain
@@ -1146,6 +1148,7 @@ impl JudgementUnit {
             weight: 1.0,
             sigma_scale: 1.0,
             mean_offset: 0.0,
+            fading_mean_offset: 0.0,
         }
     }
 
@@ -1156,6 +1159,7 @@ impl JudgementUnit {
             weight: count,
             sigma_scale: 1.0,
             mean_offset: 0.0,
+            fading_mean_offset: 0.0,
         }
     }
 
@@ -1173,6 +1177,7 @@ impl JudgementUnit {
             weight: count,
             sigma_scale: ln_sigma_scale_for_duration(model, duration_ms),
             mean_offset: model.release_mean_offset,
+            fading_mean_offset: 0.0,
         }
     }
 
@@ -1195,13 +1200,19 @@ pub fn expected_counts(
     let mut totals = [0.0; 6];
 
     for unit in units {
+        let sigma = model.sigma(unit.difficulty, skill) * unit.sigma_scale;
+        let fade = if model.sigma_ref.is_finite() && model.sigma_ref > 0.0 {
+            (sigma / model.sigma_ref).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let probabilities = judgement_probabilities_scaled(
             windows,
             model,
             unit.difficulty,
             skill,
             unit.sigma_scale,
-            unit.mean_offset,
+            unit.mean_offset + unit.fading_mean_offset * fade,
         );
 
         for judgement in ManiaJudgement::ALL {
@@ -1272,8 +1283,7 @@ pub fn skill_for_accuracy(
         return SKILL_MIN;
     }
 
-    let accuracy_at =
-        |skill: f64| expected_counts(units, windows, model, skill).custom_accuracy();
+    let accuracy_at = |skill: f64| expected_counts(units, windows, model, skill).custom_accuracy();
 
     if accuracy_at(SKILL_MIN) >= target_accuracy {
         return SKILL_MIN;
@@ -1607,8 +1617,7 @@ pub fn fit_with_quality(
 
         // Rescale to the observed total so a passed-objects mismatch between the
         // score and the unit list does not read as a bad fit on its own.
-        let predicted =
-            (expected.get(judgement) / expected_total * observed_total).max(1e-12);
+        let predicted = (expected.get(judgement) / expected_total * observed_total).max(1e-12);
 
         g_statistic += 2.0 * observed * (observed / predicted).ln();
 
@@ -1921,8 +1930,7 @@ mod tests {
 
         for &difficulty in &[0.0, 1.0, 3.0, 6.0, 10.0, 25.0] {
             for &skill in &[0.5, 2.0, 5.0, 8.0, 20.0] {
-                let probabilities =
-                    judgement_probabilities(&windows, &model, difficulty, skill);
+                let probabilities = judgement_probabilities(&windows, &model, difficulty, skill);
                 let sum: f64 = probabilities.as_array().iter().sum();
 
                 assert!(
@@ -1994,8 +2002,7 @@ mod tests {
             sigma_floor: 10.0,
             ..Default::default()
         };
-        let share = expected_counts(&units, &windows, &floored, skill)
-            .get(ManiaJudgement::Perfect)
+        let share = expected_counts(&units, &windows, &floored, skill).get(ManiaJudgement::Perfect)
             / 1506.0;
 
         assert!(
@@ -2034,10 +2041,17 @@ mod tests {
         let windows = od9_windows();
         let units = uniform_units(2.0, 1506);
         for &floor in &[0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0] {
-            let model = ErrorModel { sigma_floor: floor, ..Default::default() };
+            let model = ErrorModel {
+                sigma_floor: floor,
+                ..Default::default()
+            };
             let share = expected_counts(&units, &windows, &model, 1.0e4)
-                .get(ManiaJudgement::Perfect) / 1506.0;
-            println!("floor {floor:>4.1} ms -> {:>9.3} notes off 320", 1506.0 * (1.0 - share));
+                .get(ManiaJudgement::Perfect)
+                / 1506.0;
+            println!(
+                "floor {floor:>4.1} ms -> {:>9.3} notes off 320",
+                1506.0 * (1.0 - share)
+            );
         }
     }
 
@@ -2281,10 +2295,13 @@ mod tests {
         let mut previous = -1.0;
 
         for &skill in &[1.0, 2.0, 4.0, 6.0, 8.0, 12.0] {
-            let perfect = expected_counts(&units, &windows, &model, skill)
-                .get(ManiaJudgement::Perfect);
+            let perfect =
+                expected_counts(&units, &windows, &model, skill).get(ManiaJudgement::Perfect);
 
-            assert!(perfect > previous, "skill {skill}: {perfect} not above {previous}");
+            assert!(
+                perfect > previous,
+                "skill {skill}: {perfect} not above {previous}"
+            );
 
             previous = perfect;
         }
@@ -2961,7 +2978,10 @@ mod tests {
         let windows = od9_windows();
         let model = ErrorModel::default();
 
-        assert_eq!(model.slip_rate, 0.0, "misses should come from the timing tail");
+        assert_eq!(
+            model.slip_rate, 0.0,
+            "misses should come from the timing tail"
+        );
 
         for &notes in &[100, 1300, 6358] {
             let units = uniform_units(5.0, notes);
@@ -3016,12 +3036,7 @@ mod tests {
 
     /// Judgement counts for a player whose timing error is centred on `offset`
     /// rather than zero: `X ~ N(offset, sigma)`.
-    fn offset_score(
-        windows: &ManiaHitWindows,
-        sigma: f64,
-        offset: f64,
-        total: u32,
-    ) -> [u32; 6] {
+    fn offset_score(windows: &ManiaHitWindows, sigma: f64, offset: f64, total: u32) -> [u32; 6] {
         let mut probabilities = [0.0; 6];
 
         for judgement in ManiaJudgement::ALL {
@@ -3207,9 +3222,8 @@ mod tests {
         for &difficulty in &[2.0, 5.0, 8.0, 12.0, 20.0] {
             let units = uniform_units(difficulty, notes);
 
-            let accuracy = |skill: f64| {
-                expected_counts(&units, &windows, &timing, skill).custom_accuracy()
-            };
+            let accuracy =
+                |skill: f64| expected_counts(&units, &windows, &timing, skill).custom_accuracy();
 
             // Both ends must actually be reachable within the search bracket, or the
             // fit would be pinned for a whole class of real players.

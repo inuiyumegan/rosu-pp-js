@@ -999,6 +999,14 @@ export class SunnyManiaDifficultyAttributes {
    * The amount of hit objects taken into account.
    */
   readonly nObjects: number;
+  /**
+   * How many hit objects are long notes.
+   */
+  readonly nLongNotes: number;
+  /**
+   * Versioned compact input-state metadata retained by cached attributes.
+   */
+  readonly inputStateBins: Float64Array;
 }
 /**
  * The result of a sunny mania performance calculation.

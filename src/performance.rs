@@ -2,13 +2,14 @@ use rosu_pp::Performance;
 use wasm_bindgen::prelude::wasm_bindgen;
 
 use crate::{
+    JsResult,
     args::performance::{
         JsHitResultPriority, JsMapOrAttributes, JsPerformanceArgs, MapOrAttrs, PerformanceArgs,
     },
     attributes::performance::JsPerformanceAttributes,
     deserializer::JsDeserializer,
     mods::JsGameMods,
-    util, JsResult,
+    util,
 };
 
 /// Builder for a performance calculation.

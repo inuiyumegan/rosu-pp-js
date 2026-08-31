@@ -159,12 +159,36 @@ struct Range {
     od10: f64,
 }
 
-const LAZER_PERFECT: Range = Range { od0: 22.4, od5: 19.4, od10: 13.9 };
-const LAZER_GREAT: Range = Range { od0: 64.0, od5: 49.0, od10: 34.0 };
-const LAZER_GOOD: Range = Range { od0: 97.0, od5: 82.0, od10: 67.0 };
-const LAZER_OK: Range = Range { od0: 127.0, od5: 112.0, od10: 97.0 };
-const LAZER_MEH: Range = Range { od0: 151.0, od5: 136.0, od10: 121.0 };
-const LAZER_MISS: Range = Range { od0: 188.0, od5: 173.0, od10: 158.0 };
+const LAZER_PERFECT: Range = Range {
+    od0: 22.4,
+    od5: 19.4,
+    od10: 13.9,
+};
+const LAZER_GREAT: Range = Range {
+    od0: 64.0,
+    od5: 49.0,
+    od10: 34.0,
+};
+const LAZER_GOOD: Range = Range {
+    od0: 97.0,
+    od5: 82.0,
+    od10: 67.0,
+};
+const LAZER_OK: Range = Range {
+    od0: 127.0,
+    od5: 112.0,
+    od10: 97.0,
+};
+const LAZER_MEH: Range = Range {
+    od0: 151.0,
+    od5: 136.0,
+    od10: 121.0,
+};
+const LAZER_MISS: Range = Range {
+    od0: 188.0,
+    od5: 173.0,
+    od10: 158.0,
+};
 
 /// Linear interpolation over OD, matching lazer's
 /// `IBeatmapDifficultyInfo.DifficultyRange`: OD 0-5 interpolates between `od0`
@@ -602,7 +626,11 @@ mod tests {
             for &is_convert in &[false, true] {
                 for (mod_list, has_hr, has_ez) in [
                     (vec![], false, false),
-                    (vec![GameMod::HardRockMania(Default::default())], true, false),
+                    (
+                        vec![GameMod::HardRockMania(Default::default())],
+                        true,
+                        false,
+                    ),
                     (vec![GameMod::EasyMania(Default::default())], false, true),
                 ] {
                     for clock_rate in [1.0, 1.5, 0.75] {
@@ -611,8 +639,7 @@ mod tests {
                         let expected =
                             crate::sunny::get_hit_window_300(&m, clock_rate, has_hr, has_ez);
 
-                        let actual =
-                            hit_windows(&m, &mods(&mod_list), clock_rate, true).great;
+                        let actual = hit_windows(&m, &mods(&mod_list), clock_rate, true).great;
 
                         assert!(
                             (actual - expected).abs() < 1e-9,

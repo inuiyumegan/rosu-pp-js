@@ -21,10 +21,8 @@ use rosu_pp::model::{
     mode::GameMode,
 };
 
-use crate::mania_accuracy::{
-    fit_with_quality, ErrorModel, JudgementUnit, LN_DURATION_BUCKETS,
-};
-use crate::mania_windows::{hit_windows, ManiaHitWindows};
+use crate::mania_accuracy::{ErrorModel, JudgementUnit, LN_DURATION_BUCKETS, fit_with_quality};
+use crate::mania_windows::{ManiaHitWindows, hit_windows};
 
 /// The upper edges, in ms, of the first [`LN_DURATION_BUCKETS`] - 1 duration bins;
 /// anything longer falls in the last.
@@ -137,6 +135,213 @@ fn ln_duration_histogram(long_notes: &[Note]) -> [usize; LN_DURATION_BUCKETS] {
 /// 4284, making the exact fit cost 98.8 ms against 2.0 ms here.
 pub const NOTE_DIFFICULTY_BINS: usize = 16;
 
+/// The primary map-derived input transition classes cached with difficulty attributes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum InputClass {
+    #[default]
+    FreshPress,
+    RapidRepress,
+    Jack,
+    Release,
+    ReleaseToPress,
+    PressUnderHold,
+    ChordEntryOrExit,
+}
+
+pub const INPUT_CLASSES: usize = 7;
+pub const INPUT_STATE_BINS: usize = INPUT_CLASSES * NOTE_DIFFICULTY_BINS;
+
+/// A compact aggregate of operations sharing one [`InputClass`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct InputStateBin {
+    pub class: InputClass,
+    pub count: u32,
+    pub long_count: u32,
+    pub predecessor_count: u32,
+    pub mean_difficulty: f64,
+    pub mean_duration_ms: f64,
+    pub mean_gap_ms: f64,
+    pub mean_chord_width: f64,
+    pub mean_other_held: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputOperationKind {
+    Press,
+    Release,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InputOperation {
+    column: usize,
+    time_ms: f64,
+    kind: InputOperationKind,
+    hold_duration_ms: Option<f64>,
+    chord_mask: u64,
+    note_idx: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ColumnInputState {
+    #[default]
+    Idle,
+    Pressed,
+    Held,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClassifiedOperation {
+    operation: InputOperation,
+    class: InputClass,
+    previous_gap_ms: Option<f64>,
+    other_held: usize,
+    chord_width: usize,
+}
+
+const RAPID_REPRESS_MS: f64 = 150.0;
+
+fn input_operations(notes: &[Note]) -> Vec<InputOperation> {
+    let mut chord_masks = HashMap::<u64, u64>::new();
+
+    for note in notes {
+        if note.column < 64 {
+            *chord_masks.entry(note.head.to_bits()).or_default() |= 1 << note.column;
+        }
+    }
+
+    let mut operations = Vec::with_capacity(notes.len() * 2);
+
+    for (note_idx, note) in notes.iter().enumerate() {
+        let hold_duration_ms = note
+            .tail
+            .filter(|&tail| tail > note.head)
+            .map(|tail| tail - note.head);
+        operations.push(InputOperation {
+            column: note.column,
+            time_ms: note.head,
+            kind: InputOperationKind::Press,
+            hold_duration_ms,
+            chord_mask: chord_masks.get(&note.head.to_bits()).copied().unwrap_or(0),
+            note_idx,
+        });
+
+        if let Some(tail) = note.tail.filter(|&tail| tail > note.head) {
+            operations.push(InputOperation {
+                column: note.column,
+                time_ms: tail,
+                kind: InputOperationKind::Release,
+                hold_duration_ms: Some(tail - note.head),
+                chord_mask: 0,
+                note_idx,
+            });
+        }
+    }
+
+    // At equal timestamps, releases happen before presses so a hold ending exactly as
+    // the next note starts deterministically becomes ReleaseToPress, not an overlap.
+    operations.sort_by(|a, b| {
+        a.time_ms
+            .total_cmp(&b.time_ms)
+            .then_with(|| match (a.kind, b.kind) {
+                (InputOperationKind::Release, InputOperationKind::Press) => Ordering::Less,
+                (InputOperationKind::Press, InputOperationKind::Release) => Ordering::Greater,
+                _ => Ordering::Equal,
+            })
+            .then_with(|| a.column.cmp(&b.column))
+            .then_with(|| a.note_idx.cmp(&b.note_idx))
+    });
+
+    operations
+}
+
+fn classify_input_operations(notes: &[Note], total_columns: usize) -> Vec<ClassifiedOperation> {
+    let operations = input_operations(notes);
+    let mut states = vec![ColumnInputState::Idle; total_columns];
+    let mut held_since = vec![None::<f64>; total_columns];
+    let mut previous = vec![None::<InputOperation>; total_columns];
+    let mut classified = Vec::with_capacity(operations.len());
+
+    for operation in operations {
+        let previous_operation = previous.get(operation.column).copied().flatten();
+        let previous_gap_ms = previous_operation.map(|prev| operation.time_ms - prev.time_ms);
+        let other_held = states
+            .iter()
+            .enumerate()
+            .filter(|&(column, state)| {
+                column != operation.column
+                    && *state == ColumnInputState::Held
+                    && held_since[column].is_some_and(|start| start < operation.time_ms)
+            })
+            .count();
+        let chord_width = operation.chord_mask.count_ones() as usize;
+
+        let class = match operation.kind {
+            InputOperationKind::Release => InputClass::Release,
+            InputOperationKind::Press if other_held > 0 => InputClass::PressUnderHold,
+            InputOperationKind::Press if chord_width > 1 => InputClass::ChordEntryOrExit,
+            InputOperationKind::Press
+                if matches!(
+                    previous_operation.map(|op| op.kind),
+                    Some(InputOperationKind::Release)
+                ) && previous_gap_ms.is_some_and(|gap| gap <= RAPID_REPRESS_MS) =>
+            {
+                InputClass::ReleaseToPress
+            }
+            InputOperationKind::Press
+                if matches!(
+                    previous_operation.map(|op| op.kind),
+                    Some(InputOperationKind::Press)
+                ) && previous_gap_ms.is_some_and(|gap| gap <= RAPID_REPRESS_MS) =>
+            {
+                InputClass::RapidRepress
+            }
+            InputOperationKind::Press
+                if matches!(
+                    previous_operation.map(|op| op.kind),
+                    Some(InputOperationKind::Press)
+                ) =>
+            {
+                InputClass::Jack
+            }
+            InputOperationKind::Press => InputClass::FreshPress,
+        };
+
+        classified.push(ClassifiedOperation {
+            operation,
+            class,
+            previous_gap_ms,
+            other_held,
+            chord_width,
+        });
+
+        if let Some(state) = states.get_mut(operation.column) {
+            *state = match operation.kind {
+                InputOperationKind::Press if operation.hold_duration_ms.is_some() => {
+                    ColumnInputState::Held
+                }
+                InputOperationKind::Press => ColumnInputState::Pressed,
+                InputOperationKind::Release => ColumnInputState::Idle,
+            };
+        }
+
+        if let Some(start) = held_since.get_mut(operation.column) {
+            *start = match operation.kind {
+                InputOperationKind::Press if operation.hold_duration_ms.is_some() => {
+                    Some(operation.time_ms)
+                }
+                _ => None,
+            };
+        }
+
+        if let Some(slot) = previous.get_mut(operation.column) {
+            *slot = Some(operation);
+        }
+    }
+
+    classified
+}
+
 /// One equal-count slice of a map's per-note difficulty distribution.
 ///
 /// Deliberately *raw*: this is structural map data, cached per map alongside the star
@@ -213,6 +418,77 @@ fn note_difficulty_bins(
     }
 
     Some(bins)
+}
+
+fn input_state_bins(
+    data: &RebirthData,
+    d_all: &[f64],
+    classic: bool,
+) -> Option<[InputStateBin; INPUT_STATE_BINS]> {
+    let mut bins = std::array::from_fn(|idx| InputStateBin {
+        class: match idx / NOTE_DIFFICULTY_BINS {
+            0 => InputClass::FreshPress,
+            1 => InputClass::RapidRepress,
+            2 => InputClass::Jack,
+            3 => InputClass::Release,
+            4 => InputClass::ReleaseToPress,
+            5 => InputClass::PressUnderHold,
+            _ => InputClass::ChordEntryOrExit,
+        },
+        ..InputStateBin::default()
+    });
+
+    let mut by_class = vec![Vec::<(ClassifiedOperation, f64)>::new(); INPUT_CLASSES];
+
+    for classified in classify_input_operations(&data.notes, data.total_columns)
+        .into_iter()
+        .filter(|op| !classic || op.operation.kind != InputOperationKind::Release)
+    {
+        let note = data.notes[classified.operation.note_idx];
+        let difficulty_idx = lower_bound(&data.all_corners, note.head).min(d_all.len() - 1);
+        by_class[classified.class as usize].push((classified, d_all[difficulty_idx]));
+    }
+
+    for (class_idx, operations) in by_class.iter_mut().enumerate() {
+        operations.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let n = operations.len();
+
+        for (position, &(classified, difficulty)) in operations.iter().enumerate() {
+            let quantile = position * NOTE_DIFFICULTY_BINS / n.max(1);
+            let bin = &mut bins[class_idx * NOTE_DIFFICULTY_BINS + quantile];
+            let count = f64::from(bin.count);
+            let next_count = count + 1.0;
+
+            bin.mean_difficulty = (bin.mean_difficulty * count + difficulty) / next_count;
+            if classified.operation.kind == InputOperationKind::Press
+                && classified.operation.hold_duration_ms.is_some()
+            {
+                let long_count = f64::from(bin.long_count);
+                bin.mean_duration_ms = (bin.mean_duration_ms * long_count
+                    + classified.operation.hold_duration_ms.unwrap_or(0.0))
+                    / (long_count + 1.0);
+                bin.long_count += 1;
+            }
+            bin.mean_chord_width =
+                (bin.mean_chord_width * count + classified.chord_width as f64) / next_count;
+            bin.mean_other_held =
+                (bin.mean_other_held * count + classified.other_held as f64) / next_count;
+
+            if let Some(gap) = classified
+                .previous_gap_ms
+                .filter(|gap| gap.is_finite() && *gap >= 0.0)
+            {
+                let predecessor_count = f64::from(bin.predecessor_count);
+                bin.mean_gap_ms =
+                    (bin.mean_gap_ms * predecessor_count + gap) / (predecessor_count + 1.0);
+                bin.predecessor_count += 1;
+            }
+
+            bin.count += 1;
+        }
+    }
+
+    bins.iter().any(|bin| bin.count > 0).then_some(bins)
 }
 
 /// A single mania note (or hold-note) extracted from a beatmap.
@@ -293,6 +569,9 @@ pub struct SunnyManiaDifficultyAttributes {
     /// [`Self::ln_duration_buckets`] when present: each bin carries its own long notes and
     /// their mean hold duration.
     pub note_difficulty_bins: Option<[NoteDifficultyBin; NOTE_DIFFICULTY_BINS]>,
+    /// Compact map-only input transition metadata. Missing cached attributes retain the
+    /// pre-feature judgement path.
+    pub input_state_bins: Option<[InputStateBin; INPUT_STATE_BINS]>,
     /// The map's own judgement windows with the window-affecting mods stripped.
     ///
     /// Identical to [`Self::hit_windows`] for a no-mod score, and narrower or wider than
@@ -404,6 +683,7 @@ pub fn calculate(
         n_long_notes: data.long_notes.len(),
         ln_duration_buckets: ln_duration_histogram(&data.long_notes),
         note_difficulty_bins: params.note_difficulty_bins,
+        input_state_bins: params.input_state_bins,
         ln_judged_as_one: classic,
     })
 }
@@ -445,11 +725,8 @@ pub(crate) fn calculate_performance_with_model(
     let acc_multiplier = acc_multiplier(score_accuracy, attrs.acc_scalar);
     let length_multiplier = length_multiplier(attrs.n_objects as f64, attrs.stars);
 
-    let pp = difficulty_value
-        * multiplier
-        * variety_multiplier
-        * acc_multiplier
-        * length_multiplier;
+    let pp =
+        difficulty_value * multiplier * variety_multiplier * acc_multiplier * length_multiplier;
 
     SunnyManiaPerformanceAttributes {
         pp,
@@ -634,6 +911,18 @@ fn judgement_units(
 ) -> Vec<JudgementUnit> {
     let uniform = vec![JudgementUnit::repeated(attrs.stars, total)];
 
+    // The recovery amplitude is the deliberate feature switch. Its shipped value is
+    // zero, so merely calculating or caching input-state metadata cannot change pp.
+    if model.recovery_offset != 0.0 {
+        if let Some(bins) = attrs.input_state_bins {
+            let units = units_from_input_state_bins(&bins, attrs, total, model);
+
+            if !units.is_empty() {
+                return units;
+            }
+        }
+    }
+
     // Per-note difficulty when the map's distribution survived to here, which also
     // subsumes the LN duration split below: each bin carries its own long notes.
     if let Some(bins) = attrs
@@ -694,6 +983,70 @@ fn judgement_units(
 
     if units.is_empty() {
         return uniform;
+    }
+
+    units
+}
+
+fn units_from_input_state_bins(
+    bins: &[InputStateBin; INPUT_STATE_BINS],
+    attrs: &SunnyManiaDifficultyAttributes,
+    total: f64,
+    model: &ErrorModel,
+) -> Vec<JudgementUnit> {
+    // ScoreV1 judges a long note as one object; release operations are metadata
+    // in that mode and must not dilute the observed judgement total.
+    let binned: u32 = bins
+        .iter()
+        .filter(|bin| !(attrs.ln_judged_as_one && bin.class == InputClass::Release))
+        .map(|bin| bin.count)
+        .sum();
+
+    if binned == 0 {
+        return Vec::new();
+    }
+
+    let per_operation = total / f64::from(binned);
+    let mut units = Vec::with_capacity(INPUT_STATE_BINS * 2);
+
+    for bin in bins.iter().filter(|bin| {
+        bin.count > 0 && !(attrs.ln_judged_as_one && bin.class == InputClass::Release)
+    }) {
+        let class_offset = match bin.class {
+            InputClass::Release if !attrs.ln_judged_as_one => model.release_mean_offset,
+            InputClass::Release => 0.0,
+            _ if bin.predecessor_count > 0 => {
+                model.recovery_mean_offset(bin.mean_gap_ms) * f64::from(bin.predecessor_count)
+                    / f64::from(bin.count)
+            }
+            _ => 0.0,
+        };
+        let long_count = if attrs.ln_judged_as_one {
+            bin.long_count
+        } else {
+            0
+        };
+        let plain_count = bin.count.saturating_sub(long_count);
+
+        if plain_count > 0 {
+            let mut unit = JudgementUnit::repeated(
+                bin.mean_difficulty,
+                f64::from(plain_count) * per_operation,
+            );
+            unit.fading_mean_offset = class_offset;
+            units.push(unit);
+        }
+
+        if long_count > 0 {
+            let mut unit = JudgementUnit::long_note(
+                bin.mean_difficulty,
+                f64::from(long_count) * per_operation,
+                model,
+                bin.mean_duration_ms,
+            );
+            unit.fading_mean_offset = class_offset;
+            units.push(unit);
+        }
     }
 
     units
@@ -935,11 +1288,7 @@ fn build_notes<'a>(
         let end = end / clock_rate;
         let tail = (end > head + 1e-7).then_some(end);
 
-        notes.push(Note {
-            column,
-            head,
-            tail,
-        });
+        notes.push(Note { column, head, tail });
     }
 
     (notes, max_combo)
@@ -971,7 +1320,12 @@ struct RebirthData {
 }
 
 impl RebirthData {
-    fn new(mut notes: Vec<Note>, total_columns: usize, hit_leniency: f64, good_window: f64) -> Self {
+    fn new(
+        mut notes: Vec<Note>,
+        total_columns: usize,
+        hit_leniency: f64,
+        good_window: f64,
+    ) -> Self {
         notes.sort_by(compare_notes);
 
         let mut notes_by_column = vec![Vec::new(); total_columns];
@@ -1031,12 +1385,7 @@ fn get_corners(t_end: f64, notes: &[Note]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let boundaries = [Some(note.head), note.tail];
 
         for boundary in boundaries.into_iter().flatten() {
-            base.extend([
-                boundary,
-                boundary + 501.0,
-                boundary - 499.0,
-                boundary + 1.0,
-            ]);
+            base.extend([boundary, boundary + 501.0, boundary - 499.0, boundary + 1.0]);
             awkwardness.extend([boundary, boundary + 1000.0, boundary - 1000.0]);
         }
     }
@@ -1537,7 +1886,11 @@ fn stream_booster(delta: f64) -> f64 {
     }
 }
 
-fn compute_pbar(data: &RebirthData, ln_rep: &LongNoteBodyRepresentation, anchor: &[f64]) -> Vec<f64> {
+fn compute_pbar(
+    data: &RebirthData,
+    ln_rep: &LongNoteBodyRepresentation,
+    anchor: &[f64],
+) -> Vec<f64> {
     let mut p_step = vec![0.0; data.base_corners.len()];
 
     for pair in data.notes.windows(2) {
@@ -1612,8 +1965,7 @@ fn compute_abar(
             if k0 < dks.len() && k1 < delta_by_column.len() {
                 dks[k0][idx] = (delta_by_column[k0][idx] - delta_by_column[k1][idx]).abs()
                     + 0.4
-                        * (delta_by_column[k0][idx].max(delta_by_column[k1][idx]) - 0.11)
-                            .max(0.0);
+                        * (delta_by_column[k0][idx].max(delta_by_column[k1][idx]) - 0.11).max(0.0);
             }
         }
     }
@@ -1741,7 +2093,10 @@ fn compute_rbar(data: &RebirthData) -> Vec<f64> {
 // Density & keys
 // ---------------------------------------------------------------------------
 
-fn compute_density_and_keys(data: &RebirthData, key_usage: &[Vec<bool>]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+fn compute_density_and_keys(
+    data: &RebirthData,
+    key_usage: &[Vec<bool>],
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let note_hit_times: Vec<_> = data.notes.iter().map(|note| note.head).collect();
 
     // For the v2 (non-classic) path, long note tails count as additional
@@ -1862,6 +2217,7 @@ struct RebirthParams {
     /// The per-note difficulty distribution the `sr` percentiles were taken from, kept
     /// rather than discarded — see [`SunnyManiaDifficultyAttributes::note_difficulty_bins`].
     note_difficulty_bins: Option<[NoteDifficultyBin; NOTE_DIFFICULTY_BINS]>,
+    input_state_bins: Option<[InputStateBin; INPUT_STATE_BINS]>,
 }
 
 fn calculate_from_data(data: &RebirthData, classic: bool) -> Option<RebirthParams> {
@@ -1903,7 +2259,7 @@ fn calculate_from_data(data: &RebirthData, classic: bool) -> Option<RebirthParam
                 + (1.0 - 0.4)
                     * (abar[idx].powf(2.0 / 3.0)
                         * (0.8 * pbar[idx] + rbar[idx] * release_density_weight(density[idx])))
-                        .powf(1.5))
+                    .powf(1.5))
             .powf(2.0 / 3.0);
             let t_all = (abar[idx].powf(3.0 / keys[idx]) * xbar[idx]) / (xbar[idx] + s_all + 1.0);
 
@@ -1931,7 +2287,11 @@ fn calculate_from_data(data: &RebirthData, classic: bool) -> Option<RebirthParam
     let effective_weights: Vec<_> = if classic {
         density.iter().zip(gaps).map(|(&c, gap)| c * gap).collect()
     } else {
-        density_v2.iter().zip(gaps).map(|(&c, gap)| c * gap).collect()
+        density_v2
+            .iter()
+            .zip(gaps)
+            .map(|(&c, gap)| c * gap)
+            .collect()
     };
     let mut sorted_indices: Vec<_> = (0..d_all.len()).collect();
     sorted_indices.sort_by(|&a, &b| d_all[a].total_cmp(&d_all[b]));
@@ -2009,6 +2369,7 @@ fn calculate_from_data(data: &RebirthData, classic: bool) -> Option<RebirthParam
         switches,
         variety,
         note_difficulty_bins: note_difficulty_bins(&per_note),
+        input_state_bins: input_state_bins(data, &d_all, classic),
     })
 }
 
@@ -2022,7 +2383,12 @@ fn rescale_high(sr: f64) -> f64 {
 
 /// Spikiness measure from the weighted variance of the corner difficulty
 /// values, i.e. how much the difficulty spikes within the map.
-fn compute_spikiness(d_sorted: &[f64], w_sorted: &[f64], weighted_mean: f64, total_weight: f64) -> f64 {
+fn compute_spikiness(
+    d_sorted: &[f64],
+    w_sorted: &[f64],
+    weighted_mean: f64,
+    total_weight: f64,
+) -> f64 {
     // Degenerate cases where the reference implementation would produce NaN
     if weighted_mean == 0.0 || total_weight <= 0.0 {
         return 0.0;
@@ -2051,11 +2417,17 @@ fn compute_switches(data: &RebirthData, ks_arr: &[f64], effective_weights: &[f64
     let heads: Vec<f64> = data.notes.iter().map(|note| note.head).collect();
 
     // For each head, the index of the first corner >= head (last index dropped)
-    let idx_list: Vec<usize> = heads.iter().map(|&head| lower_bound(all_corners, head)).collect();
+    let idx_list: Vec<usize> = heads
+        .iter()
+        .map(|&head| lower_bound(all_corners, head))
+        .collect();
     let n = idx_list.len().saturating_sub(1);
 
     let ks_at_note: Vec<f64> = idx_list[..n].iter().map(|&i| ks_arr[i]).collect();
-    let weights_at_note: Vec<f64> = idx_list[..n].iter().map(|&i| effective_weights[i]).collect();
+    let weights_at_note: Vec<f64> = idx_list[..n]
+        .iter()
+        .map(|&i| effective_weights[i])
+        .collect();
 
     let head_gaps: Vec<f64> = heads.windows(2).map(|w| w[1] - w[0]).collect();
     let num_head_gaps = head_gaps.len();
@@ -2096,13 +2468,20 @@ fn compute_switches(data: &RebirthData, ks_arr: &[f64], effective_weights: &[f64
     let mut num_tail_gaps = 0;
 
     if tails.len() > 1 && tails[tails.len() - 1] > tails[0] {
-        let idx_list_tails: Vec<usize> =
-            tails.iter().map(|&tail| lower_bound(all_corners, tail)).collect();
+        let idx_list_tails: Vec<usize> = tails
+            .iter()
+            .map(|&tail| lower_bound(all_corners, tail))
+            .collect();
         let n_tails = idx_list_tails.len() - 1;
 
-        let ks_at_tail: Vec<f64> = idx_list_tails[..n_tails].iter().map(|&i| ks_arr[i]).collect();
-        let weights_at_tail: Vec<f64> =
-            idx_list_tails[..n_tails].iter().map(|&i| effective_weights[i]).collect();
+        let ks_at_tail: Vec<f64> = idx_list_tails[..n_tails]
+            .iter()
+            .map(|&i| ks_arr[i])
+            .collect();
+        let weights_at_tail: Vec<f64> = idx_list_tails[..n_tails]
+            .iter()
+            .map(|&i| effective_weights[i])
+            .collect();
 
         let tail_gaps: Vec<f64> = tails.windows(2).map(|w| w[1] - w[0]).collect();
         let num_tail_gaps_tmp = tail_gaps.len();
@@ -2171,7 +2550,11 @@ fn compute_variety(data: &RebirthData) -> f64 {
     let mut head_gaps_new = Vec::new();
 
     for column in &data.notes_by_column {
-        head_gaps_new.extend(column.windows(2).map(|w| w[1].head as i64 - w[0].head as i64));
+        head_gaps_new.extend(
+            column
+                .windows(2)
+                .map(|w| w[1].head as i64 - w[0].head as i64),
+        );
     }
 
     let col_variety = 2.5 * rao_quadratic_entropy_log(&head_gaps_new, 2);
@@ -2234,8 +2617,8 @@ fn custom_accuracy(state: SunnyScoreState) -> f64 {
         return 0.0;
     }
 
-    let numerator = state.n320 * 305 + state.n300 * 300 + state.n200 * 200 + state.n100 * 100
-        + state.n50 * 50;
+    let numerator =
+        state.n320 * 305 + state.n300 * 300 + state.n200 * 200 + state.n100 * 100 + state.n50 * 50;
     let denominator = total_hits * 305;
 
     f64::from(numerator) / f64::from(denominator)
@@ -2297,8 +2680,10 @@ mod tests {
     use super::*;
     use rosu_mods::{GameMod, GameMods as LazerMods};
 
-    const MAP_1638954: &str = r"C:\Users\uuzof\AppData\Local\Temp\opencode\rosu-pp\resources\1638954.osu";
-    const MAP_5269878: &str = r"C:\Users\uuzof\AppData\Local\Temp\opencode\rosu-pp\resources\5269878.osu";
+    const MAP_1638954: &str =
+        r"C:\Users\uuzof\AppData\Local\Temp\opencode\rosu-pp\resources\1638954.osu";
+    const MAP_5269878: &str =
+        r"C:\Users\uuzof\AppData\Local\Temp\opencode\rosu-pp\resources\5269878.osu";
 
     fn single_mod(mods: &mut LazerMods, gamemod: GameMod) {
         mods.insert(gamemod);
@@ -2364,6 +2749,367 @@ mod tests {
         map
     }
 
+    fn input_note(column: usize, head: f64, tail: Option<f64>) -> Note {
+        Note { column, head, tail }
+    }
+
+    #[test]
+    fn input_operations_have_deterministic_order_and_classes() {
+        let notes = vec![
+            input_note(0, 0.0, Some(100.0)),
+            input_note(1, 0.0, None),
+            input_note(0, 100.0, None),
+            input_note(2, 200.0, Some(500.0)),
+            input_note(1, 300.0, None),
+            input_note(1, 600.0, None),
+            input_note(1, 720.0, None),
+            input_note(1, 1000.0, None),
+            input_note(0, 1100.0, None),
+            input_note(3, 1100.0, None),
+        ];
+
+        let classified = classify_input_operations(&notes, 4);
+        let at_100: Vec<_> = classified
+            .iter()
+            .filter(|op| op.operation.time_ms == 100.0 && op.operation.column == 0)
+            .collect();
+
+        assert_eq!(at_100.len(), 2);
+        assert_eq!(at_100[0].operation.kind, InputOperationKind::Release);
+        assert_eq!(at_100[0].class, InputClass::Release);
+        assert_eq!(at_100[1].operation.kind, InputOperationKind::Press);
+        assert_eq!(at_100[1].class, InputClass::ReleaseToPress);
+
+        let class = |note_idx| {
+            classified
+                .iter()
+                .find(|op| {
+                    op.operation.note_idx == note_idx
+                        && op.operation.kind == InputOperationKind::Press
+                })
+                .unwrap()
+                .class
+        };
+
+        assert_eq!(class(4), InputClass::PressUnderHold);
+        assert_eq!(class(5), InputClass::Jack);
+        assert_eq!(class(6), InputClass::RapidRepress);
+        assert_eq!(class(7), InputClass::Jack);
+        assert_eq!(class(8), InputClass::ChordEntryOrExit);
+        assert_eq!(class(9), InputClass::ChordEntryOrExit);
+
+        let invalid = input_operations(&[
+            input_note(0, 0.0, Some(0.0)),
+            input_note(1, 0.0, Some(-1.0)),
+        ]);
+        assert_eq!(
+            invalid.len(),
+            2,
+            "zero and negative holds are plain presses"
+        );
+        assert!(
+            invalid
+                .iter()
+                .all(|op| op.kind == InputOperationKind::Press)
+        );
+    }
+
+    #[test]
+    fn input_state_bins_match_each_scoring_modes_judgement_count() {
+        let map = synthetic_map_with_holds(8.0, 400, 120.0, 3, 90.0);
+
+        for classic in [true, false] {
+            let attrs = calculate(&map, &GameMods::default(), 1.0, Some(!classic), None).unwrap();
+            let bins = attrs.input_state_bins.unwrap();
+            let count: u32 = bins.iter().map(|bin| bin.count).sum();
+            let expected = attrs.n_objects + usize::from(!classic) * attrs.n_long_notes;
+
+            assert_eq!(count as usize, expected);
+            assert!(bins.iter().all(|bin| bin.long_count <= bin.count));
+        }
+    }
+
+    #[test]
+    fn input_state_surface_is_neutral_by_default_and_effective_when_enabled() {
+        let map = synthetic_map(8.0, 400, 90.0);
+        let attrs = calculate(&map, &GameMods::default(), 1.0, Some(true), None).unwrap();
+        let without_bins = SunnyManiaDifficultyAttributes {
+            input_state_bins: None,
+            ..attrs
+        };
+        let default = ErrorModel::default();
+        let with_default = judgement_units(&attrs, 400.0, &default, true);
+        let without_default = judgement_units(&without_bins, 400.0, &default, true);
+
+        assert_eq!(with_default, without_default);
+
+        let enabled = ErrorModel {
+            recovery_offset: 73.12,
+            ..default
+        };
+        let with_enabled = judgement_units(&attrs, 400.0, &enabled, true);
+        let without_enabled = judgement_units(&without_bins, 400.0, &enabled, true);
+        let expected_with = crate::mania_accuracy::expected_counts(
+            &with_enabled,
+            &attrs.hit_windows,
+            &enabled,
+            8.0,
+        );
+        let expected_without = crate::mania_accuracy::expected_counts(
+            &without_enabled,
+            &attrs.hit_windows,
+            &enabled,
+            8.0,
+        );
+
+        assert_ne!(expected_with.as_array(), expected_without.as_array());
+
+        let ss_ceiling = crate::mania_accuracy::expected_counts(
+            &with_enabled,
+            &attrs.hit_windows,
+            &enabled,
+            1.0e6,
+        )
+        .get(crate::mania_windows::ManiaJudgement::Perfect)
+            / 400.0;
+        assert!(
+            ss_ceiling > 0.999_999,
+            "input-state conditioning must still permit an SS, ceiling={ss_ceiling}"
+        );
+    }
+
+    #[test]
+    #[ignore = "reads one gitignored fixture and prints an input-state diagnostic"]
+    fn diagnose_input_state_map_4772182() {
+        use crate::mania_accuracy::expected_counts;
+        use crate::mania_windows::ManiaJudgement;
+
+        let map = parse("local-fixtures/maps/4772182.osu").expect("fixture map 4772182");
+        let (mods, clock_rate) = mods_for("DT");
+        let attrs = calculate(&map, &mods, clock_rate, Some(false), None).unwrap();
+        let counts = [2453, 423, 0, 0, 0, 0];
+        let total = counts.iter().sum::<u32>() as f64;
+
+        let baseline = ErrorModel::default();
+        let candidate = ErrorModel {
+            recovery_offset: 73.12,
+            ..baseline
+        };
+
+        for (label, model) in [("baseline", baseline), ("candidate", candidate)] {
+            let units = judgement_units(&attrs, total, &model, true);
+            let played = fit_with_quality(&counts, &units, &attrs.hit_windows, &model);
+            let reference = fit_with_quality(&counts, &units, &reference_windows(&attrs), &model);
+            let ceiling = expected_counts(&units, &attrs.hit_windows, &model, 1.0e6)
+                .get(ManiaJudgement::Perfect)
+                / total;
+            println!(
+                "{label}: units={} played_skill={:.6} reference_skill={:.6} scalar={:.8} g={:.3}/{:.3} perfect_ceiling={:.6}",
+                units.len(),
+                played.skill,
+                reference.skill,
+                played.skill / reference.skill,
+                played.g_timing,
+                reference.g_timing,
+                ceiling,
+            );
+            assert!(label == "baseline" || ceiling > 0.999_999);
+        }
+
+        println!("class quantiles:");
+        for bin in attrs
+            .input_state_bins
+            .unwrap()
+            .iter()
+            .filter(|bin| bin.count > 0)
+        {
+            let offset = if bin.predecessor_count > 0 {
+                candidate.recovery_mean_offset(bin.mean_gap_ms) * f64::from(bin.predecessor_count)
+                    / f64::from(bin.count)
+            } else {
+                0.0
+            };
+            println!(
+                "  {:?}: n={} pred={} d={:.3} gap={:.2} chord={:.2} held={:.2} offset={:+.2}",
+                bin.class,
+                bin.count,
+                bin.predecessor_count,
+                bin.mean_difficulty,
+                bin.mean_gap_ms,
+                bin.mean_chord_width,
+                bin.mean_other_held,
+                offset,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "reads one gitignored fixture and prints a low-OD LN diagnostic"]
+    fn diagnose_input_state_map_3217217() {
+        use crate::mania_accuracy::expected_counts;
+        use crate::mania_windows::ManiaJudgement;
+
+        let map = parse("local-fixtures/maps/3217217.osu").expect("fixture map 3217217");
+        let (mods, clock_rate) = mods_for("MR");
+        let attrs = calculate(&map, &mods, clock_rate, Some(false), None).unwrap();
+        let counts = [1381, 2071, 49, 9, 11, 32];
+        let total = counts.iter().sum::<u32>() as f64;
+        let live_pp = 877.228;
+
+        println!(
+            "map: objects={} long_notes={} LN={:.1}% judgements={} OD={:.1} windows={:?}",
+            attrs.n_objects,
+            attrs.n_long_notes,
+            100.0 * attrs.n_long_notes as f64 / attrs.n_objects as f64,
+            total,
+            map.od,
+            attrs.hit_windows,
+        );
+
+        let baseline = ErrorModel::default();
+        let candidate = ErrorModel {
+            recovery_offset: 73.12,
+            ..baseline
+        };
+
+        for (label, model) in [("baseline", baseline), ("candidate", candidate)] {
+            let units = judgement_units(&attrs, total, &model, true);
+            let played = fit_with_quality(&counts, &units, &attrs.hit_windows, &model);
+            let reference = fit_with_quality(&counts, &units, &reference_windows(&attrs), &model);
+            let perf = calculate_performance_with_model(
+                &attrs,
+                &mods,
+                SunnyScoreState {
+                    n320: counts[0],
+                    n300: counts[1],
+                    n200: counts[2],
+                    n100: counts[3],
+                    n50: counts[4],
+                    misses: counts[5],
+                },
+                &model,
+            );
+            let ceiling = expected_counts(&units, &attrs.hit_windows, &model, 1.0e6)
+                .get(ManiaJudgement::Perfect)
+                / total;
+
+            println!(
+                "{label}: units={} pp={:.2} live_ratio={:.2}% played_skill={:.6} reference_skill={:.6} scalar={:.8} g={:.3}/{:.3} perfect_ceiling={:.6}",
+                units.len(),
+                perf.pp,
+                100.0 * perf.pp / live_pp,
+                played.skill,
+                reference.skill,
+                played.skill / reference.skill,
+                played.g_timing,
+                reference.g_timing,
+                ceiling,
+            );
+        }
+
+        let total_columns = map.cs.round_ties_even().max(1.0) as usize;
+        let (notes, _) = build_notes(clock_rate, map.hit_objects.iter(), total_columns);
+        let windows = hit_windows(&map, &mods, clock_rate, false);
+        let great =
+            get_hit_window_300(&map, clock_rate, has_mod(&mods, "HR"), has_mod(&mods, "EZ"));
+        let data = RebirthData::new(
+            notes,
+            total_columns,
+            hit_leniency_from_window(great),
+            windows.good,
+        );
+        let (_, _, per_note) = per_note_difficulty(&map).expect("per-note difficulty");
+        let gaps = same_column_gaps(&data);
+        let per_unit = total / per_note.len() as f64;
+        let mut exact = Vec::with_capacity(per_note.len());
+
+        for (idx, &(difficulty, duration)) in per_note.iter().enumerate() {
+            let (sigma_scale, release_offset) = match duration {
+                Some(duration) if attrs.ln_judged_as_one => (
+                    crate::mania_accuracy::ln_sigma_scale_for_duration(&candidate, duration),
+                    candidate.release_mean_offset,
+                ),
+                _ => (1.0, 0.0),
+            };
+
+            exact.push(JudgementUnit {
+                difficulty,
+                weight: per_unit,
+                sigma_scale,
+                mean_offset: release_offset,
+                fading_mean_offset: candidate.recovery_mean_offset(gaps[idx]),
+            });
+        }
+
+        let exact_played = fit_with_quality(&counts, &exact, &attrs.hit_windows, &candidate);
+        let exact_reference =
+            fit_with_quality(&counts, &exact, &reference_windows(&attrs), &candidate);
+        let exact_scalar = exact_played.skill / exact_reference.skill;
+        let compact_pp = calculate_performance_with_model(
+            &attrs,
+            &mods,
+            SunnyScoreState {
+                n320: counts[0],
+                n300: counts[1],
+                n200: counts[2],
+                n100: counts[3],
+                n50: counts[4],
+                misses: counts[5],
+            },
+            &candidate,
+        )
+        .pp;
+        let compact_units = judgement_units(&attrs, total, &candidate, true);
+        let compact_played =
+            fit_with_quality(&counts, &compact_units, &attrs.hit_windows, &candidate);
+        let compact_reference = fit_with_quality(
+            &counts,
+            &compact_units,
+            &reference_windows(&attrs),
+            &candidate,
+        );
+        let compact_scalar = compact_played.skill / compact_reference.skill;
+        println!(
+            "exact candidate: units={} played_skill={:.6} reference_skill={:.6} scalar={:.8} g={:.3}/{:.3} implied_pp={:.2} compact_pp={:.2}",
+            exact.len(),
+            exact_played.skill,
+            exact_reference.skill,
+            exact_scalar,
+            exact_played.g_timing,
+            exact_reference.g_timing,
+            compact_pp * (exact_scalar / compact_scalar).powf(2.2),
+            compact_pp,
+        );
+
+        println!("class quantiles:");
+        for bin in attrs
+            .input_state_bins
+            .unwrap()
+            .iter()
+            .filter(|bin| bin.count > 0)
+        {
+            let offset = if bin.predecessor_count > 0 {
+                candidate.recovery_mean_offset(bin.mean_gap_ms) * f64::from(bin.predecessor_count)
+                    / f64::from(bin.count)
+            } else {
+                0.0
+            };
+            println!(
+                "  {:?}: n={} long={} pred={} d={:.3} duration={:.1} gap={:.2} chord={:.2} held={:.2} offset={:+.2}",
+                bin.class,
+                bin.count,
+                bin.long_count,
+                bin.predecessor_count,
+                bin.mean_difficulty,
+                bin.mean_duration_ms,
+                bin.mean_gap_ms,
+                bin.mean_chord_width,
+                bin.mean_other_held,
+                offset,
+            );
+        }
+    }
+
     /// The per-note path must hand the fit exactly the score that was played.
     ///
     /// [`crate::mania_accuracy::skill_for_counts`] fits a multinomial, so the unit weights
@@ -2383,9 +3129,21 @@ mod tests {
         let cases = [
             ("rice, V1", synthetic_map(8.0, 400, 120.0), true),
             ("rice, V2", synthetic_map(8.0, 400, 120.0), false),
-            ("holds, V1", synthetic_map_with_holds(8.0, 400, 120.0, 3, 90.0), true),
-            ("holds, V2", synthetic_map_with_holds(8.0, 400, 120.0, 3, 90.0), false),
-            ("all holds, V1", synthetic_map_with_holds(8.0, 400, 120.0, 1, 300.0), true),
+            (
+                "holds, V1",
+                synthetic_map_with_holds(8.0, 400, 120.0, 3, 90.0),
+                true,
+            ),
+            (
+                "holds, V2",
+                synthetic_map_with_holds(8.0, 400, 120.0, 3, 90.0),
+                false,
+            ),
+            (
+                "all holds, V1",
+                synthetic_map_with_holds(8.0, 400, 120.0, 1, 300.0),
+                true,
+            ),
         ];
 
         for (label, map, classic) in cases {
@@ -2399,7 +3157,10 @@ mod tests {
             let long: u32 = bins.iter().map(|bin| bin.long).sum();
 
             if label.contains("holds") {
-                assert!(long > 0, "{label}: expected long notes in the bins, found none");
+                assert!(
+                    long > 0,
+                    "{label}: expected long notes in the bins, found none"
+                );
                 assert!(
                     bins.iter().any(|bin| bin.mean_duration > 0.0),
                     "{label}: expected a non-zero mean hold duration"
@@ -2419,12 +3180,8 @@ mod tests {
                     "{label}: a {total}-hit score got {weight} units of weight"
                 );
 
-                let emitted = crate::mania_accuracy::expected_counts(
-                    &units,
-                    &attrs.hit_windows,
-                    &model,
-                    9.0,
-                );
+                let emitted =
+                    crate::mania_accuracy::expected_counts(&units, &attrs.hit_windows, &model, 9.0);
                 let emitted_total: f64 = crate::mania_windows::ManiaJudgement::ALL
                     .iter()
                     .map(|&judgement| emitted.get(judgement))
@@ -2469,7 +3226,14 @@ mod tests {
         );
 
         // And the pricing path survives it, which is the property the JS binding relies on.
-        let state = SunnyScoreState { n320: 380, n300: 20, n200: 0, n100: 0, n50: 0, misses: 0 };
+        let state = SunnyScoreState {
+            n320: 380,
+            n300: 20,
+            n200: 0,
+            n100: 0,
+            n50: 0,
+            misses: 0,
+        };
         let scalar = window_scalar_with_model(&stripped, state, &ErrorModel::default());
 
         assert!(
@@ -2541,18 +3305,14 @@ mod tests {
         assert!((get_hit_window_300(&map, 1.0, false, false) - 40.5).abs() < 1e-9);
 
         // HR: (int)(40.000001 / 1.4) + 0.5 = 28.5
-        assert!(
-            (get_hit_window_300(&map, 1.0, true, false) - 28.5).abs() < 1e-9
-        );
+        assert!((get_hit_window_300(&map, 1.0, true, false) - 28.5).abs() < 1e-9);
 
         // EZ: (int)(40.000001 * 1.4) + 0.5 = 56.5
         assert!((get_hit_window_300(&map, 1.0, false, true) - 56.5).abs() < 1e-9);
 
         // clock rate scales the window but the fractional truncation is kept
         // (matches the reference: (int)(40 * 1.5 + 1e-6) + 0.5 = 60.5 / 1.5)
-        assert!(
-            (get_hit_window_300(&map, 1.5, false, false) - 60.5 / 1.5).abs() < 1e-9
-        );
+        assert!((get_hit_window_300(&map, 1.5, false, false) - 60.5 / 1.5).abs() < 1e-9);
     }
 
     #[test]
@@ -2597,7 +3357,15 @@ mod tests {
         assert!(perf.pp > 0.0);
         assert!((perf.variety_multiplier - 0.945..=1.055).contains(&perf.variety_multiplier));
         assert!(perf.length_multiplier > 0.0 && perf.length_multiplier < 1.1);
-        assert!((perf.pp - perf.pp_difficulty * perf.variety_multiplier * perf.acc_multiplier * perf.length_multiplier).abs() < 1e-6);
+        assert!(
+            (perf.pp
+                - perf.pp_difficulty
+                    * perf.variety_multiplier
+                    * perf.acc_multiplier
+                    * perf.length_multiplier)
+                .abs()
+                < 1e-6
+        );
 
         // NF keeps its flat factor: failing is a scoring matter the timing surface
         // says nothing about.
@@ -2798,7 +3566,10 @@ mod tests {
 
         let empty = calculate_performance(&attrs, &mods, SunnyScoreState::default());
 
-        assert_eq!(empty.window_scalar, 1.0, "an empty score has nothing to fit");
+        assert_eq!(
+            empty.window_scalar, 1.0,
+            "an empty score has nothing to fit"
+        );
     }
 
     /// Some real scores still fit poorly even with a calibrated tail, so pricing must
@@ -2878,26 +3649,246 @@ mod tests {
     /// tRPC API. Beatmaps live alongside in `local-fixtures/maps/`; both are
     /// gitignored, so this report skips when they are absent.
     const REAL_SCORES: &[Row] = &[
-        Row { map: "4633018", n320: 1987, n300: 1710, n200: 593, n100: 20, n50: 8, miss: 138, live_pp: 1379.012, live_acc: 91.241, mods: "EZ+DT" },
-        Row { map: "5583718", n320: 1399, n300: 980, n200: 324, n100: 46, n50: 5, miss: 13, live_pp: 1356.142, live_acc: 94.368, mods: "EZ+DT" },
-        Row { map: "3663002", n320: 1975, n300: 1863, n200: 591, n100: 34, n50: 0, miss: 210, live_pp: 1313.038, live_acc: 90.01, mods: "EZ+DT" },
-        Row { map: "4870605", n320: 1436, n300: 1194, n200: 600, n100: 35, n50: 0, miss: 42, live_pp: 1279.841, live_acc: 91.181, mods: "EZ+DT" },
-        Row { map: "4870608", n320: 2590, n300: 2266, n200: 928, n100: 132, n50: 30, miss: 50, live_pp: 1240.625, live_acc: 92.123, mods: "EZ+DT" },
-        Row { map: "3583718", n320: 1359, n300: 1458, n200: 783, n100: 52, n50: 3, miss: 65, live_pp: 1199.563, live_acc: 89.357, mods: "EZ+DT" },
-        Row { map: "5583724", n320: 1323, n300: 1366, n200: 550, n100: 102, n50: 29, miss: 17, live_pp: 1183.49, live_acc: 91.364, mods: "EZ+DT" },
-        Row { map: "4459721", n320: 1306, n300: 1502, n200: 648, n100: 34, n50: 0, miss: 71, live_pp: 1095.582, live_acc: 90.408, mods: "EZ+DT" },
-        Row { map: "4459716", n320: 1240, n300: 1120, n200: 486, n100: 93, n50: 1, miss: 18, live_pp: 1094.649, live_acc: 91.791, mods: "EZ+DT" },
-        Row { map: "4807505", n320: 2407, n300: 1825, n200: 761, n100: 128, n50: 35, miss: 54, live_pp: 1065.901, live_acc: 91.897, mods: "EZ+DT" },
-        Row { map: "5583717", n320: 1095, n300: 1149, n200: 544, n100: 34, n50: 1, miss: 105, live_pp: 1028.791, live_acc: 88.565, mods: "EZ+DT" },
-        Row { map: "4870609", n320: 1048, n300: 940, n200: 326, n100: 17, n50: 0, miss: 49, live_pp: 984.332, live_acc: 92.098, mods: "EZ+DT" },
-        Row { map: "4459712", n320: 1415, n300: 1016, n200: 393, n100: 47, n50: 7, miss: 13, live_pp: 965.078, live_acc: 93.733, mods: "EZ+DT" },
-        Row { map: "4459715", n320: 1203, n300: 1536, n200: 779, n100: 37, n50: 0, miss: 65, live_pp: 945.481, live_acc: 89.414, mods: "EZ+DT" },
-        Row { map: "4459717", n320: 1213, n300: 1138, n200: 583, n100: 38, n50: 4, miss: 38, live_pp: 920.466, live_acc: 90.503, mods: "EZ+DT" },
-        Row { map: "4706643", n320: 882, n300: 538, n200: 195, n100: 48, n50: 1, miss: 19, live_pp: 895.026, live_acc: 93.058, mods: "EZ+DT" },
-        Row { map: "4459723", n320: 940, n300: 953, n200: 410, n100: 30, n50: 0, miss: 47, live_pp: 852.64, live_acc: 90.591, mods: "EZ+DT" },
-        Row { map: "4229780", n320: 2459, n300: 963, n200: 144, n100: 56, n50: 13, miss: 82, live_pp: 722.134, live_acc: 95.207, mods: "" },
-        Row { map: "3477077", n320: 1482, n300: 637, n200: 84, n100: 12, n50: 3, miss: 42, live_pp: 707.994, live_acc: 96.438, mods: "" },
-        Row { map: "3477076", n320: 1587, n300: 598, n200: 66, n100: 8, n50: 1, miss: 16, live_pp: 672.317, live_acc: 98.059, mods: "" },
+        Row {
+            map: "4633018",
+            n320: 1987,
+            n300: 1710,
+            n200: 593,
+            n100: 20,
+            n50: 8,
+            miss: 138,
+            live_pp: 1379.012,
+            live_acc: 91.241,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "5583718",
+            n320: 1399,
+            n300: 980,
+            n200: 324,
+            n100: 46,
+            n50: 5,
+            miss: 13,
+            live_pp: 1356.142,
+            live_acc: 94.368,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "3663002",
+            n320: 1975,
+            n300: 1863,
+            n200: 591,
+            n100: 34,
+            n50: 0,
+            miss: 210,
+            live_pp: 1313.038,
+            live_acc: 90.01,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "4870605",
+            n320: 1436,
+            n300: 1194,
+            n200: 600,
+            n100: 35,
+            n50: 0,
+            miss: 42,
+            live_pp: 1279.841,
+            live_acc: 91.181,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "4870608",
+            n320: 2590,
+            n300: 2266,
+            n200: 928,
+            n100: 132,
+            n50: 30,
+            miss: 50,
+            live_pp: 1240.625,
+            live_acc: 92.123,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "3583718",
+            n320: 1359,
+            n300: 1458,
+            n200: 783,
+            n100: 52,
+            n50: 3,
+            miss: 65,
+            live_pp: 1199.563,
+            live_acc: 89.357,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "5583724",
+            n320: 1323,
+            n300: 1366,
+            n200: 550,
+            n100: 102,
+            n50: 29,
+            miss: 17,
+            live_pp: 1183.49,
+            live_acc: 91.364,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "4459721",
+            n320: 1306,
+            n300: 1502,
+            n200: 648,
+            n100: 34,
+            n50: 0,
+            miss: 71,
+            live_pp: 1095.582,
+            live_acc: 90.408,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "4459716",
+            n320: 1240,
+            n300: 1120,
+            n200: 486,
+            n100: 93,
+            n50: 1,
+            miss: 18,
+            live_pp: 1094.649,
+            live_acc: 91.791,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "4807505",
+            n320: 2407,
+            n300: 1825,
+            n200: 761,
+            n100: 128,
+            n50: 35,
+            miss: 54,
+            live_pp: 1065.901,
+            live_acc: 91.897,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "5583717",
+            n320: 1095,
+            n300: 1149,
+            n200: 544,
+            n100: 34,
+            n50: 1,
+            miss: 105,
+            live_pp: 1028.791,
+            live_acc: 88.565,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "4870609",
+            n320: 1048,
+            n300: 940,
+            n200: 326,
+            n100: 17,
+            n50: 0,
+            miss: 49,
+            live_pp: 984.332,
+            live_acc: 92.098,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "4459712",
+            n320: 1415,
+            n300: 1016,
+            n200: 393,
+            n100: 47,
+            n50: 7,
+            miss: 13,
+            live_pp: 965.078,
+            live_acc: 93.733,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "4459715",
+            n320: 1203,
+            n300: 1536,
+            n200: 779,
+            n100: 37,
+            n50: 0,
+            miss: 65,
+            live_pp: 945.481,
+            live_acc: 89.414,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "4459717",
+            n320: 1213,
+            n300: 1138,
+            n200: 583,
+            n100: 38,
+            n50: 4,
+            miss: 38,
+            live_pp: 920.466,
+            live_acc: 90.503,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "4706643",
+            n320: 882,
+            n300: 538,
+            n200: 195,
+            n100: 48,
+            n50: 1,
+            miss: 19,
+            live_pp: 895.026,
+            live_acc: 93.058,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "4459723",
+            n320: 940,
+            n300: 953,
+            n200: 410,
+            n100: 30,
+            n50: 0,
+            miss: 47,
+            live_pp: 852.64,
+            live_acc: 90.591,
+            mods: "EZ+DT",
+        },
+        Row {
+            map: "4229780",
+            n320: 2459,
+            n300: 963,
+            n200: 144,
+            n100: 56,
+            n50: 13,
+            miss: 82,
+            live_pp: 722.134,
+            live_acc: 95.207,
+            mods: "",
+        },
+        Row {
+            map: "3477077",
+            n320: 1482,
+            n300: 637,
+            n200: 84,
+            n100: 12,
+            n50: 3,
+            miss: 42,
+            live_pp: 707.994,
+            live_acc: 96.438,
+            mods: "",
+        },
+        Row {
+            map: "3477076",
+            n320: 1587,
+            n300: 598,
+            n200: 66,
+            n100: 8,
+            n50: 1,
+            miss: 16,
+            live_pp: 672.317,
+            live_acc: 98.059,
+            mods: "",
+        },
     ];
 
     /// One fixture reduced to what the surface needs: the windows it was played
@@ -3208,7 +4199,11 @@ mod tests {
             println!(
                 "{:>9} {:>7} {:>7.4} {:>9.1} {:>9.1}",
                 score.map,
-                if score.mods.is_empty() { "NM" } else { score.mods },
+                if score.mods.is_empty() {
+                    "NM"
+                } else {
+                    score.mods
+                },
                 scalar,
                 before.g_timing,
                 after.g_timing,
@@ -3391,15 +4386,29 @@ mod tests {
                 }
             }
 
-            if count == 0 { f64::INFINITY } else { sum / count as f64 }
+            if count == 0 {
+                f64::INFINITY
+            } else {
+                sum / count as f64
+            }
         };
 
         let baseline = ErrorModel::default();
-        let single_normal = ErrorModel { lapse_weight: 0.0, ..baseline };
+        let single_normal = ErrorModel {
+            lapse_weight: 0.0,
+            ..baseline
+        };
 
-        println!("single normal:   mean g_timing={:.2}", mean_g(&single_normal));
-        println!("current default: lapse_weight={:.4} lapse_ratio={:.3} mean g_timing={:.2}",
-            baseline.lapse_weight, baseline.lapse_ratio, mean_g(&baseline));
+        println!(
+            "single normal:   mean g_timing={:.2}",
+            mean_g(&single_normal)
+        );
+        println!(
+            "current default: lapse_weight={:.4} lapse_ratio={:.3} mean g_timing={:.2}",
+            baseline.lapse_weight,
+            baseline.lapse_ratio,
+            mean_g(&baseline)
+        );
 
         // Grid search (narrower range since multiuser might be different)
         let mut best = single_normal;
@@ -3420,8 +4429,10 @@ mod tests {
                 if value < best_score {
                     best_score = value;
                     best = candidate;
-                    println!("  new best: weight={:.4} ratio={:.2} g={:.2}",
-                        weight, ratio, value);
+                    println!(
+                        "  new best: weight={:.4} ratio={:.2} g={:.2}",
+                        weight, ratio, value
+                    );
                 }
 
                 ratio += 0.25;
@@ -3429,8 +4440,10 @@ mod tests {
             weight += 0.005;
         }
 
-        println!("\nGrid best: lapse_weight={:.4} lapse_ratio={:.2} mean g_timing={:.2}",
-            best.lapse_weight, best.lapse_ratio, best_score);
+        println!(
+            "\nGrid best: lapse_weight={:.4} lapse_ratio={:.2} mean g_timing={:.2}",
+            best.lapse_weight, best.lapse_ratio, best_score
+        );
 
         // Refine
         let mut step = [0.0025, 0.125];
@@ -3460,8 +4473,10 @@ mod tests {
             }
         }
 
-        println!("Refined:   lapse_weight={:.4} lapse_ratio={:.3} mean g_timing={:.2}",
-            best.lapse_weight, best.lapse_ratio, best_score);
+        println!(
+            "Refined:   lapse_weight={:.4} lapse_ratio={:.3} mean g_timing={:.2}",
+            best.lapse_weight, best.lapse_ratio, best_score
+        );
     }
 
     /// Not an assertion — a report. Prices every real score through the current
@@ -3536,8 +4551,7 @@ mod tests {
                 attrs.stars,
                 f64::from(state.total_hits()),
             )];
-            let fit =
-                fit_with_quality(&counts, &units, &attrs.hit_windows, &ErrorModel::default());
+            let fit = fit_with_quality(&counts, &units, &attrs.hit_windows, &ErrorModel::default());
 
             // What the same score would be worth with the scalar switched off, so
             // the window effect can be read directly in pp rather than in skill.
@@ -3665,12 +4679,7 @@ mod tests {
         );
         println!(
             "windows: perfect {:.1} great {:.1} good {:.1} ok {:.1} meh {:.1} miss {:.1}",
-            windows.perfect,
-            windows.great,
-            windows.good,
-            windows.ok,
-            windows.meh,
-            windows.miss
+            windows.perfect, windows.great, windows.good, windows.ok, windows.meh, windows.miss
         );
 
         let implied_sigma = model.sigma(attrs.stars, fit.skill);
@@ -3695,8 +4704,7 @@ mod tests {
         // two-component mixture, variance = (1-w)*s^2 + w*(k*s)^2.
         let weight = model.lapse_weight;
         let ratio = model.lapse_ratio;
-        let mixture_sigma =
-            implied_sigma * ((1.0 - weight) + weight * ratio * ratio).sqrt();
+        let mixture_sigma = implied_sigma * ((1.0 - weight) + weight * ratio * ratio).sqrt();
 
         println!(
             "mixture sigma (both components) = {mixture_sigma:.2} ms  \
@@ -3750,7 +4758,10 @@ mod tests {
         let observed_timing = f64::from(total - state.misses);
         let expected_timing = expected.total() - expected.get(ManiaJudgement::Miss);
 
-        println!("\n{:>10} {:>10} {:>10}", "judgement", "observed", "predicted");
+        println!(
+            "\n{:>10} {:>10} {:>10}",
+            "judgement", "observed", "predicted"
+        );
 
         for (label, judgement, observed) in [
             ("320", ManiaJudgement::Perfect, state.n320),
@@ -3917,18 +4928,21 @@ mod tests {
             let model = ErrorModel::default();
             let fit = fit_with_quality(&counts, &units, &attrs.hit_windows, &model);
 
-            by_player.entry(fields[0].to_owned()).or_default().push(Row {
-                stars: attrs.stars,
-                od: map.od,
-                acc: fields[8].parse().unwrap_or(0.0),
-                live_pp: fields[9].parse().unwrap_or(0.0),
-                our_pp: perf.pp,
-                skill: skill_for_counts(&counts, &units, &attrs.hit_windows, &model),
-                scalar: perf.window_scalar,
-                g_timing: fit.g_timing,
-                plausible: fit.is_plausible(),
-                notes: state.total_hits(),
-            });
+            by_player
+                .entry(fields[0].to_owned())
+                .or_default()
+                .push(Row {
+                    stars: attrs.stars,
+                    od: map.od,
+                    acc: fields[8].parse().unwrap_or(0.0),
+                    live_pp: fields[9].parse().unwrap_or(0.0),
+                    our_pp: perf.pp,
+                    skill: skill_for_counts(&counts, &units, &attrs.hit_windows, &model),
+                    scalar: perf.window_scalar,
+                    g_timing: fit.g_timing,
+                    plausible: fit.is_plausible(),
+                    notes: state.total_hits(),
+                });
         }
 
         if by_player.is_empty() {
@@ -3945,7 +4959,15 @@ mod tests {
             println!("\n=== player {player} ({} scores)", rows.len());
             println!(
                 "{:>6} {:>4} {:>6} {:>7} {:>8} {:>8} {:>7} {:>7} {:>9} {:>6}",
-                "stars", "od", "notes", "acc%", "livePP", "ourPP", "skill", "sk/st", "g_timing",
+                "stars",
+                "od",
+                "notes",
+                "acc%",
+                "livePP",
+                "ourPP",
+                "skill",
+                "sk/st",
+                "g_timing",
                 "plaus"
             );
 
@@ -3986,9 +5008,7 @@ mod tests {
         let scalars: Vec<f64> = all.iter().map(|r| r.scalar).collect();
         let lo = scalars.iter().copied().fold(f64::INFINITY, f64::min);
         let hi = scalars.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        println!(
-            "window scalar: {lo:.4}..{hi:.4} (no-mod, so departures from 1 are OD alone)"
-        );
+        println!("window scalar: {lo:.4}..{hi:.4} (no-mod, so departures from 1 are OD alone)");
 
         let plausible = all.iter().filter(|r| r.plausible).count();
         println!(
@@ -4016,9 +5036,11 @@ mod tests {
             if band.is_empty() {
                 continue;
             }
-            let ratio =
-                band.iter().map(|r| r.skill / r.stars).sum::<f64>() / band.len() as f64;
-            println!("  {lo:>4.1}-{hi:<4.1} n={:<4} mean skill/stars {ratio:.3}", band.len());
+            let ratio = band.iter().map(|r| r.skill / r.stars).sum::<f64>() / band.len() as f64;
+            println!(
+                "  {lo:>4.1}-{hi:<4.1} n={:<4} mean skill/stars {ratio:.3}",
+                band.len()
+            );
         }
     }
 
@@ -4037,7 +5059,7 @@ mod tests {
     #[ignore = "writes CSV for plotting rather than asserting"]
     fn surface_dump() {
         use crate::mania_accuracy::expected_counts;
-        use crate::mania_windows::{windows_from_great, ManiaJudgement};
+        use crate::mania_windows::{ManiaJudgement, windows_from_great};
         use std::fmt::Write as _;
 
         let model = ErrorModel::default();
@@ -4131,7 +5153,12 @@ mod tests {
 
         std::fs::write(dir.join("windows.csv"), windows_csv).unwrap();
 
-        println!("wrote {} (grid {} x {})", dir.display(), difficulties.len(), skills.len());
+        println!(
+            "wrote {} (grid {} x {})",
+            dir.display(),
+            difficulties.len(),
+            skills.len()
+        );
     }
 
     /// Not an assertion — dumps `target/surface/od_grid.csv`: every judgement band's
@@ -4154,7 +5181,7 @@ mod tests {
     #[ignore = "writes CSV for plotting rather than asserting"]
     fn od_surface_dump() {
         use crate::mania_accuracy::expected_counts;
-        use crate::mania_windows::{hit_windows, ManiaJudgement};
+        use crate::mania_windows::{ManiaJudgement, hit_windows};
         use std::fmt::Write as _;
 
         let model = ErrorModel::default();
@@ -4297,7 +5324,8 @@ mod tests {
         for (label, mods) in [("DT", GameMods::default()), ("DT+EZ", with_ez)] {
             // Classic (stable) scoring, DT 1.5x, as played.
             let attrs = calculate(&map, &mods, 1.5, Some(false), None).unwrap();
-            let fit = fit_with_quality(&counts, &units_for(attrs.stars), &attrs.hit_windows, &model);
+            let fit =
+                fit_with_quality(&counts, &units_for(attrs.stars), &attrs.hit_windows, &model);
             let perf = calculate_performance(&attrs, &mods, state);
 
             rows.push((label, attrs, fit, perf));
@@ -4305,7 +5333,13 @@ mod tests {
 
         println!(
             "map: OD {} convert {} | {total} notes | counts 320:{} 300:{} 200:{} 100:{} 50:{} miss:{}",
-            map.od, map.is_convert, state.n320, state.n300, state.n200, state.n100, state.n50,
+            map.od,
+            map.is_convert,
+            state.n320,
+            state.n300,
+            state.n200,
+            state.n100,
+            state.n50,
             state.misses
         );
         println!("custom_accuracy {:.3}%\n", custom_accuracy(state) * 100.0);
@@ -4490,8 +5524,7 @@ mod tests {
             }
             let units = [JudgementUnit::repeated(score.stars, f64::from(total))];
             let played = fit_with_quality(&score.counts, &units, &score.windows, model);
-            let reference =
-                fit_with_quality(&score.counts, &units, &REFERENCE_WINDOWS, model);
+            let reference = fit_with_quality(&score.counts, &units, &REFERENCE_WINDOWS, model);
             if played.skill <= 0.0 || reference.skill <= 0.0 {
                 return 1.0;
             }
@@ -4523,8 +5556,7 @@ mod tests {
             for score in &scores {
                 let total: u32 = score.counts.iter().sum();
                 let units = [JudgementUnit::repeated(score.stars, f64::from(total))];
-                let fit =
-                    fit_with_quality(&score.counts, &units, &score.windows, &model);
+                let fit = fit_with_quality(&score.counts, &units, &score.windows, &model);
                 gs.push(fit.g_timing);
 
                 let scalar = scalar_with(score, &model);
@@ -4545,8 +5577,7 @@ mod tests {
 
                 // Everything except the scalar is floor-independent, so recomposing
                 // the difficulty value is enough to see the pp effect.
-                total_pp +=
-                    compute_difficulty_value(score.stars, custom_accuracy(state), scalar);
+                total_pp += compute_difficulty_value(score.stars, custom_accuracy(state), scalar);
             }
 
             if baseline_pp == 0.0 {
@@ -4595,11 +5626,8 @@ mod tests {
                 ..ErrorModel::default()
             };
             let units = [JudgementUnit::repeated(2.0, 1506.0)];
-            let counts = crate::mania_accuracy::expected_counts(
-                &units, &windows, &model, 1.0e4,
-            );
-            let share =
-                counts.get(crate::mania_windows::ManiaJudgement::Perfect) / 1506.0;
+            let counts = crate::mania_accuracy::expected_counts(&units, &windows, &model, 1.0e4);
+            let share = counts.get(crate::mania_windows::ManiaJudgement::Perfect) / 1506.0;
             println!(
                 "  {floor:>4.1} ms -> {:>7.3}%  ({:>6.2} of 1506 notes forced off 320)",
                 share * 100.0,
@@ -4755,12 +5783,38 @@ mod tests {
         acc: f64,
         notes: u32,
         ln_fraction: f64,
+        live_pp: f64,
         before_pp: f64,
         after_pp: f64,
         before_g: f64,
         after_g: f64,
         before_plausible: bool,
         after_plausible: bool,
+    }
+
+    const INPUT_STATE_RECOVERY_OFFSET: f64 = 73.12;
+
+    /// Whether fixture-backed reports should price the current input-state candidate.
+    fn input_state_calculation_enabled() -> bool {
+        std::env::var("SUNNY_INPUT_STATE")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn report_error_model() -> ErrorModel {
+        if input_state_calculation_enabled() {
+            ErrorModel {
+                recovery_offset: INPUT_STATE_RECOVERY_OFFSET,
+                ..ErrorModel::default()
+            }
+        } else {
+            ErrorModel::default()
+        }
     }
 
     /// Prices every `multiuser.tsv` row under `before` and `after`, so an error-model
@@ -4831,6 +5885,7 @@ mod tests {
                 } else {
                     0.0
                 },
+                live_pp: f[14].parse().unwrap_or(0.0),
                 before_pp,
                 after_pp,
                 before_g,
@@ -4856,6 +5911,7 @@ mod tests {
         let n = rows.len() as f64;
         let before_sum: f64 = rows.iter().map(|r| r.before_pp).sum();
         let after_sum: f64 = rows.iter().map(|r| r.after_pp).sum();
+        let live_sum: f64 = rows.iter().map(|r| r.live_pp).sum();
 
         let mut deltas: Vec<f64> = rows
             .iter()
@@ -4890,7 +5946,11 @@ mod tests {
                 .filter(|g| g.is_finite())
                 .collect();
             v.sort_by(f64::total_cmp);
-            if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+            if v.is_empty() {
+                f64::NAN
+            } else {
+                v[v.len() / 2]
+            }
         };
         let before_g_med = median_of(|r| r.before_g);
         let after_g_med = median_of(|r| r.after_g);
@@ -4903,7 +5963,7 @@ mod tests {
         let after_plaus = rows.iter().filter(|r| r.after_plausible).count();
 
         println!(
-            "  {label}: n={:<4} pp {:.0} -> {:.0} ({:+.2}%)  med {:+.2}% mean {:+.2}%  \
+            "  {label}: n={:<4} pp {:.0} -> {:.0} ({:+.2}%)  live {:.0} ratios {:.1}% -> {:.1}%  med {:+.2}% mean {:+.2}%  \
              up/down {raised}/{lowered}  g med {:.1} -> {:.1}  mean {:.1} -> {:.1}  \
              (plaus {before_plaus} -> {after_plaus})",
             rows.len(),
@@ -4911,6 +5971,17 @@ mod tests {
             after_sum,
             if before_sum > 0.0 {
                 (after_sum / before_sum - 1.0) * 100.0
+            } else {
+                0.0
+            },
+            live_sum,
+            if live_sum > 0.0 {
+                100.0 * before_sum / live_sum
+            } else {
+                0.0
+            },
+            if live_sum > 0.0 {
+                100.0 * after_sum / live_sum
             } else {
                 0.0
             },
@@ -4945,10 +6016,16 @@ mod tests {
         // 0.00% everywhere. That is the harness's own control: a non-zero delta there
         // would mean the two columns differ by something other than the model.
         let null_run = std::env::var_os("MODEL_AB_NULL").is_some();
+        let input_state_run = input_state_calculation_enabled();
 
         let before = ErrorModel::default();
         let after = if null_run {
             ErrorModel::default()
+        } else if input_state_run {
+            ErrorModel {
+                recovery_offset: INPUT_STATE_RECOVERY_OFFSET,
+                ..ErrorModel::default()
+            }
         } else {
             // Refit on the 1204-score set by `calibrate_lapse_on_multiuser`:
             // mean g_timing 42.29 -> 38.16, at an interior optimum rather than a
@@ -4962,15 +6039,17 @@ mod tests {
 
         if null_run {
             println!("NULL RUN: both sides are the shipped default; all deltas must be 0.00%");
+        } else if input_state_run {
+            println!("INPUT-STATE RUN: enabling the measured same-column recovery curve");
         }
 
         println!(
-            "before: lapse_weight={:.4} lapse_ratio={:.3}",
-            before.lapse_weight, before.lapse_ratio
+            "before: lapse_weight={:.4} lapse_ratio={:.3} recovery_offset={:.2}",
+            before.lapse_weight, before.lapse_ratio, before.recovery_offset
         );
         println!(
-            "after:  lapse_weight={:.4} lapse_ratio={:.3}",
-            after.lapse_weight, after.lapse_ratio
+            "after:  lapse_weight={:.4} lapse_ratio={:.3} recovery_offset={:.2}",
+            after.lapse_weight, after.lapse_ratio, after.recovery_offset
         );
 
         let scores = load_multiuser_ab(&before, &after);
@@ -5034,6 +6113,40 @@ mod tests {
             );
         }
 
+        println!("\nlow-OD target and controls:");
+        for (label, pred) in [
+            (
+                "low OD <7, rice <30% LN",
+                (|r: &&AbPriced| r.od < 7.0 && r.ln_fraction < 0.30) as Pred,
+            ),
+            ("low OD <7, LN >=30%", |r: &&AbPriced| {
+                r.od < 7.0 && r.ln_fraction >= 0.30
+            }),
+            ("OD >=8, rice <30% LN", |r: &&AbPriced| {
+                r.od >= 8.0 && r.ln_fraction < 0.30
+            }),
+            ("OD >=8, LN >=30%", |r: &&AbPriced| {
+                r.od >= 8.0 && r.ln_fraction >= 0.30
+            }),
+        ] {
+            let group: Vec<&AbPriced> = all.iter().copied().filter(pred).collect();
+            summarise_ab(label, &group);
+        }
+
+        println!("\ndeterministic map holdout (map id mod 5):");
+        for (label, held_out) in [("train folds 1-4", false), ("held-out fold 0", true)] {
+            let group: Vec<&AbPriced> = all
+                .iter()
+                .copied()
+                .filter(|r| {
+                    r.map_id
+                        .parse::<u64>()
+                        .is_ok_and(|id| (id % 5 == 0) == held_out)
+                })
+                .collect();
+            summarise_ab(label, &group);
+        }
+
         println!("\nby accuracy band:");
         for (lo, hi) in [(0.0, 90.0), (90.0, 95.0), (95.0, 98.0), (98.0, 100.01)] {
             let group: Vec<&AbPriced> = all
@@ -5046,11 +6159,8 @@ mod tests {
 
         // The largest individual movers, since a cohort mean can hide a few scores
         // being repriced hard in both directions.
-        let mut movers: Vec<&AbPriced> = all
-            .iter()
-            .copied()
-            .filter(|r| r.before_pp > 0.0)
-            .collect();
+        let mut movers: Vec<&AbPriced> =
+            all.iter().copied().filter(|r| r.before_pp > 0.0).collect();
         movers.sort_by(|a, b| {
             let da = (a.after_pp / a.before_pp - 1.0).abs();
             let db = (b.after_pp / b.before_pp - 1.0).abs();
@@ -5059,7 +6169,7 @@ mod tests {
 
         println!("\nlargest 15 movers:");
         println!(
-            "{:>8} {:>8} {:>9} {:>4} {:>4} {:>6} {:>7} {:>8} {:>8} {:>8} {:>7} {:>7}",
+            "{:>8} {:>8} {:>9} {:>4} {:>4} {:>6} {:>7} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7}",
             "uid",
             "map",
             "mods",
@@ -5070,12 +6180,13 @@ mod tests {
             "beforePP",
             "afterPP",
             "d%",
+            "aft/live",
             "g_bef",
             "g_aft"
         );
         for r in movers.iter().take(15) {
             println!(
-                "{:>8} {:>8} {:>9} {:>4} {:>4.1} {:>6} {:>7.3} {:>8.1} {:>8.1} {:>+8.2} {:>7.1} {:>7.1}",
+                "{:>8} {:>8} {:>9} {:>4} {:>4.1} {:>6} {:>7.3} {:>8.1} {:>8.1} {:>+8.2} {:>7.1}% {:>7.1} {:>7.1}",
                 r.uid,
                 r.map_id,
                 if r.mods.is_empty() { "NM" } else { &r.mods },
@@ -5086,6 +6197,11 @@ mod tests {
                 r.before_pp,
                 r.after_pp,
                 (r.after_pp / r.before_pp - 1.0) * 100.0,
+                if r.live_pp > 0.0 {
+                    100.0 * r.after_pp / r.live_pp
+                } else {
+                    0.0
+                },
                 r.before_g,
                 r.after_g,
             );
@@ -5146,8 +6262,8 @@ mod tests {
                 misses: row.counts[5],
             };
 
-            let perf = calculate_performance(&attrs, &mods, state);
-            let model = ErrorModel::default();
+            let model = report_error_model();
+            let perf = calculate_performance_with_model(&attrs, &mods, state, &model);
             let units = judgement_units(
                 &attrs,
                 f64::from(state.total_hits()),
@@ -5294,12 +6410,24 @@ mod tests {
     /// two sunny versions have otherwise moved.
     ///
     /// Usage:
+    /// `SUNNY_INPUT_STATE=1` prices the current input-state candidate against fixture
+    /// live pp. Without it, this report prices the shipped/default model.
+    ///
     /// `cargo test --release multiuser_report -- --ignored --nocapture --exact
     /// sunny::tests::multiuser_report`
     #[test]
     #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
     fn multiuser_report() {
         use std::collections::BTreeMap;
+
+        println!(
+            "calculation: {}",
+            if input_state_calculation_enabled() {
+                "input-state candidate (SUNNY_INPUT_STATE)"
+            } else {
+                "shipped/default"
+            }
+        );
 
         let scores = load_multiuser();
         if scores.is_empty() {
@@ -5319,9 +6447,22 @@ mod tests {
             println!("\n=== uid {uid} ({} scores)", rows.len());
             println!(
                 "{:>8} {:>9} {:>4} {:>4} {:>4} {:>6} {:>6} {:>6} {:>26} {:>7} {:>8} {:>9} {:>7} {:>7} {:>6} {:>5}",
-                "map", "mods", "k", "od", "cvt", "our*", "live*", "notes",
-                "320/300/200/100/50/miss", "acc%", "livePP", "currentPP",
-                "d%", "scalar", "skill", "plaus"
+                "map",
+                "mods",
+                "k",
+                "od",
+                "cvt",
+                "our*",
+                "live*",
+                "notes",
+                "320/300/200/100/50/miss",
+                "acc%",
+                "livePP",
+                "currentPP",
+                "d%",
+                "scalar",
+                "skill",
+                "plaus"
             );
 
             for r in &rows {
@@ -5380,7 +6521,11 @@ mod tests {
 
         let all: Vec<&MultiPriced> = scores.iter().collect();
 
-        println!("\n=== overall ({} scores, {} users)", all.len(), by_uid.len());
+        println!(
+            "\n=== overall ({} scores, {} users)",
+            all.len(),
+            by_uid.len()
+        );
         summarise_group("all", &all);
 
         // Split by whether the mod set touches the hit windows. This is the axis the
@@ -5390,7 +6535,10 @@ mod tests {
         println!("\nby window-affecting mod:");
         type Pred = fn(&&MultiPriced) -> bool;
         for (label, pred) in [
-            ("EZ (windows widened)", (|r| r.row.mods.contains("EZ")) as Pred),
+            (
+                "EZ (windows widened)",
+                (|r| r.row.mods.contains("EZ")) as Pred,
+            ),
             ("HR (windows narrowed)", |r| r.row.mods.contains("HR")),
             ("no window mod", |r| {
                 !r.row.mods.contains("EZ") && !r.row.mods.contains("HR")
@@ -5465,10 +6613,7 @@ mod tests {
                     if inner.len() >= 3 {
                         let mean_inner_od =
                             inner.iter().map(|r| f64::from(r.od)).sum::<f64>() / inner.len() as f64;
-                        summarise_group(
-                            &format!("{sub} (mean OD {mean_inner_od:.1})"),
-                            &inner,
-                        );
+                        summarise_group(&format!("{sub} (mean OD {mean_inner_od:.1})"), &inner);
                     }
                 }
             }
@@ -5598,8 +6743,17 @@ mod tests {
 
         println!(
             "\n{:>8} {:>4} {:>5} {:>6} {:>9} {:>9} {:>7} {:>9} {:>9} {:>8} {:>9}",
-            "map", "keys", "od", "ln%", "livePP", "ourPP", "scalar", "g_played",
-            "g_ref", "skill", "ref_skill"
+            "map",
+            "keys",
+            "od",
+            "ln%",
+            "livePP",
+            "ourPP",
+            "scalar",
+            "g_played",
+            "g_ref",
+            "skill",
+            "ref_skill"
         );
 
         let with_live: Vec<&MultiPriced> = scores.iter().filter(|r| r.row.live_pp > 0.0).collect();
@@ -5682,15 +6836,21 @@ mod tests {
 
         println!("\nby keymode (ourPP/livePP):");
         for keys in [4u32, 7] {
-            let band: Vec<&MultiPriced> =
-                with_live.iter().copied().filter(|r| r.row.keys == keys).collect();
+            let band: Vec<&MultiPriced> = with_live
+                .iter()
+                .copied()
+                .filter(|r| r.row.keys == keys)
+                .collect();
             report_ratio(&format!("{keys}K"), &band);
         }
 
         println!("\nby keymode (g_timing, played vs reference):");
         for keys in [4u32, 7] {
-            let band: Vec<&MultiPriced> =
-                with_live.iter().copied().filter(|r| r.row.keys == keys).collect();
+            let band: Vec<&MultiPriced> = with_live
+                .iter()
+                .copied()
+                .filter(|r| r.row.keys == keys)
+                .collect();
             report_g_timing(&format!("{keys}K"), &band);
         }
 
@@ -5764,8 +6924,10 @@ mod tests {
         // catches any drift at all, not just drift big enough to change a rounded
         // display value.
         println!("\nstars (must be byte-identical across every release_mean_offset run):");
-        let mut by_map: Vec<(&str, f64)> =
-            scores.iter().map(|r| (r.row.map_id.as_str(), r.stars)).collect();
+        let mut by_map: Vec<(&str, f64)> = scores
+            .iter()
+            .map(|r| (r.row.map_id.as_str(), r.stars))
+            .collect();
         by_map.sort_by(|a, b| a.0.cmp(b.0).then(a.1.total_cmp(&b.1)));
         by_map.dedup();
         for (map_id, stars) in &by_map {
@@ -5817,7 +6979,10 @@ mod tests {
         );
         print!("{:>6} {:>7}  {:>13}", "ratio", "scale", "CONTROL");
         for (lo, hi) in bands {
-            print!("  {:>13}", format!("LN{:.0}-{:.0}%", 100.0 * lo, 100.0 * hi));
+            print!(
+                "  {:>13}",
+                format!("LN{:.0}-{:.0}%", 100.0 * lo, 100.0 * hi)
+            );
         }
         println!("  {:>13}  {:>9}", "all V1+LN", "plaus");
         println!("{}", "-".repeat(6 + 7 + 4 * 15 + 15 + 11));
@@ -5863,9 +7028,7 @@ mod tests {
             for (lo, hi) in bands {
                 let band: Vec<&LnCase> = cases
                     .iter()
-                    .filter(|c| {
-                        c.has_ln_effect() && c.ln_fraction() >= lo && c.ln_fraction() < hi
-                    })
+                    .filter(|c| c.has_ln_effect() && c.ln_fraction() >= lo && c.ln_fraction() < hi)
                     .collect();
 
                 match median_g(&band) {
@@ -5915,8 +7078,11 @@ mod tests {
             "ratio(t) = release_ratio * (1 + penalty * exp(-t / scale)); penalty 0 is phase one"
         );
 
-        let bands_by_median: [(&str, f64, f64); 3] =
-            [("short", 0.0, 90.0), ("mid", 90.0, 160.0), ("long", 160.0, 1e9)];
+        let bands_by_median: [(&str, f64, f64); 3] = [
+            ("short", 0.0, 90.0),
+            ("mid", 90.0, 160.0),
+            ("long", 160.0, 1e9),
+        ];
 
         print!("{:>7} {:>7} {:>6}", "penalty", "scale", "base");
         for (label, _, _) in bands_by_median {
@@ -5986,8 +7152,7 @@ mod tests {
                     }
                 }
 
-                let affected: Vec<&LnCase> =
-                    cases.iter().filter(|c| c.has_ln_effect()).collect();
+                let affected: Vec<&LnCase> = cases.iter().filter(|c| c.has_ln_effect()).collect();
                 let plausible = affected
                     .iter()
                     .filter(|c| {
@@ -6167,7 +7332,11 @@ mod tests {
 
         println!(
             "LN split is {}. {} V1 scores.",
-            if ln_split_disabled() { "DISABLED" } else { "on" },
+            if ln_split_disabled() {
+                "DISABLED"
+            } else {
+                "on"
+            },
             points.len()
         );
         println!(
@@ -6258,12 +7427,13 @@ mod tests {
         }
 
         let model = ErrorModel::default();
-        let bands: [(&str, f64, f64); 3] =
-            [("short <90ms", 0.0, 90.0), ("mid 90-160", 90.0, 160.0), ("long >160", 160.0, 1e9)];
+        let bands: [(&str, f64, f64); 3] = [
+            ("short <90ms", 0.0, 90.0),
+            ("mid 90-160", 90.0, 160.0),
+            ("long >160", 160.0, 1e9),
+        ];
 
-        println!(
-            "observed / predicted judgement shares, LN maps grouped by median hold length"
-        );
+        println!("observed / predicted judgement shares, LN maps grouped by median hold length");
         println!(
             "{:>12} {:>5}  {:>15} {:>15} {:>15} {:>15} {:>15}",
             "group", "n", "320", "300", "200", "100", "50"
@@ -6298,8 +7468,7 @@ mod tests {
                 let fit = fit_with_quality(&case.counts, &units, &case.windows, &model);
                 let expected = expected_counts(&units, &case.windows, &model, fit.skill);
 
-                let obs_timing: f64 =
-                    case.counts[..5].iter().map(|&c| f64::from(c)).sum();
+                let obs_timing: f64 = case.counts[..5].iter().map(|&c| f64::from(c)).sum();
                 let exp_array = expected.as_array();
                 let exp_timing: f64 = exp_array[..5].iter().sum();
 
@@ -6493,10 +7662,7 @@ mod tests {
 
         for &duration in &case.ln_durations {
             units.push(JudgementUnit::long_note(
-                case.stars,
-                per_object,
-                model,
-                duration,
+                case.stars, per_object, model, duration,
             ));
         }
 
@@ -6876,13 +8042,10 @@ mod tests {
         // What the model charges these maps, to see whether the duration bins happen to
         // catch the inverse maps anyway.
         let model = ErrorModel::default();
-        let scale_for = |duration: f64| {
-            crate::mania_accuracy::ln_sigma_scale_for_duration(&model, duration)
-        };
+        let scale_for =
+            |duration: f64| crate::mania_accuracy::ln_sigma_scale_for_duration(&model, duration);
 
-        println!(
-            "\nthe model's LN spread multiplier at each duration bin's representative:"
-        );
+        println!("\nthe model's LN spread multiplier at each duration bin's representative:");
         for (idx, &rep) in LN_DURATION_REPRESENTATIVES.iter().enumerate() {
             println!("  bin {idx}: {rep:>4.0}ms -> {:.3}x", scale_for(rep));
         }
@@ -6958,7 +8121,9 @@ mod tests {
                         continue;
                     };
 
-                    let gap = column.get(idx + 1).map_or(1e9, |next| next.head - tail_time);
+                    let gap = column
+                        .get(idx + 1)
+                        .map_or(1e9, |next| next.head - tail_time);
                     gaps.push(gap);
                     tails.push((tail_time, overlap_for(gap, good_window)));
                 }
@@ -6981,11 +8146,17 @@ mod tests {
                 let mut factor_n = 0usize;
 
                 for idx in 0..overlaps.len() - 1 {
-                    factor_sum += 1.0 + COLLISION_WEIGHT * 0.5 * (overlaps[idx] + overlaps[idx + 1]);
+                    factor_sum +=
+                        1.0 + COLLISION_WEIGHT * 0.5 * (overlaps[idx] + overlaps[idx + 1]);
                     factor_n += 1;
                 }
 
-                (collision_share, overlaps, total_columns, factor_sum / factor_n as f64)
+                (
+                    collision_share,
+                    overlaps,
+                    total_columns,
+                    factor_sum / factor_n as f64,
+                )
             })
         }
 
@@ -7008,7 +8179,9 @@ mod tests {
                             collision_share * 100.0
                         );
                     } else {
-                        println!("map 5143109: fewer than 2 long notes with gaps; nothing to report");
+                        println!(
+                            "map 5143109: fewer than 2 long notes with gaps; nothing to report"
+                        );
                     }
                 }
                 None => println!("map 5143109: calculate() returned None"),
@@ -7113,7 +8286,10 @@ mod tests {
             let n = group.len() as f64;
             let mean_factor = group.iter().map(|r| r.mean_factor).sum::<f64>() / n;
 
-            println!("  {label:>7}: n={:<4} mean applied factor {mean_factor:.4}", group.len());
+            println!(
+                "  {label:>7}: n={:<4} mean applied factor {mean_factor:.4}",
+                group.len()
+            );
 
             if label == "0%" && (mean_factor - 1.0).abs() > 1e-9 {
                 println!(
@@ -7244,10 +8420,7 @@ mod tests {
             } else {
                 0.0
             };
-            println!(
-                "MAP\t{id}\t{keys}\t{ln_share:.6}\t{:.10}",
-                attrs.stars
-            );
+            println!("MAP\t{id}\t{keys}\t{ln_share:.6}\t{:.10}", attrs.stars);
         }
 
         for score in load_multiuser() {
@@ -7603,12 +8776,14 @@ mod tests {
             let d_all: Vec<f64> = (0..data.all_corners.len())
                 .map(|idx| {
                     let s_all = (0.4
-                        * (abar[idx].powf(3.0 / keys[idx]) * jbar[idx].min(8.0 + 0.85 * jbar[idx]))
-                            .powf(1.5)
+                        * (abar[idx].powf(3.0 / keys[idx])
+                            * jbar[idx].min(8.0 + 0.85 * jbar[idx]))
+                        .powf(1.5)
                         + (1.0 - 0.4)
                             * (abar[idx].powf(2.0 / 3.0)
-                                * (0.8 * pbar[idx] + rbar[idx] * release_density_weight(density[idx])))
-                                .powf(1.5))
+                                * (0.8 * pbar[idx]
+                                    + rbar[idx] * release_density_weight(density[idx])))
+                            .powf(1.5))
                     .powf(2.0 / 3.0);
                     let t_all =
                         (abar[idx].powf(3.0 / keys[idx]) * xbar[idx]) / (xbar[idx] + s_all + 1.0);
@@ -7781,14 +8956,21 @@ mod tests {
             sorted[idx.min(sorted.len() - 1)]
         }
 
-        let mut pooled_d: Vec<f64> = rows.iter().flat_map(|r| r.per_note_d.iter().copied()).collect();
+        let mut pooled_d: Vec<f64> = rows
+            .iter()
+            .flat_map(|r| r.per_note_d.iter().copied())
+            .collect();
         pooled_d.sort_by(f64::total_cmp);
         let p50 = percentile(&pooled_d, 0.50);
         let p90 = percentile(&pooled_d, 0.90);
         let p99 = percentile(&pooled_d, 0.99);
         let max_d = pooled_d.last().copied().unwrap_or(0.0);
 
-        println!("\n(c) SPREAD of per-note d_all (pooled across {} notes, {} maps)", pooled_d.len(), rows.len());
+        println!(
+            "\n(c) SPREAD of per-note d_all (pooled across {} notes, {} maps)",
+            pooled_d.len(),
+            rows.len()
+        );
         println!(
             "  p50={p50:.4}  p90={p90:.4}  p99={p99:.4}  max={max_d:.4}  p90/p50={:.4}",
             if p50 != 0.0 { p90 / p50 } else { f64::NAN }
@@ -7809,7 +8991,10 @@ mod tests {
         let ratio_min = sorted_ratios.first().copied().unwrap_or(f64::NAN);
         let ratio_max = sorted_ratios.last().copied().unwrap_or(f64::NAN);
 
-        println!("\n(d) SCALE: weighted-mean(d_all) / final sr, across {} maps", ratios.len());
+        println!(
+            "\n(d) SCALE: weighted-mean(d_all) / final sr, across {} maps",
+            ratios.len()
+        );
         println!(
             "  mean={ratio_mean:.4}  median={ratio_median:.4}  min={ratio_min:.4}  max={ratio_max:.4}"
         );
@@ -7825,7 +9010,10 @@ mod tests {
             let total_notes: usize = group.iter().map(|r| r.n_objects).sum();
             let total_exact: usize = group.iter().map(|r| r.exact_heads).sum();
             let exact_frac = total_exact as f64 / total_notes as f64;
-            let max_mismatch = group.iter().map(|r| r.max_head_mismatch_ms).fold(0.0, f64::max);
+            let max_mismatch = group
+                .iter()
+                .map(|r| r.max_head_mismatch_ms)
+                .fold(0.0, f64::max);
 
             let distinct_005: Vec<usize> = group
                 .iter()
@@ -7834,7 +9022,10 @@ mod tests {
             let max_distinct = distinct_005.iter().copied().max().unwrap_or(0);
             let min_distinct = distinct_005.iter().copied().min().unwrap_or(0);
 
-            let mut pooled: Vec<f64> = group.iter().flat_map(|r| r.per_note_d.iter().copied()).collect();
+            let mut pooled: Vec<f64> = group
+                .iter()
+                .flat_map(|r| r.per_note_d.iter().copied())
+                .collect();
             pooled.sort_by(f64::total_cmp);
             let p50 = percentile(&pooled, 0.50);
             let p90 = percentile(&pooled, 0.90);
@@ -7849,7 +9040,10 @@ mod tests {
             let ratio_mean = ratios.iter().sum::<f64>() / ratios.len().max(1) as f64;
             let mut sorted_ratios = ratios.clone();
             sorted_ratios.sort_by(f64::total_cmp);
-            let ratio_median = sorted_ratios.get(sorted_ratios.len() / 2).copied().unwrap_or(f64::NAN);
+            let ratio_median = sorted_ratios
+                .get(sorted_ratios.len() / 2)
+                .copied()
+                .unwrap_or(f64::NAN);
 
             println!(
                 "  {label:>7}: n={:<4} exact={:>6.2}% max_mismatch={:.4}ms  distinct@0.05[min={min_distinct},max={max_distinct}]  \
@@ -7873,7 +9067,11 @@ mod tests {
         }
 
         println!("\nby LN-share bucket:");
-        let ln_buckets = [("<15%", 0.0, 0.15), ("15-35%", 0.15, 0.35), (">35%", 0.35, f64::INFINITY)];
+        let ln_buckets = [
+            ("<15%", 0.0, 0.15),
+            ("15-35%", 0.15, 0.35),
+            (">35%", 0.35, f64::INFINITY),
+        ];
         for (label, lo, hi) in ln_buckets {
             let group: Vec<&MapReport> = rows
                 .iter()
@@ -8134,7 +9332,11 @@ mod tests {
         );
 
         for od in [0.0, 5.0, 8.0] {
-            let window = if od <= 0.0 { 64.5 } else { 34.0 + 3.0 * (10.0 - od) };
+            let window = if od <= 0.0 {
+                64.5
+            } else {
+                34.0 + 3.0 * (10.0 - od)
+            };
             let leniency = hit_leniency_from_window(window);
 
             println!("\n  OD {od:.0} (great {window:.1}ms, leniency {leniency:.4}s):");
@@ -8650,13 +9852,14 @@ mod tests {
                 return None;
             }
 
-            let ss_res: f64 = demeaned
-                .iter()
-                .map(|(x, y)| (y - slope * x).powi(2))
-                .sum();
+            let ss_res: f64 = demeaned.iter().map(|(x, y)| (y - slope * x).powi(2)).sum();
             let s2 = ss_res / residual_df as f64;
             let se = (s2 / sum_xx).sqrt();
-            let t = if se > 1e-12 { slope / se } else { f64::INFINITY };
+            let t = if se > 1e-12 {
+                slope / se
+            } else {
+                f64::INFINITY
+            };
 
             Some((slope, se, t, n, n_players))
         }
@@ -8799,18 +10002,24 @@ mod tests {
                 f64::NAN
             };
 
-            let (cluster_se1, cluster_t1, cluster_se2, cluster_t2) = if cluster_dof_ok
-                && v11 > 0.0
-                && v22 > 0.0
-            {
-                let se1c = (correction * v11).sqrt();
-                let se2c = (correction * v22).sqrt();
-                let t1c = if se1c > 1e-12 { b1 / se1c } else { f64::INFINITY };
-                let t2c = if se2c > 1e-12 { b2 / se2c } else { f64::INFINITY };
-                (Some(se1c), Some(t1c), Some(se2c), Some(t2c))
-            } else {
-                (None, None, None, None)
-            };
+            let (cluster_se1, cluster_t1, cluster_se2, cluster_t2) =
+                if cluster_dof_ok && v11 > 0.0 && v22 > 0.0 {
+                    let se1c = (correction * v11).sqrt();
+                    let se2c = (correction * v22).sqrt();
+                    let t1c = if se1c > 1e-12 {
+                        b1 / se1c
+                    } else {
+                        f64::INFINITY
+                    };
+                    let t2c = if se2c > 1e-12 {
+                        b2 / se2c
+                    } else {
+                        f64::INFINITY
+                    };
+                    (Some(se1c), Some(t1c), Some(se2c), Some(t2c))
+                } else {
+                    (None, None, None, None)
+                };
 
             Some(JointFit {
                 b1,
@@ -9119,10 +10328,7 @@ mod tests {
             let n = pairs.len() as f64;
             let mean_x = pairs.iter().map(|(x, _)| x).sum::<f64>() / n;
             let mean_y = pairs.iter().map(|(_, y)| y).sum::<f64>() / n;
-            let covariance: f64 = pairs
-                .iter()
-                .map(|(x, y)| (x - mean_x) * (y - mean_y))
-                .sum();
+            let covariance: f64 = pairs.iter().map(|(x, y)| (x - mean_x) * (y - mean_y)).sum();
             let variance: f64 = pairs.iter().map(|(x, _)| (x - mean_x).powi(2)).sum();
             (variance > 1e-9).then_some(covariance / variance)
         }
@@ -9255,10 +10461,7 @@ mod tests {
                 } else {
                     let mean_skill =
                         group.iter().map(|p| p.skill).sum::<f64>() / group.len() as f64;
-                    print!(
-                        "  {label:>4}: n={:<3} skill={mean_skill:6.2}",
-                        group.len()
-                    );
+                    print!("  {label:>4}: n={:<3} skill={mean_skill:6.2}", group.len());
                 }
             }
             println!();
@@ -9331,10 +10534,11 @@ mod tests {
 
             for p in &no_window_mod {
                 match refit_skill(p, &model) {
-                    Some(skill) => refit_by_uid
-                        .entry(p.uid.as_str())
-                        .or_default()
-                        .push((p.collision_share, p.stars, skill)),
+                    Some(skill) => refit_by_uid.entry(p.uid.as_str()).or_default().push((
+                        p.collision_share,
+                        p.stars,
+                        skill,
+                    )),
                     None => n_failed += 1,
                 }
             }
@@ -9481,10 +10685,12 @@ mod tests {
                         .powf(1.5)
                     + (1.0 - 0.4)
                         * (abar[idx].powf(2.0 / 3.0)
-                            * (0.8 * pbar[idx] + rbar[idx] * release_density_weight(density[idx])))
-                            .powf(1.5))
+                            * (0.8 * pbar[idx]
+                                + rbar[idx] * release_density_weight(density[idx])))
+                        .powf(1.5))
                 .powf(2.0 / 3.0);
-                let t_all = (abar[idx].powf(3.0 / keys[idx]) * xbar[idx]) / (xbar[idx] + s_all + 1.0);
+                let t_all =
+                    (abar[idx].powf(3.0 / keys[idx]) * xbar[idx]) / (xbar[idx] + s_all + 1.0);
 
                 2.7 * s_all.powf(0.5) * t_all.powf(1.5) + s_all * 0.27
             })
@@ -9538,7 +10744,7 @@ mod tests {
     #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
     fn per_note_binning_cost() {
         use crate::mania_accuracy::{
-            expected_counts, ln_sigma_scale_for_duration, skill_for_counts, JudgementUnit,
+            JudgementUnit, expected_counts, ln_sigma_scale_for_duration, skill_for_counts,
         };
         use std::fs;
         use std::time::Instant;
@@ -9568,7 +10774,8 @@ mod tests {
             let mut map: HashMap<(u64, u64), f64> = HashMap::new();
 
             for &(d_eff, offset) in pairs {
-                *map.entry((d_eff.to_bits(), offset.to_bits())).or_insert(0.0) += 1.0;
+                *map.entry((d_eff.to_bits(), offset.to_bits()))
+                    .or_insert(0.0) += 1.0;
             }
 
             map.into_iter()
@@ -9577,6 +10784,7 @@ mod tests {
                     weight,
                     sigma_scale: 1.0,
                     mean_offset: f64::from_bits(offset_bits),
+                    fading_mean_offset: 0.0,
                 })
                 .collect()
         }
@@ -9616,7 +10824,8 @@ mod tests {
                 }
 
                 let slice = &sorted[start..end];
-                let mean_difficulty = slice.iter().map(|&(d, _)| d).sum::<f64>() / slice.len() as f64;
+                let mean_difficulty =
+                    slice.iter().map(|&(d, _)| d).sum::<f64>() / slice.len() as f64;
 
                 let holds: Vec<f64> = slice.iter().filter_map(|&(_, hold)| hold).collect();
                 let rice = slice.len() - holds.len();
@@ -9676,6 +10885,7 @@ mod tests {
                         weight: slice.len() as f64,
                         sigma_scale: 1.0,
                         mean_offset: offset,
+                        fading_mean_offset: 0.0,
                     });
                 }
             }
@@ -9878,7 +11088,12 @@ mod tests {
             sorted_units.first().copied().unwrap_or(0),
             sorted_units[sorted_units.len() / 2],
             sorted_units.last().copied().unwrap_or(0),
-            mean(&full_unit_counts.iter().map(|&c| c as f64).collect::<Vec<_>>())
+            mean(
+                &full_unit_counts
+                    .iter()
+                    .map(|&c| c as f64)
+                    .collect::<Vec<_>>()
+            )
         );
 
         println!(
@@ -10061,11 +11276,7 @@ mod tests {
                     let p50 = bins[NOTE_DIFFICULTY_BINS / 2].difficulty;
                     let p90 = bins[(NOTE_DIFFICULTY_BINS * 9) / 10].difficulty;
 
-                    if p50 > 0.0 {
-                        p90 / p50
-                    } else {
-                        1.0
-                    }
+                    if p50 > 0.0 { p90 / p50 } else { 1.0 }
                 })
                 .unwrap_or(1.0);
 
@@ -10190,7 +11401,12 @@ mod tests {
              uniform). Per-note lists average {:.1} units/score.",
             rows.len(),
             rows.len() - missing_bins,
-            mean(&rows.iter().map(|row| row.unit_count as f64).collect::<Vec<_>>())
+            mean(
+                &rows
+                    .iter()
+                    .map(|row| row.unit_count as f64)
+                    .collect::<Vec<_>>()
+            )
         );
         println!("\ng_timing: lower is better. pp delta is per-note relative to uniform.\n");
 
@@ -10247,9 +11463,7 @@ mod tests {
             .iter()
             .filter(|row| row.per_note_g.is_finite() && row.uniform_g.is_finite())
             .collect();
-        worst.sort_by(|a, b| {
-            (b.per_note_g - b.uniform_g).total_cmp(&(a.per_note_g - a.uniform_g))
-        });
+        worst.sort_by(|a, b| (b.per_note_g - b.uniform_g).total_cmp(&(a.per_note_g - a.uniform_g)));
 
         println!("\nWORST 10 REGRESSIONS (g_timing rose most)");
         println!(
@@ -10326,10 +11540,10 @@ mod tests {
     #[test]
     #[ignore = "reads gitignored fixtures; prints a report rather than asserting"]
     fn does_a_mean_offset_move_pp() {
+        use crate::mania_accuracy::ln_sigma_scale_for_duration;
         use rayon::join;
         use rayon::prelude::*;
         use std::sync::Mutex;
-        use crate::mania_accuracy::ln_sigma_scale_for_duration;
 
         let Ok(text) = std::fs::read_to_string("local-fixtures/multiuser.tsv") else {
             println!("no fixtures present (local-fixtures/multiuser.tsv); nothing to report");
@@ -10342,7 +11556,7 @@ mod tests {
             ("off (shipped)", 0.0, 0.0),
             ("A = 10 ms", 10.0, -3.19),
             ("A = 20 ms", 20.0, -3.19),
-            ("A = 25 ms", 25.0, -3.19),
+            ("A = 73.12 ms", 73.12, -3.19),
         ];
 
         struct Row {
@@ -10393,7 +11607,8 @@ mod tests {
             }
 
             let windows = hit_windows(&map, &mods, clock_rate, false);
-            let great = get_hit_window_300(&map, clock_rate, has_mod(&mods, "HR"), has_mod(&mods, "EZ"));
+            let great =
+                get_hit_window_300(&map, clock_rate, has_mod(&mods, "HR"), has_mod(&mods, "EZ"));
             let data = RebirthData::new(
                 notes,
                 total_columns,
@@ -10410,7 +11625,8 @@ mod tests {
             }
 
             let gaps = same_column_gaps(&data);
-            let mut sorted_gaps: Vec<f64> = gaps.iter().copied().filter(|g| g.is_finite()).collect();
+            let mut sorted_gaps: Vec<f64> =
+                gaps.iter().copied().filter(|g| g.is_finite()).collect();
             sorted_gaps.sort_by(f64::total_cmp);
 
             let median_gap = if sorted_gaps.is_empty() {
@@ -10422,7 +11638,7 @@ mod tests {
             let reference = reference_windows(&attrs);
             let per_unit = f64::from(total) / per_note.len() as f64;
 
-            let mut row = Row {
+            let row = Row {
                 keys: u(f[6]),
                 ln_fraction: if attrs.n_objects > 0 {
                     attrs.n_long_notes as f64 / attrs.n_objects as f64
@@ -10430,71 +11646,83 @@ mod tests {
                     0.0
                 },
                 median_gap,
-                played_g: Vec::new(),
-                reference_g: Vec::new(),
-                played_skill: Vec::new(),
-                reference_skill: Vec::new(),
-                scalar: Vec::new(),
+                played_g: vec![f64::NAN; candidates.len()],
+                reference_g: vec![f64::NAN; candidates.len()],
+                played_skill: vec![f64::NAN; candidates.len()],
+                reference_skill: vec![f64::NAN; candidates.len()],
+                scalar: vec![f64::NAN; candidates.len()],
             };
 
             let row = Mutex::new(row);
 
-            candidates.par_iter().for_each(|&(_, amplitude, plateau)| {
-                let model = ErrorModel {
-                    recovery_offset: amplitude,
-                    anticipation_offset: plateau,
-                    ..Default::default()
-                };
-
-                // Exact per-note units: one per distinct (difficulty, sigma_scale, offset),
-                // which is ground truth for the effect rather than a binned approximation.
-                // Cost is why this is a report and not the shipping path.
-                let mut merged: HashMap<(u64, u64, u64), f64> = HashMap::new();
-
-                for (idx, &(difficulty, duration)) in per_note.iter().enumerate() {
-                    let gap_offset = model.recovery_mean_offset(gaps[idx]);
-
-                    let (sigma_scale, offset) = match duration {
-                        // A long note under V1 is one judgement carrying both the press and
-                        // the release, so it takes both offsets.
-                        Some(duration) if attrs.ln_judged_as_one => (
-                            ln_sigma_scale_for_duration(&model, duration),
-                            gap_offset + model.release_mean_offset,
-                        ),
-                        _ => (1.0, gap_offset),
+            candidates.par_iter().enumerate().for_each(
+                |(candidate_idx, &(_, amplitude, plateau))| {
+                    let model = ErrorModel {
+                        recovery_offset: amplitude,
+                        anticipation_offset: plateau,
+                        ..Default::default()
                     };
 
-                    *merged
-                        .entry((difficulty.to_bits(), sigma_scale.to_bits(), offset.to_bits()))
-                        .or_insert(0.0) += per_unit;
-                }
+                    // Exact per-note units: one per distinct (difficulty, sigma_scale, offset),
+                    // which is ground truth for the effect rather than a binned approximation.
+                    // Cost is why this is a report and not the shipping path.
+                    let mut merged: HashMap<(u64, u64, u64, u64), f64> = HashMap::new();
 
-                let units: Vec<JudgementUnit> = merged
-                    .into_iter()
-                    .map(|((difficulty, sigma_scale, offset), weight)| JudgementUnit {
-                        difficulty: f64::from_bits(difficulty),
-                        weight,
-                        sigma_scale: f64::from_bits(sigma_scale),
-                        mean_offset: f64::from_bits(offset),
-                    })
-                    .collect();
+                    for (idx, &(difficulty, duration)) in per_note.iter().enumerate() {
+                        let gap_offset = model.recovery_mean_offset(gaps[idx]);
 
-                let (played, reference_fit) = join(
-                    || fit_with_quality(&counts, &units, &attrs.hit_windows, &model),
-                    || fit_with_quality(&counts, &units, &reference, &model),
-                );
+                        let (sigma_scale, release_offset) = match duration {
+                            // A long note under V1 is one judgement carrying the fixed release
+                            // offset. Recovery remains separate because it fades at SS skill.
+                            Some(duration) if attrs.ln_judged_as_one => (
+                                ln_sigma_scale_for_duration(&model, duration),
+                                model.release_mean_offset,
+                            ),
+                            _ => (1.0, 0.0),
+                        };
 
-                let mut row = row.lock().expect("candidate result lock poisoned");
-                row.played_g.push(played.g_timing);
-                row.reference_g.push(reference_fit.g_timing);
-                row.played_skill.push(played.skill);
-                row.reference_skill.push(reference_fit.skill);
-                row.scalar.push(if played.skill > 0.0 && reference_fit.skill > 0.0 {
-                    played.skill / reference_fit.skill
-                } else {
-                    1.0
-                });
-            });
+                        *merged
+                            .entry((
+                                difficulty.to_bits(),
+                                sigma_scale.to_bits(),
+                                release_offset.to_bits(),
+                                gap_offset.to_bits(),
+                            ))
+                            .or_insert(0.0) += per_unit;
+                    }
+
+                    let units: Vec<JudgementUnit> = merged
+                        .into_iter()
+                        .map(
+                            |((difficulty, sigma_scale, release_offset, gap_offset), weight)| {
+                                JudgementUnit {
+                                    difficulty: f64::from_bits(difficulty),
+                                    weight,
+                                    sigma_scale: f64::from_bits(sigma_scale),
+                                    mean_offset: f64::from_bits(release_offset),
+                                    fading_mean_offset: f64::from_bits(gap_offset),
+                                }
+                            },
+                        )
+                        .collect();
+
+                    let (played, reference_fit) = join(
+                        || fit_with_quality(&counts, &units, &attrs.hit_windows, &model),
+                        || fit_with_quality(&counts, &units, &reference, &model),
+                    );
+
+                    let mut row = row.lock().expect("candidate result lock poisoned");
+                    row.played_g[candidate_idx] = played.g_timing;
+                    row.reference_g[candidate_idx] = reference_fit.g_timing;
+                    row.played_skill[candidate_idx] = played.skill;
+                    row.reference_skill[candidate_idx] = reference_fit.skill;
+                    row.scalar[candidate_idx] = if played.skill > 0.0 && reference_fit.skill > 0.0 {
+                        played.skill / reference_fit.skill
+                    } else {
+                        1.0
+                    };
+                },
+            );
 
             rows.push(row.into_inner().expect("candidate result lock poisoned"));
         }
@@ -10526,7 +11754,8 @@ mod tests {
             finite.iter().sum::<f64>() / finite.len() as f64
         }
 
-        let column = |extract: &dyn Fn(&Row) -> f64| -> Vec<f64> { rows.iter().map(extract).collect() };
+        let column =
+            |extract: &dyn Fn(&Row) -> f64| -> Vec<f64> { rows.iter().map(extract).collect() };
 
         println!(
             "\n{} scores, exact per-note units. Median same-column gap across maps: {:.0} ms \
@@ -10614,8 +11843,18 @@ mod tests {
             println!(
                 "  {label:<14} {:>4} {:>9.2} {:>9.2} {:>+9.2} {:>9}",
                 group.len(),
-                median(&group.iter().map(|row| row.played_g[fitted]).collect::<Vec<_>>()),
-                median(&group.iter().map(|row| row.reference_g[fitted]).collect::<Vec<_>>()),
+                median(
+                    &group
+                        .iter()
+                        .map(|row| row.played_g[fitted])
+                        .collect::<Vec<_>>()
+                ),
+                median(
+                    &group
+                        .iter()
+                        .map(|row| row.reference_g[fitted])
+                        .collect::<Vec<_>>()
+                ),
                 median(&group_deltas) * 100.0,
                 group_deltas.iter().filter(|d| **d > 0.001).count(),
             );
@@ -10641,7 +11880,12 @@ mod tests {
                 group.len(),
                 median(&group.iter().map(|row| row.median_gap).collect::<Vec<_>>()),
                 median(&group_deltas) * 100.0,
-                median(&group.iter().map(|row| row.played_g[fitted]).collect::<Vec<_>>()),
+                median(
+                    &group
+                        .iter()
+                        .map(|row| row.played_g[fitted])
+                        .collect::<Vec<_>>()
+                ),
             );
         }
 
@@ -10666,7 +11910,12 @@ mod tests {
                 group.len(),
                 median(&group.iter().map(|row| row.median_gap).collect::<Vec<_>>()),
                 median(&group_deltas) * 100.0,
-                median(&group.iter().map(|row| row.played_g[fitted]).collect::<Vec<_>>()),
+                median(
+                    &group
+                        .iter()
+                        .map(|row| row.played_g[fitted])
+                        .collect::<Vec<_>>()
+                ),
             );
         }
     }
@@ -10713,10 +11962,30 @@ mod tests {
 
         // Column order matters: each adds one mechanism to the one before it.
         let mut variants = vec![
-            Variant { label: "uniform(stars)", g_timing: Vec::new(), skill: Vec::new(), plausible: 0 },
-            Variant { label: "+level only", g_timing: Vec::new(), skill: Vec::new(), plausible: 0 },
-            Variant { label: "+LN difficulty", g_timing: Vec::new(), skill: Vec::new(), plausible: 0 },
-            Variant { label: "+spread (full)", g_timing: Vec::new(), skill: Vec::new(), plausible: 0 },
+            Variant {
+                label: "uniform(stars)",
+                g_timing: Vec::new(),
+                skill: Vec::new(),
+                plausible: 0,
+            },
+            Variant {
+                label: "+level only",
+                g_timing: Vec::new(),
+                skill: Vec::new(),
+                plausible: 0,
+            },
+            Variant {
+                label: "+LN difficulty",
+                g_timing: Vec::new(),
+                skill: Vec::new(),
+                plausible: 0,
+            },
+            Variant {
+                label: "+spread (full)",
+                g_timing: Vec::new(),
+                skill: Vec::new(),
+                plausible: 0,
+            },
         ];
 
         let mut ln_higher = 0usize;

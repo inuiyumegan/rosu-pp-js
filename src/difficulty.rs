@@ -1,6 +1,7 @@
 use wasm_bindgen::prelude::wasm_bindgen;
 
 use crate::{
+    JsResult,
     args::difficulty::{DifficultyArgs, JsDifficultyArgs},
     attributes::difficulty::JsDifficultyAttributes,
     beatmap::JsBeatmap,
@@ -8,7 +9,7 @@ use crate::{
     gradual::{difficulty::JsGradualDifficulty, performance::JsGradualPerformance},
     mods::JsGameMods,
     strains::JsStrains,
-    util, JsResult,
+    util,
 };
 
 /// Builder for a difficulty calculation.

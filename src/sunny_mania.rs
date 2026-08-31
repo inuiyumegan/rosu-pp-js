@@ -11,7 +11,10 @@ use crate::{
     args::difficulty::{DifficultyArgs, JsDifficultyArgs},
     args::performance::{JsPerformanceArgs, PerformanceArgs},
     beatmap::JsBeatmap,
-    sunny::{self, SunnyManiaDifficultyAttributes, SunnyScoreState},
+    sunny::{
+        self, INPUT_STATE_BINS, InputClass, InputStateBin, NOTE_DIFFICULTY_BINS,
+        SunnyManiaDifficultyAttributes, SunnyScoreState,
+    },
     util,
 };
 
@@ -55,6 +58,9 @@ pub struct JsSunnyManiaDifficultyAttributes {
     /// spread than a plain note and an LN-heavy map is a mixture of the two.
     #[wasm_bindgen(js_name = "nLongNotes", readonly)]
     pub n_long_notes: u32,
+    /// Versioned flattened input-state bins retained by cached JS attributes.
+    #[serde(default)]
+    pub(crate) input_state_bins: Vec<f64>,
     /// The long-note duration histogram, kept for the performance calc.
     ///
     /// Not exposed to JS for the same reason as [`Self::hit_windows`]: it is an
@@ -89,12 +95,85 @@ impl From<SunnyManiaDifficultyAttributes> for JsSunnyManiaDifficultyAttributes {
             max_combo: attrs.max_combo,
             n_objects: attrs.n_objects as u32,
             n_long_notes: attrs.n_long_notes as u32,
+            input_state_bins: encode_input_state_bins(attrs.input_state_bins.as_ref()),
             ln_duration_buckets: attrs.ln_duration_buckets,
             mods: GameMods::default(),
             hit_windows: attrs.hit_windows,
             map_windows: attrs.map_windows,
         }
     }
+}
+
+#[wasm_bindgen(js_class = SunnyManiaDifficultyAttributes)]
+impl JsSunnyManiaDifficultyAttributes {
+    /// Compact input-state metadata used by the timing surface.
+    #[wasm_bindgen(getter = inputStateBins)]
+    pub fn input_state_bins(&self) -> Box<[f64]> {
+        self.input_state_bins.clone().into_boxed_slice()
+    }
+}
+
+const INPUT_STATE_SERIAL_VERSION: f64 = 1.0;
+const INPUT_STATE_FIELDS_PER_BIN: usize = 8;
+
+fn encode_input_state_bins(bins: Option<&[InputStateBin; INPUT_STATE_BINS]>) -> Vec<f64> {
+    let Some(bins) = bins else {
+        return Vec::new();
+    };
+
+    let mut encoded = Vec::with_capacity(1 + INPUT_STATE_BINS * INPUT_STATE_FIELDS_PER_BIN);
+    encoded.push(INPUT_STATE_SERIAL_VERSION);
+
+    for bin in bins {
+        encoded.extend([
+            f64::from(bin.count),
+            f64::from(bin.long_count),
+            f64::from(bin.predecessor_count),
+            bin.mean_difficulty,
+            bin.mean_duration_ms,
+            bin.mean_gap_ms,
+            bin.mean_chord_width,
+            bin.mean_other_held,
+        ]);
+    }
+
+    encoded
+}
+
+fn decode_input_state_bins(encoded: &[f64]) -> Option<[InputStateBin; INPUT_STATE_BINS]> {
+    if encoded.len() != 1 + INPUT_STATE_BINS * INPUT_STATE_FIELDS_PER_BIN
+        || encoded[0] != INPUT_STATE_SERIAL_VERSION
+        || encoded.iter().any(|value| !value.is_finite())
+    {
+        return None;
+    }
+
+    let bins = std::array::from_fn(|idx| {
+        let offset = 1 + idx * INPUT_STATE_FIELDS_PER_BIN;
+        InputStateBin {
+            class: match idx / NOTE_DIFFICULTY_BINS {
+                0 => InputClass::FreshPress,
+                1 => InputClass::RapidRepress,
+                2 => InputClass::Jack,
+                3 => InputClass::Release,
+                4 => InputClass::ReleaseToPress,
+                5 => InputClass::PressUnderHold,
+                _ => InputClass::ChordEntryOrExit,
+            },
+            count: encoded[offset].clamp(0.0, f64::from(u32::MAX)) as u32,
+            long_count: encoded[offset + 1].clamp(0.0, f64::from(u32::MAX)) as u32,
+            predecessor_count: encoded[offset + 2].clamp(0.0, f64::from(u32::MAX)) as u32,
+            mean_difficulty: encoded[offset + 3],
+            mean_duration_ms: encoded[offset + 4],
+            mean_gap_ms: encoded[offset + 5],
+            mean_chord_width: encoded[offset + 6],
+            mean_other_held: encoded[offset + 7],
+        }
+    });
+
+    bins.iter()
+        .all(|bin| bin.long_count <= bin.count && bin.predecessor_count <= bin.count)
+        .then_some(bins)
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +322,10 @@ impl JsSunnyManiaPerformance {
     ///
     /// The argument must either be the attributes of a previous sunny mania
     /// difficulty calculation or a beatmap.
-    pub fn calculate(&self, value: &wasm_bindgen::JsValue) -> JsResult<JsSunnyManiaPerformanceAttributes> {
+    pub fn calculate(
+        &self,
+        value: &wasm_bindgen::JsValue,
+    ) -> JsResult<JsSunnyManiaPerformanceAttributes> {
         let (attrs, mods) = self.attrs_and_mods(value)?;
         let state = self.score_state(attrs.n_objects as u32)?;
 
@@ -282,8 +364,8 @@ impl JsSunnyManiaPerformance {
             // and hand `EZ` a bonus.
             // Pinned by `stripping_the_mod_multiplier_recovers_the_maps_own_window`.
             let map_windows = if js_attrs.map_windows == Default::default() {
-                let unmodded = js_attrs.great_hit_window
-                    * crate::mania_windows::difficulty_multiplier(&mods);
+                let unmodded =
+                    js_attrs.great_hit_window * crate::mania_windows::difficulty_multiplier(&mods);
                 crate::mania_windows::windows_from_great(unmodded)
             } else {
                 js_attrs.map_windows
@@ -320,6 +402,7 @@ impl JsSunnyManiaPerformance {
                 // Inventing a spread would price maps on a guess. `None` falls back to the
                 // uniform list, which is what this path already did.
                 note_difficulty_bins: None,
+                input_state_bins: decode_input_state_bins(&js_attrs.input_state_bins),
                 // Not carried through JS: it is a property of how the score was
                 // played, not of the map, so it is re-derived from the mods that
                 // came back with the attributes. `lazer` is not part of the shape
@@ -330,7 +413,8 @@ impl JsSunnyManiaPerformance {
             return Ok((attrs, mods));
         }
 
-        if let Ok(map) = JsBeatmap::deserialize(crate::deserializer::JsDeserializer::from_ref(value))
+        if let Ok(map) =
+            JsBeatmap::deserialize(crate::deserializer::JsDeserializer::from_ref(value))
         {
             let map = prepare_map_for_perf(&self.args, &map)?;
             let clock_rate = self
@@ -456,10 +540,7 @@ impl JsSunnyManiaPerformance {
 // ---------------------------------------------------------------------------
 
 /// Ensure that the beatmap is converted to mania.
-fn prepare_map<'m>(
-    args: &DifficultyArgs,
-    map: &'m JsBeatmap,
-) -> JsResult<Cow<'m, Beatmap>> {
+fn prepare_map<'m>(args: &DifficultyArgs, map: &'m JsBeatmap) -> JsResult<Cow<'m, Beatmap>> {
     if map.inner.mode == GameMode::Mania {
         return Ok(Cow::Borrowed(&map.inner));
     }
@@ -508,4 +589,44 @@ fn convert_map<'m>(args: &DifficultyArgs, map: &'m Beatmap) -> JsResult<Cow<'m, 
 fn clock_rate(args: &DifficultyArgs) -> f64 {
     args.clock_rate
         .unwrap_or_else(|| args.mods.clock_rate().unwrap_or(1.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_state_bins_round_trip_and_old_attributes_fall_back() {
+        let mut bins = std::array::from_fn(|idx| InputStateBin {
+            class: match idx / NOTE_DIFFICULTY_BINS {
+                0 => InputClass::FreshPress,
+                1 => InputClass::RapidRepress,
+                2 => InputClass::Jack,
+                3 => InputClass::Release,
+                4 => InputClass::ReleaseToPress,
+                5 => InputClass::PressUnderHold,
+                _ => InputClass::ChordEntryOrExit,
+            },
+            ..InputStateBin::default()
+        });
+        bins[2 * NOTE_DIFFICULTY_BINS] = InputStateBin {
+            class: InputClass::Jack,
+            count: 17,
+            long_count: 3,
+            predecessor_count: 12,
+            mean_difficulty: 8.25,
+            mean_duration_ms: 123.0,
+            mean_gap_ms: 91.0,
+            mean_chord_width: 1.5,
+            mean_other_held: 0.25,
+        };
+
+        let encoded = encode_input_state_bins(Some(&bins));
+        assert_eq!(decode_input_state_bins(&encoded), Some(bins));
+        assert_eq!(decode_input_state_bins(&[]), None);
+
+        let mut malformed = encoded;
+        malformed[0] = 99.0;
+        assert_eq!(decode_input_state_bins(&malformed), None);
+    }
 }
