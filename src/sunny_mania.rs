@@ -218,10 +218,10 @@ pub struct JsSunnyManiaPerformanceAttributes {
     /// The length multiplier applied to the difficulty portion.
     #[wasm_bindgen(js_name = "lengthMultiplier", readonly)]
     pub length_multiplier: f64,
-    /// How much the judgement windows in effect changed the score's value.
+    /// Timing skill inferred from the played hit-result surface, normalized by a
+    /// structure-free fit through the map's natural windows.
     ///
-    /// Below 1 when the score was graded through windows wider than the OD 8
-    /// reference, which is how `EZ` is priced without a mod-specific factor.
+    /// The played fit uses the judgement windows actually in effect, including EZ/HR.
     #[wasm_bindgen(js_name = "windowScalar", readonly)]
     pub window_scalar: f64,
 }

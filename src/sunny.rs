@@ -731,8 +731,8 @@ pub fn calculate_performance(
 
 /// [`calculate_performance`] under an explicit [`ErrorModel`].
 ///
-/// The model reaches pp only through [`window_scalar`], so this differs from the
-/// public entry point in exactly one term. Production calls
+/// The model reaches pp only through [`window_scalar_with_model`], so this differs
+/// from the public entry point in exactly one term. Production calls
 /// [`calculate_performance`]; this exists so a calibration candidate can be priced
 /// against the shipped default on identical scores.
 pub(crate) fn calculate_performance_with_model(
@@ -788,11 +788,12 @@ const REFERENCE_WINDOWS: ManiaHitWindows = ManiaHitWindows {
     miss: 164.5,
 };
 
-/// The windows a score is priced *against*, which decides what the surface charges for.
+/// The windows used as a fixed comparison yardstick by research and calibration
+/// reports.
 ///
-/// **The fixed OD 8 [`REFERENCE_WINDOWS`], again.** Three candidates were measured
-/// against the same 143 live scores; the alternatives are kept behind env switches so
-/// the comparison can be rerun in one build, the way `SUNNY_NO_LN_SPLIT` is kept.
+/// Production pricing no longer uses this second fit. It normalizes against a neutral
+/// fit through the map's own natural windows; keeping this helper allows the historical
+/// fixed/map/one-sided comparisons to remain reproducible.
 ///
 /// - **Fixed [`REFERENCE_WINDOWS`]** (OD 8, the default now — no env var needed) says a
 ///   low-OD map is genuinely more lenient, so a score on it demonstrates less precision
@@ -1206,13 +1207,19 @@ fn window_scalar_with_model(
     );
 
     let played = fit_with_quality(&counts, &units, &attrs.hit_windows, model);
-    let reference = fit_with_quality(&counts, &units, &reference_windows(attrs), model);
+    let neutral_units = [JudgementUnit::repeated(attrs.stars, f64::from(total))];
+    let neutral = fit_with_quality(&counts, &neutral_units, &attrs.map_windows, model);
 
-    if played.skill <= 0.0 || reference.skill <= 0.0 {
+    if played.skill <= 0.0 || neutral.skill <= 0.0 {
         return 1.0;
     }
 
-    played.skill / reference.skill
+    // The baseline deliberately contains no local-difficulty, LN, or input-state
+    // structure. Low OD therefore is not charged merely for being below OD8, while a
+    // window-changing mod still acts on the played fit relative to the map's natural
+    // windows. Keeping structural units out of the denominator prevents their effect
+    // from cancelling or being inverted by a second structured fit.
+    played.skill / neutral.skill
 }
 
 // ---------------------------------------------------------------------------
@@ -3558,38 +3565,13 @@ mod tests {
         );
     }
 
-    /// Every no-mod score is priced at 1, at any OD, **under `SUNNY_MAP_REFERENCE`**.
-    ///
-    /// This is no longer the shipped default — [`reference_windows`] reverted to the
-    /// fixed OD 8 reference because pricing every score against its own windows makes
-    /// this property hold *unconditionally*, which closes the OD channel entirely: no
-    /// map property can ever move pricing if the map is always compared to itself. The
-    /// property below is still real and still the defining behaviour of the map
-    /// reference, it is just no longer what `reference_windows` returns by default, so
-    /// the env var is set explicitly to reach it.
-    ///
-    /// Swept across OD rather than checked at OD 8, because at OD 8 the map reference and
-    /// the fixed reference agree and the test cannot tell them apart. OD 0 and 10 are the
-    /// extremes of the mania range, and 4.2 is the fixture mean for 7K LN charts — the
-    /// maps that lose 16.6% of their live pp under the fixed default.
-    ///
-    /// **Env-var race.** `SUNNY_MAP_REFERENCE` is process-global and `cargo test` runs
-    /// tests in parallel by default; every other test in this module that prices a score
-    /// implicitly assumes the fixed default, so this test can in principle flake them
-    /// (and be flaked by them) if the runner interleaves it with them while the var is
-    /// set. No serial-test harness or env-scoping mechanism exists anywhere else in this
-    /// crate to borrow, and adding a new one just for this test was out of scope here —
-    /// noted rather than silently accepted.
+    /// Legacy reference switches remain available to research reports, but production
+    /// pricing must no longer read them.
     #[test]
-    fn a_no_mod_score_prices_at_one_under_the_map_reference() {
-        // Safety: single-threaded within this test's own lifetime is not actually
-        // guaranteed (see the doc comment above), but nothing here reads or writes
-        // any other environment variable, so the only possible unsoundness is the
-        // documented cross-test race, not a memory-safety one.
-        unsafe {
-            std::env::set_var("SUNNY_MAP_REFERENCE", "1");
-        }
-
+    fn production_pricing_ignores_legacy_reference_switches() {
+        let map = synthetic_map(4.2, 2000, 120.0);
+        let mods = GameMods::default();
+        let attrs = calculate(&map, &mods, 1.0, Some(true), None).unwrap();
         let state = SunnyScoreState {
             n320: 1400,
             n300: 480,
@@ -3598,29 +3580,17 @@ mod tests {
             n50: 5,
             misses: 5,
         };
+        let baseline = calculate_performance(&attrs, &mods, state);
 
-        for od in [0.0, 4.2, 8.0, 10.0] {
-            let map = synthetic_map(od, 2000, 120.0);
-            let mods = GameMods::default();
-            let attrs = calculate(&map, &mods, 1.0, Some(true), None).unwrap();
+        for switch in ["SUNNY_MAP_REFERENCE", "SUNNY_ONESIDED_REFERENCE"] {
+            // Safety: these process-global switches are only read by research helpers
+            // now; the assertion below pins that production calculation is isolated.
+            unsafe { std::env::set_var(switch, "1") };
+            let switched = calculate_performance(&attrs, &mods, state);
+            unsafe { std::env::remove_var(switch) };
 
-            let perf = calculate_performance(&attrs, &mods, state);
-
-            let ok = (perf.window_scalar - 1.0).abs() < 1e-6;
-
-            if !ok {
-                unsafe {
-                    std::env::remove_var("SUNNY_MAP_REFERENCE");
-                }
-                panic!(
-                    "a no-mod score at OD {od} must price at 1 under the map reference, got {}",
-                    perf.window_scalar
-                );
-            }
-        }
-
-        unsafe {
-            std::env::remove_var("SUNNY_MAP_REFERENCE");
+            assert!((switched.pp - baseline.pp).abs() < 1e-9);
+            assert!((switched.window_scalar - baseline.window_scalar).abs() < 1e-9);
         }
     }
 
@@ -5907,9 +5877,13 @@ mod tests {
             state.misses,
         ];
         let played = fit_with_quality(&counts, units, &attrs.hit_windows, model);
-        let reference = fit_with_quality(&counts, units, &reference_windows(attrs), model);
-        let scalar = if played.skill > 0.0 && reference.skill > 0.0 {
-            played.skill / reference.skill
+        let neutral_units = [JudgementUnit::repeated(
+            attrs.stars,
+            f64::from(state.total_hits()),
+        )];
+        let neutral = fit_with_quality(&counts, &neutral_units, &attrs.map_windows, model);
+        let scalar = if played.skill > 0.0 && neutral.skill > 0.0 {
+            played.skill / neutral.skill
         } else {
             1.0
         };
@@ -6709,10 +6683,9 @@ mod tests {
             summarise_group(label, &group);
         }
 
-        // OD bands, for the no-window-mod scores only: there the scalar is OD alone,
-        // so this is the cleanest read on how much the OD-8 reference choice costs or
-        // pays an ordinary score.
-        println!("\nno-window-mod scores by OD (scalar is OD alone here):");
+        // OD bands for no-window-mod scores. OD itself is normalized against each
+        // map's natural windows; movement here comes from the structured played units.
+        println!("\nno-window-mod scores by OD (natural-window baseline):");
         let plain: Vec<&MultiPriced> = all
             .iter()
             .copied()
@@ -6742,11 +6715,9 @@ mod tests {
             );
         }
 
-        // Key count, which turns out to matter far more than it looks like it should.
-        // It is not that the surface treats 4k and 7k differently — it does not know
-        // the key count at all — but that the two populations chart at different OD,
-        // so a single OD reference lands very differently on each.
-        println!("\nby key count (the surface never reads keys; this is OD convention):");
+        // The surface does not read key count directly; this groups the structural
+        // populations so their LN/rice and charting differences remain visible.
+        println!("\nby key count (reported as a structural cohort, not a model input):");
         for keys in [4u32, 5, 6, 7, 8, 9, 10] {
             let band: Vec<&MultiPriced> =
                 all.iter().copied().filter(|r| r.row.keys == keys).collect();
