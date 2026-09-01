@@ -218,8 +218,8 @@ pub struct JsSunnyManiaPerformanceAttributes {
     /// The length multiplier applied to the difficulty portion.
     #[wasm_bindgen(js_name = "lengthMultiplier", readonly)]
     pub length_multiplier: f64,
-    /// Timing skill inferred from the played hit-result surface, normalized by a
-    /// structure-free fit through the map's natural windows.
+    /// Timing skill inferred from the played hit-result surface, normalized by the
+    /// established non-input-state surface through the map's natural windows.
     ///
     /// The played fit uses the judgement windows actually in effect, including EZ/HR.
     #[wasm_bindgen(js_name = "windowScalar", readonly)]

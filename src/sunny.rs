@@ -791,9 +791,10 @@ const REFERENCE_WINDOWS: ManiaHitWindows = ManiaHitWindows {
 /// The windows used as a fixed comparison yardstick by research and calibration
 /// reports.
 ///
-/// Production pricing no longer uses this second fit. It normalizes against a neutral
-/// fit through the map's own natural windows; keeping this helper allows the historical
-/// fixed/map/one-sided comparisons to remain reproducible.
+/// Production pricing no longer uses this second fit. It normalizes against the
+/// established non-input-state surface through the map's own natural windows; keeping
+/// this helper allows the historical fixed/map/one-sided comparisons to remain
+/// reproducible.
 ///
 /// - **Fixed [`REFERENCE_WINDOWS`]** (OD 8, the default now — no env var needed) says a
 ///   low-OD map is genuinely more lenient, so a score on it demonstrates less precision
@@ -1207,19 +1208,32 @@ fn window_scalar_with_model(
     );
 
     let played = fit_with_quality(&counts, &units, &attrs.hit_windows, model);
-    let neutral_units = [JudgementUnit::repeated(attrs.stars, f64::from(total))];
-    let neutral = fit_with_quality(&counts, &neutral_units, &attrs.map_windows, model);
+    let baseline_model = ErrorModel {
+        recovery_offset: 0.0,
+        ..*model
+    };
+    let baseline_units = judgement_units(
+        attrs,
+        f64::from(total),
+        &baseline_model,
+        !per_note_difficulty_disabled(),
+    );
+    let baseline = fit_with_quality(
+        &counts,
+        &baseline_units,
+        &attrs.map_windows,
+        &baseline_model,
+    );
 
-    if played.skill <= 0.0 || neutral.skill <= 0.0 {
+    if played.skill <= 0.0 || baseline.skill <= 0.0 {
         return 1.0;
     }
 
-    // The baseline deliberately contains no local-difficulty, LN, or input-state
-    // structure. Low OD therefore is not charged merely for being below OD8, while a
-    // window-changing mod still acts on the played fit relative to the map's natural
-    // windows. Keeping structural units out of the denominator prevents their effect
-    // from cancelling or being inverted by a second structured fit.
-    played.skill / neutral.skill
+    // The baseline retains established local-difficulty and LN structure but excludes
+    // the experimental recovery channel. Low OD is not charged merely for being below
+    // OD8, EZ/HR still act through the played windows, and new input-state/oracle units
+    // appear only on the played side instead of cancelling themselves.
+    played.skill / baseline.skill
 }
 
 // ---------------------------------------------------------------------------
@@ -5711,6 +5725,13 @@ mod tests {
         od: f32,
         is_convert: bool,
         current_pp: f64,
+        neutral_pp: f64,
+        base_difficulty_pp: f64,
+        accuracy_proportion: f64,
+        surface_multiplier: f64,
+        acc_multiplier: f64,
+        variety_multiplier: f64,
+        length_multiplier: f64,
         scalar: f64,
         skill: f64,
         g_timing: f64,
@@ -5877,13 +5898,20 @@ mod tests {
             state.misses,
         ];
         let played = fit_with_quality(&counts, units, &attrs.hit_windows, model);
-        let neutral_units = [JudgementUnit::repeated(
-            attrs.stars,
-            f64::from(state.total_hits()),
-        )];
-        let neutral = fit_with_quality(&counts, &neutral_units, &attrs.map_windows, model);
-        let scalar = if played.skill > 0.0 && neutral.skill > 0.0 {
-            played.skill / neutral.skill
+        let baseline_model = ErrorModel {
+            recovery_offset: 0.0,
+            ..*model
+        };
+        let baseline_units =
+            judgement_units(attrs, f64::from(state.total_hits()), &baseline_model, true);
+        let baseline = fit_with_quality(
+            &counts,
+            &baseline_units,
+            &attrs.map_windows,
+            &baseline_model,
+        );
+        let scalar = if played.skill > 0.0 && baseline.skill > 0.0 {
+            played.skill / baseline.skill
         } else {
             1.0
         };
@@ -6399,6 +6427,16 @@ mod tests {
 
             let model = report_error_model();
             let perf = calculate_performance_with_model(&attrs, &mods, state, &model);
+            let score_accuracy = custom_accuracy(state);
+            let base_stars = f64::max(attrs.stars - 0.15, 0.05);
+            let base_difficulty_pp = 9.8 * base_stars.powf(2.2);
+            let accuracy_proportion = performance_proportion(score_accuracy);
+            let surface_multiplier = perf.window_scalar.max(0.0).powf(2.2);
+            let neutral_pp = compute_difficulty_value(attrs.stars, score_accuracy, 1.0)
+                * if has_mod(&mods, "NF") { 0.75 } else { 1.0 }
+                * perf.variety_multiplier
+                * perf.acc_multiplier
+                * perf.length_multiplier;
             let units = judgement_units(
                 &attrs,
                 f64::from(state.total_hits()),
@@ -6414,6 +6452,13 @@ mod tests {
                 od: map.od,
                 is_convert: map.is_convert,
                 current_pp: perf.pp,
+                neutral_pp,
+                base_difficulty_pp,
+                accuracy_proportion,
+                surface_multiplier,
+                acc_multiplier: perf.acc_multiplier,
+                variety_multiplier: perf.variety_multiplier,
+                length_multiplier: perf.length_multiplier,
                 scalar: perf.window_scalar,
                 skill: fit.skill,
                 g_timing: fit.g_timing,
@@ -6495,6 +6540,8 @@ mod tests {
             };
 
             let perf = calculate_performance(&attrs, &GameMods::default(), state);
+            let score_accuracy = custom_accuracy(state);
+            let base_stars = f64::max(attrs.stars - 0.15, 0.05);
             let model = ErrorModel::default();
             let units = judgement_units(
                 &attrs,
@@ -6511,6 +6558,16 @@ mod tests {
                 od: map.od,
                 is_convert: map.is_convert,
                 current_pp: perf.pp,
+                neutral_pp: compute_difficulty_value(attrs.stars, score_accuracy, 1.0)
+                    * perf.variety_multiplier
+                    * perf.acc_multiplier
+                    * perf.length_multiplier,
+                base_difficulty_pp: 9.8 * base_stars.powf(2.2),
+                accuracy_proportion: performance_proportion(score_accuracy),
+                surface_multiplier: perf.window_scalar.max(0.0).powf(2.2),
+                acc_multiplier: perf.acc_multiplier,
+                variety_multiplier: perf.variety_multiplier,
+                length_multiplier: perf.length_multiplier,
                 scalar: perf.window_scalar,
                 skill: fit.skill,
                 g_timing: fit.g_timing,
@@ -6785,6 +6842,84 @@ mod tests {
                 &band,
             );
         }
+
+        fn report_composition(label: &str, mut rows: Vec<&MultiPriced>) {
+            rows.sort_by(|a, b| {
+                let a_delta = a.current_pp / a.neutral_pp - 1.0;
+                let b_delta = b.current_pp / b.neutral_pp - 1.0;
+                b_delta.total_cmp(&a_delta)
+            });
+
+            println!("\n{label} ({} scores; at most 40 shown)", rows.len());
+            println!(
+                "{:>6} {:>8} {:>9} {:>4} {:>5} {:>6} {:>8} {:>8}  {:>8} x {:>7} x {:>6} = {:>8}  x {:>6} x {:>6} x {:>6}",
+                "uid",
+                "map",
+                "mods",
+                "od",
+                "LN%",
+                "acc%",
+                "surface%",
+                "live%",
+                "baseDPP",
+                "accProp",
+                "surf",
+                "diffPP",
+                "accMul",
+                "var",
+                "length"
+            );
+
+            for r in rows.into_iter().take(40) {
+                let surface_delta = (r.current_pp / r.neutral_pp - 1.0) * 100.0;
+                let live_delta = (r.current_pp / r.row.live_pp - 1.0) * 100.0;
+                let difficulty_pp =
+                    r.base_difficulty_pp * r.accuracy_proportion * r.surface_multiplier;
+                println!(
+                    "{:>6} {:>8} {:>9} {:>4.1} {:>5.0} {:>6.2} {:+8.2} {:+8.2}  {:>8.1} x {:>7.4} x {:>6.3} = {:>8.1}  x {:>6.3} x {:>6.3} x {:>6.3}",
+                    r.row.uid,
+                    r.row.map_id,
+                    r.row.mods,
+                    r.od,
+                    100.0 * r.ln_fraction,
+                    r.row.acc,
+                    surface_delta,
+                    live_delta,
+                    r.base_difficulty_pp,
+                    r.accuracy_proportion,
+                    r.surface_multiplier,
+                    difficulty_pp,
+                    r.acc_multiplier,
+                    r.variety_multiplier,
+                    r.length_multiplier,
+                );
+            }
+        }
+
+        report_composition(
+            "surface gains above 20%",
+            all.iter()
+                .copied()
+                .filter(|r| r.current_pp / r.neutral_pp > 1.20)
+                .collect(),
+        );
+        report_composition(
+            "non-EZ surface losses below -5%",
+            all.iter()
+                .copied()
+                .filter(|r| !r.row.mods.contains("EZ") && r.current_pp / r.neutral_pp < 0.95)
+                .collect(),
+        );
+        report_composition(
+            "uid 3110: low OD or absolute surface movement above 10%",
+            all.iter()
+                .copied()
+                .filter(|r| {
+                    r.row.uid == "3110"
+                        && (r.od < 7.0 || (r.current_pp / r.neutral_pp - 1.0).abs() > 0.10)
+                })
+                .collect(),
+        );
 
         // Our star rating against the live server's, which is the other half of the
         // gap between `beforePP` and the `livePP` column: the two sunny versions
