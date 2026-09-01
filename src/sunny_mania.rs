@@ -224,6 +224,18 @@ pub struct JsSunnyManiaPerformanceAttributes {
     /// The played fit uses the judgement windows actually in effect, including EZ/HR.
     #[wasm_bindgen(js_name = "windowScalar", readonly)]
     pub window_scalar: f64,
+    /// PP contribution from pattern difficulty (sunny's base calculation).
+    #[wasm_bindgen(js_name = "ppPattern", readonly)]
+    pub pp_pattern: f64,
+    /// PP contribution from timing difficulty (accuracy surface).
+    #[wasm_bindgen(js_name = "ppTiming", readonly)]
+    pub pp_timing: f64,
+    /// Fitted timing skill through actual windows (with mods and input-state).
+    #[wasm_bindgen(js_name = "timingSkillPlayed", readonly)]
+    pub timing_skill_played: f64,
+    /// Fitted timing skill through natural windows (no mods, no input-state).
+    #[wasm_bindgen(js_name = "timingSkillBaseline", readonly)]
+    pub timing_skill_baseline: f64,
 }
 
 impl From<sunny::SunnyManiaPerformanceAttributes> for JsSunnyManiaPerformanceAttributes {
@@ -235,6 +247,10 @@ impl From<sunny::SunnyManiaPerformanceAttributes> for JsSunnyManiaPerformanceAtt
             acc_multiplier: attrs.acc_multiplier,
             length_multiplier: attrs.length_multiplier,
             window_scalar: attrs.window_scalar,
+            pp_pattern: attrs.pp_pattern,
+            pp_timing: attrs.pp_timing,
+            timing_skill_played: attrs.timing_skill_played,
+            timing_skill_baseline: attrs.timing_skill_baseline,
         }
     }
 }

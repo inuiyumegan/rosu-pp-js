@@ -641,6 +641,14 @@ pub struct SunnyManiaPerformanceAttributes {
     /// reference, which is how `EZ` is priced without a mod-specific factor. Exactly
     /// 1 only when there was nothing to measure. See [`window_scalar`].
     pub window_scalar: f64,
+    /// PP contribution from pattern difficulty (sunny's base calculation).
+    pub pp_pattern: f64,
+    /// PP contribution from timing difficulty (accuracy surface).
+    pub pp_timing: f64,
+    /// Fitted timing skill through actual windows (with mods and input-state).
+    pub timing_skill_played: f64,
+    /// Fitted timing skill through natural windows (no mods, no input-state).
+    pub timing_skill_baseline: f64,
 }
 
 /// Score state required for the performance calculation.
@@ -743,7 +751,7 @@ pub(crate) fn calculate_performance_with_model(
 ) -> SunnyManiaPerformanceAttributes {
     // NF still gets a flat factor: failing is a scoring matter that the timing
     // surface says nothing about, so there is nothing for it to price. EZ has no
-    // factor here on purpose — see `compute_difficulty_value`.
+    // factor here on purpose — see the compositional calculation below.
     let mut multiplier = 1.0;
 
     if has_mod(mods, "NF") {
@@ -751,14 +759,40 @@ pub(crate) fn calculate_performance_with_model(
     }
 
     let score_accuracy = custom_accuracy(state);
-    let window_scalar = window_scalar_with_model(attrs, state, model);
-    let difficulty_value = compute_difficulty_value(attrs.stars, score_accuracy, window_scalar);
-    let variety_multiplier = variety_multiplier(attrs.variety);
-    let acc_multiplier = acc_multiplier(score_accuracy, attrs.acc_scalar);
-    let length_multiplier = length_multiplier(attrs.n_objects as f64, attrs.stars);
 
-    let pp =
-        difficulty_value * multiplier * variety_multiplier * acc_multiplier * length_multiplier;
+    // === COMPOSITIONAL ARCHITECTURE ===
+    // PP is split into two additive components:
+    // 1. Pattern difficulty (from sunny's base star rating)
+    // 2. Timing difficulty (from the accuracy surface)
+
+    // Pattern difficulty: base calculation from sunny
+    let variety_multiplier = variety_multiplier(attrs.variety);
+    let length_multiplier = length_multiplier(attrs.n_objects as f64, attrs.stars);
+    let acc_multiplier = acc_multiplier(score_accuracy, attrs.acc_scalar);
+
+    // Base pattern pp (without timing surface)
+    let pattern_difficulty = attrs.stars.max(0.05) - 0.15;
+    let pp_pattern = 9.8 * pattern_difficulty.powf(2.2)
+        * variety_multiplier
+        * length_multiplier
+        * multiplier;
+
+    // Timing difficulty: from the accuracy surface
+    let timing_result = compute_timing_pp(attrs, state, model);
+    let pp_timing = timing_result.pp * acc_multiplier * multiplier;
+
+    // Legacy window_scalar for compatibility (kept for reporting)
+    let window_scalar = if timing_result.baseline_skill > 0.0 {
+        timing_result.played_skill / timing_result.baseline_skill
+    } else {
+        1.0
+    };
+
+    // Total pp is additive composition
+    let pp = pp_pattern + pp_timing;
+
+    // Legacy difficulty_value for compatibility
+    let difficulty_value = compute_difficulty_value(attrs.stars, score_accuracy, window_scalar);
 
     SunnyManiaPerformanceAttributes {
         pp,
@@ -767,6 +801,10 @@ pub(crate) fn calculate_performance_with_model(
         acc_multiplier,
         length_multiplier,
         window_scalar,
+        pp_pattern,
+        pp_timing,
+        timing_skill_played: timing_result.played_skill,
+        timing_skill_baseline: timing_result.baseline_skill,
     }
 }
 
@@ -1234,6 +1272,145 @@ fn window_scalar_with_model(
     // OD8, EZ/HR still act through the played windows, and new input-state/oracle units
     // appear only on the played side instead of cancelling themselves.
     played.skill / baseline.skill
+}
+
+/// Result of timing pp calculation with component breakdown.
+#[derive(Clone, Copy, Debug, Default)]
+struct TimingPpResult {
+    pp: f64,
+    played_skill: f64,
+    baseline_skill: f64,
+}
+
+/// Compute timing difficulty pp from the accuracy surface.
+///
+/// This separates timing precision from pattern difficulty, measuring:
+/// 1. Demonstrated timing skill through actual windows (with mods and input-state)
+/// 2. Expected timing skill through natural windows (no mods, no input-state)
+/// 3. Window difficulty adjustment (narrower windows = harder = more pp)
+/// 4. Accuracy penalty (rewards clean scores, heavily penalizes low acc)
+fn compute_timing_pp(
+    attrs: &SunnyManiaDifficultyAttributes,
+    state: SunnyScoreState,
+    model: &ErrorModel,
+) -> TimingPpResult {
+    let total = state.total_hits();
+
+    if total == 0 || attrs.n_objects == 0 || attrs.stars <= 0.0 {
+        return TimingPpResult::default();
+    }
+
+    let counts = [
+        state.n320,
+        state.n300,
+        state.n200,
+        state.n100,
+        state.n50,
+        state.misses,
+    ];
+
+    let units = judgement_units(
+        attrs,
+        f64::from(total),
+        model,
+        !per_note_difficulty_disabled(),
+    );
+
+    // Fit skill through actual windows (with mods and input-state)
+    let played = fit_with_quality(&counts, &units, &attrs.hit_windows, model);
+
+    // Fit skill through natural windows (no mods, no input-state)
+    let baseline_model = ErrorModel {
+        recovery_offset: 0.0,
+        ..*model
+    };
+    let baseline_units = judgement_units(
+        attrs,
+        f64::from(total),
+        &baseline_model,
+        !per_note_difficulty_disabled(),
+    );
+    let baseline = fit_with_quality(
+        &counts,
+        &baseline_units,
+        &attrs.map_windows,
+        &baseline_model,
+    );
+
+    if played.skill <= 0.0 || baseline.skill <= 0.0 {
+        return TimingPpResult {
+            pp: 0.0,
+            played_skill: played.skill,
+            baseline_skill: baseline.skill,
+        };
+    }
+
+    // The core insight: fitted skill is window-dependent.
+    // When the same counts come through wider windows (EZ), the fitted skill
+    // is LOWER because the model interprets it as "less precision needed".
+    // We want: wider windows → lower pp, narrower windows → higher pp.
+
+    // Strategy: use the ratio of skills, but apply window difficulty separately
+    let skill_ratio = played.skill / baseline.skill;
+
+    // Window difficulty: narrower windows = harder = multiplier > 1
+    // This captures the absolute OD level effect
+    let window_difficulty = window_difficulty_factor(&attrs.hit_windows);
+
+    // Accuracy penalty from hit distribution
+    let acc_penalty = accuracy_penalty_from_counts(&counts);
+
+    // Base timing pp: scale baseline skill by the ratio and window difficulty
+    // The ratio captures input-state effects and mod effects
+    // The window difficulty captures the absolute timing requirement
+    let base_timing = baseline.skill * skill_ratio * window_difficulty * 5.0;
+
+    let pp = base_timing * acc_penalty;
+
+    TimingPpResult {
+        pp,
+        played_skill: played.skill,
+        baseline_skill: baseline.skill,
+    }
+}
+
+/// Compute window difficulty factor: narrower windows = harder = higher multiplier.
+fn window_difficulty_factor(windows: &ManiaHitWindows) -> f64 {
+    const REFERENCE_GREAT: f64 = 40.5; // OD 8
+
+    let ratio = REFERENCE_GREAT / windows.great;
+
+    // Apply moderate exponent (0.4) to dampen the effect:
+    // - OD 10 (32ms): ratio 1.27 → factor 1.10 (+10%)
+    // - OD 8 (40.5ms): ratio 1.00 → factor 1.00 (neutral)
+    // - OD 5 (55.5ms): ratio 0.73 → factor 0.85 (-15%)
+    ratio.powf(0.4)
+}
+
+/// Compute accuracy penalty from hit counts.
+///
+/// Rewards clean scores and heavily penalizes low accuracy. Uses a steep
+/// curve (exponent 12) so that 95% acc gets ~74% of the timing pp, and
+/// 90% acc gets ~28%.
+fn accuracy_penalty_from_counts(counts: &[u32]) -> f64 {
+    let total = counts.iter().sum::<u32>() as f64;
+    if total <= 0.0 {
+        return 0.0;
+    }
+
+    // Weighted average: 320=1.0, 300=0.9, 200=0.7, 100=0.4, 50=0.2, miss=0.0
+    let weighted = (
+        counts[0] as f64 * 1.0 +
+        counts[1] as f64 * 0.9 +
+        counts[2] as f64 * 0.7 +
+        counts[3] as f64 * 0.4 +
+        counts[4] as f64 * 0.2 +
+        counts[5] as f64 * 0.0
+    ) / total;
+
+    // Steep penalty curve: 12th power
+    // 100% → 1.00, 99% → 0.89, 95% → 0.54, 90% → 0.28, 85% → 0.14
+    weighted.powi(12)
 }
 
 // ---------------------------------------------------------------------------
