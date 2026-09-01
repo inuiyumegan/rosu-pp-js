@@ -169,19 +169,19 @@ pub struct InputStateBin {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InputOperationKind {
+pub(crate) enum InputOperationKind {
     Press,
     Release,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct InputOperation {
+pub(crate) struct InputOperation {
     column: usize,
     time_ms: f64,
-    kind: InputOperationKind,
-    hold_duration_ms: Option<f64>,
+    pub(crate) kind: InputOperationKind,
+    pub(crate) hold_duration_ms: Option<f64>,
     chord_mask: u64,
-    note_idx: usize,
+    pub(crate) note_idx: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -193,21 +193,21 @@ enum ColumnInputState {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct ClassifiedOperation {
-    operation: InputOperation,
-    class: InputClass,
-    previous_gap_ms: Option<f64>,
+pub(crate) struct ClassifiedOperation {
+    pub(crate) operation: InputOperation,
+    pub(crate) class: InputClass,
+    pub(crate) previous_gap_ms: Option<f64>,
     #[cfg_attr(not(test), allow(dead_code))]
-    previous_operation_kind: Option<InputOperationKind>,
-    next_gap_ms: Option<f64>,
-    next_operation_kind: Option<InputOperationKind>,
-    other_held: usize,
-    chord_width: usize,
+    pub(crate) previous_operation_kind: Option<InputOperationKind>,
+    pub(crate) next_gap_ms: Option<f64>,
+    pub(crate) next_operation_kind: Option<InputOperationKind>,
+    pub(crate) other_held: usize,
+    pub(crate) chord_width: usize,
 }
 
 const RAPID_REPRESS_MS: f64 = 150.0;
 
-fn input_operations(notes: &[Note]) -> Vec<InputOperation> {
+pub(crate) fn input_operations(notes: &[Note]) -> Vec<InputOperation> {
     let mut chord_masks = HashMap::<u64, u64>::new();
 
     for note in notes {
@@ -261,7 +261,10 @@ fn input_operations(notes: &[Note]) -> Vec<InputOperation> {
     operations
 }
 
-fn classify_input_operations(notes: &[Note], total_columns: usize) -> Vec<ClassifiedOperation> {
+pub(crate) fn classify_input_operations(
+    notes: &[Note],
+    total_columns: usize,
+) -> Vec<ClassifiedOperation> {
     let operations = input_operations(notes);
     let mut states = vec![ColumnInputState::Idle; total_columns];
     let mut held_since = vec![None::<f64>; total_columns];
@@ -5855,6 +5858,12 @@ mod tests {
         after_g: f64,
         before_plausible: bool,
         after_plausible: bool,
+        before_scalar: f64,
+        before_difficulty_value: f64,
+        before_acc_multiplier: f64,
+        after_scalar: f64,
+        after_difficulty_value: f64,
+        after_acc_multiplier: f64,
     }
 
     const INPUT_STATE_RECOVERY_OFFSET: f64 = 73.12;
@@ -5880,6 +5889,40 @@ mod tests {
         } else {
             ErrorModel::default()
         }
+    }
+
+    fn composition_from_units(
+        attrs: &SunnyManiaDifficultyAttributes,
+        mods: &LazerMods,
+        state: SunnyScoreState,
+        model: &ErrorModel,
+        units: &[crate::mania_accuracy::JudgementUnit],
+    ) -> (f64, f64, f64, f64) {
+        let counts = [
+            state.n320,
+            state.n300,
+            state.n200,
+            state.n100,
+            state.n50,
+            state.misses,
+        ];
+        let played = fit_with_quality(&counts, units, &attrs.hit_windows, model);
+        let reference = fit_with_quality(&counts, units, &reference_windows(attrs), model);
+        let scalar = if played.skill > 0.0 && reference.skill > 0.0 {
+            played.skill / reference.skill
+        } else {
+            1.0
+        };
+        let multiplier = if has_mod(mods, "NF") { 0.75 } else { 1.0 };
+        let difficulty_value =
+            compute_difficulty_value(attrs.stars, custom_accuracy(state), scalar);
+        let acc = acc_multiplier(custom_accuracy(state), attrs.acc_scalar);
+        let pp = difficulty_value
+            * multiplier
+            * variety_multiplier(attrs.variety)
+            * acc
+            * length_multiplier(attrs.n_objects as f64, attrs.stars);
+        (pp, scalar, difficulty_value, acc)
     }
 
     /// Prices every `multiuser.tsv` row under `before` and `after`, so an error-model
@@ -5931,11 +5974,34 @@ mod tests {
                 let fit = fit_with_quality(&counts, &units, &attrs.hit_windows, model);
                 let perf = calculate_performance_with_model(&attrs, &mods, state, model);
 
-                (perf.pp, fit.g_timing, fit.is_plausible())
+                let (_, scalar, difficulty_value, acc_multiplier) =
+                    composition_from_units(&attrs, &mods, state, model, &units);
+                (
+                    perf.pp,
+                    fit.g_timing,
+                    fit.is_plausible(),
+                    scalar,
+                    difficulty_value,
+                    acc_multiplier,
+                )
             };
 
-            let (before_pp, before_g, before_plausible) = price(before);
-            let (after_pp, after_g, after_plausible) = price(after);
+            let (
+                before_pp,
+                before_g,
+                before_plausible,
+                before_scalar,
+                before_difficulty_value,
+                before_acc_multiplier,
+            ) = price(before);
+            let (
+                after_pp,
+                after_g,
+                after_plausible,
+                after_scalar,
+                after_difficulty_value,
+                after_acc_multiplier,
+            ) = price(after);
 
             out.push(AbPriced {
                 uid: f[0].to_owned(),
@@ -5957,6 +6023,12 @@ mod tests {
                 after_g,
                 before_plausible,
                 after_plausible,
+                before_scalar,
+                before_difficulty_value,
+                before_acc_multiplier,
+                after_scalar,
+                after_difficulty_value,
+                after_acc_multiplier,
             });
         }
 
@@ -6001,6 +6073,24 @@ mod tests {
 
         let before_g: f64 = rows.iter().map(|r| r.before_g).sum::<f64>() / n;
         let after_g: f64 = rows.iter().map(|r| r.after_g).sum::<f64>() / n;
+        let finite_mean = |pick: fn(&AbPriced) -> f64| {
+            let values: Vec<f64> = rows
+                .iter()
+                .map(|r| pick(r))
+                .filter(|v| v.is_finite())
+                .collect();
+            if values.is_empty() {
+                f64::NAN
+            } else {
+                values.iter().sum::<f64>() / values.len() as f64
+            }
+        };
+        let before_scalar = finite_mean(|r| r.before_scalar);
+        let before_dv = finite_mean(|r| r.before_difficulty_value);
+        let before_acc = finite_mean(|r| r.before_acc_multiplier);
+        let after_scalar = finite_mean(|r| r.after_scalar);
+        let after_dv = finite_mean(|r| r.after_difficulty_value);
+        let after_acc = finite_mean(|r| r.after_acc_multiplier);
 
         // Median alongside the mean, because a handful of pathological fits move the
         // mean a long way and that is exactly where a shape change shows up first.
@@ -6030,7 +6120,7 @@ mod tests {
         println!(
             "  {label}: n={:<4} pp {:.0} -> {:.0} ({:+.2}%)  live {:.0} ratios {:.1}% -> {:.1}%  med {:+.2}% mean {:+.2}%  \
              up/down {raised}/{lowered}  g med {:.1} -> {:.1}  mean {:.1} -> {:.1}  \
-             (plaus {before_plaus} -> {after_plaus})",
+             (plaus {before_plaus} -> {after_plaus})  composition scalar {:.5} -> {:.5} difficulty {:.3} -> {:.3} acc_mult {:.5} -> {:.5}",
             rows.len(),
             before_sum,
             after_sum,
@@ -6056,6 +6146,12 @@ mod tests {
             after_g_med,
             before_g,
             after_g,
+            before_scalar,
+            after_scalar,
+            before_dv,
+            after_dv,
+            before_acc,
+            after_acc,
         );
     }
 
@@ -12301,6 +12397,7 @@ mod tests {
     #[ignore = "reads gitignored fixtures; expensive calibration research"]
     fn transition_oracle_experiments() {
         use crate::mania_accuracy::{ErrorModel, JudgementUnit};
+        use rayon::prelude::*;
 
         let Ok(text) = std::fs::read_to_string("local-fixtures/multiuser.tsv") else {
             println!("no fixtures present (local-fixtures/multiuser.tsv); nothing to report");
@@ -12315,7 +12412,10 @@ mod tests {
         };
 
         // Candidate formulas to test
-        let candidates: Vec<(&str, Box<dyn Fn(&ClassifiedOperation, &ErrorModel) -> f64>)> = vec![
+        let candidates: Vec<(
+            &str,
+            Box<dyn Fn(&ClassifiedOperation, &ErrorModel) -> f64 + Sync>,
+        )> = vec![
             // 1. Baseline uniform recovery
             (
                 "baseline_uniform",
@@ -12428,160 +12528,185 @@ mod tests {
             ),
         ];
 
-        for (name, formula) in &candidates {
+        let reports: Vec<(&str, Vec<AbPriced>)> = candidates
+            .par_iter()
+            .map(|(name, formula)| {
+                let mut scores = Vec::new();
+
+                for line in text.lines() {
+                    let f: Vec<&str> = line.split('\t').collect();
+                    if f.len() < 18 || f[0] == "uid" {
+                        continue;
+                    }
+
+                    let u = |s: &str| s.parse::<u32>().unwrap_or(0);
+                    let counts = [u(f[7]), u(f[8]), u(f[9]), u(f[10]), u(f[11]), u(f[12])];
+
+                    let Some(map) = parse(&format!("local-fixtures/maps/{}.osu", f[2])) else {
+                        continue;
+                    };
+
+                    let (mods, clock_rate) = mods_for(f[3]);
+
+                    let Some(attrs) = calculate(&map, &mods, clock_rate, Some(false), None) else {
+                        continue;
+                    };
+
+                    let state = SunnyScoreState {
+                        n320: counts[0],
+                        n300: counts[1],
+                        n200: counts[2],
+                        n100: counts[3],
+                        n50: counts[4],
+                        misses: counts[5],
+                    };
+
+                    // Price with baseline (no recovery)
+                    let baseline_no_recovery = ErrorModel::default();
+                    let units_before = judgement_units(
+                        &attrs,
+                        f64::from(state.total_hits()),
+                        &baseline_no_recovery,
+                        true,
+                    );
+                    let fit_before = fit_with_quality(
+                        &counts,
+                        &units_before,
+                        &attrs.hit_windows,
+                        &baseline_no_recovery,
+                    );
+                    let (perf_before, _, _, _) = composition_from_units(
+                        &attrs,
+                        &mods,
+                        state,
+                        &baseline_no_recovery,
+                        &units_before,
+                    );
+
+                    // Price with exact oracle using this candidate formula
+                    let total = f64::from(state.total_hits());
+                    let units_after = (|| {
+                        let total_columns = map.cs.round_ties_even().max(1.0) as usize;
+                        let (notes, _) =
+                            build_notes(clock_rate, map.hit_objects.iter(), total_columns);
+                        let windows = hit_windows(&map, &mods, clock_rate, false);
+                        let great = get_hit_window_300(
+                            &map,
+                            clock_rate,
+                            has_mod(&mods, "HR"),
+                            has_mod(&mods, "EZ"),
+                        );
+                        let data = RebirthData::new(
+                            notes,
+                            total_columns,
+                            hit_leniency_from_window(great),
+                            windows.good,
+                        );
+                        let (_, _, per_note) = per_note_difficulty(&map)?;
+                        if per_note.len() != data.notes.len() {
+                            return None;
+                        }
+                        let classic = !attrs.ln_judged_as_one;
+
+                        let oracle_offsets =
+                            exact_transition_oracle(&data.notes, data.total_columns, |op| {
+                                formula(op, &baseline)
+                            });
+
+                        // Build units from oracle offsets
+                        let included = oracle_offsets
+                            .iter()
+                            .filter(|(op, _)| {
+                                !classic || op.operation.kind != InputOperationKind::Release
+                            })
+                            .count();
+                        if included == 0 {
+                            return None;
+                        }
+                        let mut units = Vec::with_capacity(included);
+                        let per_op = total / included as f64;
+
+                        for (op, offset) in &oracle_offsets {
+                            if classic && op.operation.kind == InputOperationKind::Release {
+                                continue;
+                            }
+
+                            let difficulty = per_note[op.operation.note_idx].0;
+
+                            let is_long = op.operation.kind == InputOperationKind::Press
+                                && op.operation.hold_duration_ms.is_some();
+
+                            let mut unit = if is_long && attrs.ln_judged_as_one {
+                                JudgementUnit::long_note(
+                                    difficulty,
+                                    per_op,
+                                    &baseline_no_recovery,
+                                    op.operation.hold_duration_ms.unwrap_or(0.0),
+                                )
+                            } else {
+                                JudgementUnit::repeated(difficulty, per_op)
+                            };
+
+                            unit.fading_mean_offset = *offset;
+                            units.push(unit);
+                        }
+
+                        Some(units)
+                    })()
+                    .unwrap_or_else(|| units_before.clone());
+
+                    let fit_after = fit_with_quality(
+                        &counts,
+                        &units_after,
+                        &attrs.hit_windows,
+                        &baseline_no_recovery,
+                    );
+                    let (perf_after, after_scalar, after_difficulty_value, after_acc_multiplier) =
+                        composition_from_units(
+                            &attrs,
+                            &mods,
+                            state,
+                            &baseline_no_recovery,
+                            &units_after,
+                        );
+
+                    scores.push(AbPriced {
+                        uid: f[0].to_owned(),
+                        map_id: f[2].to_owned(),
+                        mods: f[3].to_owned(),
+                        keys: u(f[6]),
+                        od: map.od,
+                        acc: f[13].parse().unwrap_or(0.0),
+                        notes: state.total_hits(),
+                        ln_fraction: if attrs.n_objects > 0 {
+                            attrs.n_long_notes as f64 / attrs.n_objects as f64
+                        } else {
+                            0.0
+                        },
+                        live_pp: f[14].parse().unwrap_or(0.0),
+                        before_pp: perf_before,
+                        after_pp: perf_after,
+                        before_g: fit_before.g_timing,
+                        after_g: fit_after.g_timing,
+                        before_plausible: fit_before.is_plausible(),
+                        after_plausible: fit_after.is_plausible(),
+                        before_scalar: f64::NAN,
+                        before_difficulty_value: f64::NAN,
+                        before_acc_multiplier: f64::NAN,
+                        after_scalar,
+                        after_difficulty_value,
+                        after_acc_multiplier,
+                    });
+                }
+
+                (*name, scores)
+            })
+            .collect();
+
+        for (name, scores) in reports {
             println!("\n{:=<80}", "");
             println!("CANDIDATE: {name}");
             println!("{:=<80}\n", "");
-
-            let mut scores = Vec::new();
-
-            for line in text.lines() {
-                let f: Vec<&str> = line.split('\t').collect();
-                if f.len() < 18 || f[0] == "uid" {
-                    continue;
-                }
-
-                let u = |s: &str| s.parse::<u32>().unwrap_or(0);
-                let counts = [u(f[7]), u(f[8]), u(f[9]), u(f[10]), u(f[11]), u(f[12])];
-
-                let Some(map) = parse(&format!("local-fixtures/maps/{}.osu", f[2])) else {
-                    continue;
-                };
-
-                let (mods, clock_rate) = mods_for(f[3]);
-
-                let Some(attrs) = calculate(&map, &mods, clock_rate, Some(false), None) else {
-                    continue;
-                };
-
-                let state = SunnyScoreState {
-                    n320: counts[0],
-                    n300: counts[1],
-                    n200: counts[2],
-                    n100: counts[3],
-                    n50: counts[4],
-                    misses: counts[5],
-                };
-
-                // Price with baseline (no recovery)
-                let baseline_no_recovery = ErrorModel::default();
-                let units_before = judgement_units(
-                    &attrs,
-                    f64::from(state.total_hits()),
-                    &baseline_no_recovery,
-                    true,
-                );
-                let fit_before = fit_with_quality(
-                    &counts,
-                    &units_before,
-                    &attrs.hit_windows,
-                    &baseline_no_recovery,
-                );
-                let perf_before =
-                    calculate_performance_with_model(&attrs, &mods, state, &baseline_no_recovery);
-
-                // Price with exact oracle using this candidate formula
-                let total = f64::from(state.total_hits());
-                let units_after = (|| {
-                    let total_columns = map.cs.round_ties_even().max(1.0) as usize;
-                    let (notes, _) = build_notes(clock_rate, map.hit_objects.iter(), total_columns);
-                    let windows = hit_windows(&map, &mods, clock_rate, false);
-                    let great = get_hit_window_300(
-                        &map,
-                        clock_rate,
-                        has_mod(&mods, "HR"),
-                        has_mod(&mods, "EZ"),
-                    );
-                    let data = RebirthData::new(
-                        notes,
-                        total_columns,
-                        hit_leniency_from_window(great),
-                        windows.good,
-                    );
-                    let (_, _, per_note) = per_note_difficulty(&map)?;
-                    if per_note.len() != data.notes.len() {
-                        return None;
-                    }
-                    let classic = !attrs.ln_judged_as_one;
-
-                    let oracle_offsets =
-                        exact_transition_oracle(&data.notes, data.total_columns, |op| {
-                            formula(op, &baseline)
-                        });
-
-                    // Build units from oracle offsets
-                    let included = oracle_offsets
-                        .iter()
-                        .filter(|(op, _)| {
-                            !classic || op.operation.kind != InputOperationKind::Release
-                        })
-                        .count();
-                    if included == 0 {
-                        return None;
-                    }
-                    let mut units = Vec::with_capacity(included);
-                    let per_op = total / included as f64;
-
-                    for (op, offset) in &oracle_offsets {
-                        if classic && op.operation.kind == InputOperationKind::Release {
-                            continue;
-                        }
-
-                        let difficulty = per_note[op.operation.note_idx].0;
-
-                        let is_long = op.operation.kind == InputOperationKind::Press
-                            && op.operation.hold_duration_ms.is_some();
-
-                        let mut unit = if is_long && attrs.ln_judged_as_one {
-                            JudgementUnit::long_note(
-                                difficulty,
-                                per_op,
-                                &baseline_no_recovery,
-                                op.operation.hold_duration_ms.unwrap_or(0.0),
-                            )
-                        } else {
-                            JudgementUnit::repeated(difficulty, per_op)
-                        };
-
-                        unit.fading_mean_offset = *offset;
-                        units.push(unit);
-                    }
-
-                    Some(units)
-                })()
-                .unwrap_or_else(|| units_before.clone());
-
-                let fit_after = fit_with_quality(
-                    &counts,
-                    &units_after,
-                    &attrs.hit_windows,
-                    &baseline_no_recovery,
-                );
-                let perf_after =
-                    calculate_performance_with_model(&attrs, &mods, state, &baseline_no_recovery);
-
-                scores.push(AbPriced {
-                    uid: f[0].to_owned(),
-                    map_id: f[2].to_owned(),
-                    mods: f[3].to_owned(),
-                    keys: u(f[6]),
-                    od: map.od,
-                    acc: f[13].parse().unwrap_or(0.0),
-                    notes: state.total_hits(),
-                    ln_fraction: if attrs.n_objects > 0 {
-                        attrs.n_long_notes as f64 / attrs.n_objects as f64
-                    } else {
-                        0.0
-                    },
-                    live_pp: f[14].parse().unwrap_or(0.0),
-                    before_pp: perf_before.pp,
-                    after_pp: perf_after.pp,
-                    before_g: fit_before.g_timing,
-                    after_g: fit_after.g_timing,
-                    before_plausible: fit_before.is_plausible(),
-                    after_plausible: fit_after.is_plausible(),
-                });
-            }
 
             if scores.is_empty() {
                 println!("no scores loaded");
