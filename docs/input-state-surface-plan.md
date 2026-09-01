@@ -595,3 +595,144 @@ The compact multi-user A/B against the no-input-state control passed those gates
 The timing-fit diagnostic moved modestly (`g_timing` median `19.0 -> 19.5` on the
 no-window-mod cohort) and remains supplemental. The calibration changes only the recovery
 curve parameters; accuracy multipliers were identical on the reported compositions.
+
+## Recovery-curve policy interpolation (2026-09-02)
+
+### What the three parameters mean
+
+For a press with a previous same-column press, the measured mean timing displacement is
+
+```text
+offset(gap) = recovery_offset * exp(-gap / recovery_tau) + anticipation_offset
+```
+
+- `recovery_offset` is the positive short-gap displacement. Larger values model more
+  lateness immediately after a rapid same-column press.
+- `recovery_tau` is the e-folding time in milliseconds. Larger values make the short-gap
+  displacement persist across longer gaps; smaller values return to the long-gap regime
+  sooner.
+- `anticipation_offset` is the long-gap endpoint. A negative value models the small early
+  bias measured when a player has ample warning before the next press.
+
+These fields are independently assignable in `ErrorModel`, but they are not three
+independent balance controls. Over a finite set of map gaps, increasing the amplitude can
+be partly compensated by shortening tau or moving the plateau. They should normally be
+fitted together from replay timing. User feedback and pp reports validate the resulting
+policy; they do not identify which physical parameter is wrong.
+
+The input-state builder centers the curve over each map's press population before the
+timing fit. It therefore redistributes expected timing error between local input states
+instead of manufacturing a global latency offset. The recovery curve is enabled only on
+the played fit. The natural-window reference uses the same input-state representation
+with recovery disabled. Consequently the parameters can move the played/reference skill
+ratio and pp even though they do not directly encode LN, OD, or EZ. Those cohorts respond
+because their window and same-column-gap populations differ.
+
+### Production-path interpolation harness
+
+The accepted expanded-pool curve and historical small-pool curve are:
+
+```text
+current = (20.425, 116.68, -2.517)
+old     = (73.12,   72.40, -3.19)
+```
+
+Three complete curves were linearly interpolated component by component with
+`candidate(t) = current + t * (old - current)`. This is deliberately different from the
+older amplitude-only exact oracle above: it prices the shipping compact input-state bins,
+Sunny composition, actual hit windows, and natural-window reference together.
+
+| candidate | t | recovery_offset | recovery_tau | anticipation_offset |
+|---|---:|---:|---:|---:|
+| current | 0.00 | 20.425 | 116.68 | -2.517 |
+| 25% | 0.25 | 33.59875 | 105.61 | -2.68525 |
+| 50% | 0.50 | 46.7725 | 94.54 | -2.8535 |
+| 75% | 0.75 | 59.94625 | 83.47 | -3.02175 |
+| old | 1.00 | 73.12 | 72.40 | -3.19 |
+
+For each candidate, set those three `ErrorModel::default()` fields, rebuild, and run:
+
+```sh
+SUNNY_INPUT_STATE=1 cargo test --release multiuser_report -- --ignored --nocapture \
+  --exact sunny::tests::multiuser_report
+```
+
+Each run loaded the same 1,204 scores from 80 users and completed successfully. Generated
+reports are measurement output and remain uncommitted. The accepted defaults must be
+restored after a sweep. A future permanent sweep harness should pass an explicit candidate
+model into the report rather than mutate environment variables during a parallel test.
+
+### Cohort results
+
+All percentages below compare calculated pp with the live pp stored in the fixture. The
+columns are therefore absolute policy outcomes, not candidate-versus-current deltas.
+
+| curve | all summed | no-EZ summed | EZ summed | LN 30-60% summed | LN >=60% summed |
+|---|---:|---:|---:|---:|---:|
+| current | +0.37% | +2.97% | -37.73% | +3.95% | +5.91% |
+| 25% | +1.03% | +3.66% | -37.49% | +4.99% | +6.62% |
+| 50% | +1.80% | +4.46% | -37.17% | +6.17% | +7.46% |
+| 75% | +2.48% | +5.16% | -36.84% | +7.23% | +8.27% |
+| old | +2.85% | +5.54% | -36.59% | +7.85% | +8.80% |
+
+The response is smooth and nearly monotone. Moving toward the historical curve acts as a
+stronger recovery-surface transfer: it adds progressively more pp to LN-heavy cohorts and
+simultaneously returns some pp to EZ. It is not an LN or EZ bonus parameter, but in this
+fixture their structural populations make it behave like a lever between those outcomes.
+
+The direct old-versus-current comparison also shows that the lever acts most strongly on
+high-performing scores:
+
+| current fitted timing skill | old summed pp relative to current |
+|---|---:|
+| below 7 | +0.94% |
+| 7 to 9 | +2.23% |
+| at least 9 | +2.80% |
+
+| score accuracy | old summed pp relative to current |
+|---|---:|
+| below 95% | +1.60% |
+| 95-98% | +2.35% |
+| at least 98% | +2.79% |
+
+This does not prove a player-skill-dependent recovery curve. The fixed aggressive curve
+can itself make near-perfect execution on a recovery-heavy surface appear more
+exceptional. A skill-conditioned curve must be measured from replay offsets using skill
+estimated from other scores and validated on held-out users; it must not be inferred from
+this pp response.
+
+### Fit-quality and outlier gates
+
+| curve | median g_timing | p90 g_timing | plausible | >20% relative surface gains |
+|---|---:|---:|---:|---:|
+| current | 20.0 | 96.9 | 766 / 1204 | 0 |
+| 25% | 20.0 | 99.7 | 761 / 1204 | 1 |
+| 50% | 19.9 | 102.4 | 762 / 1204 | 4 |
+| 75% | 20.0 | 102.3 | 762 / 1204 | 6 |
+| old | 20.1 | 101.4 | 759 / 1204 | 6 |
+
+The median cannot distinguish the candidates. The p90 tail and plausible count favor the
+expanded replay fit. `g_timing` remains a falsification/guardrail statistic rather than a
+parameter-fitting target because aggregate judgement counts discard the note-to-gap
+association that identifies recovery.
+
+At 25%, the only cohort-relative mover above 20% is uid 6821 on map 4045169: NM, OD8,
+43% LN, 100% accuracy, `+19.88%` raw surface and `+21.04%` relative to the cohort. At
+50%, four maps cross the gate; all have 36-60% LN and 99.73-100% accuracy. At 75%, the
+same six near-perfect LN cases seen under the historical curve return. Under the old
+curve their raw surface gains range from `+23.22%` to `+33.82%`.
+
+### Decision recorded from this sweep
+
+The expanded replay fit remains the empirical baseline: it best preserves Sunny's broad
+shape, retains a modest LN correction, keeps EZ approximately 38% below live, has the
+best fit-quality tail, and produces no cohort-relative mover above 20%.
+
+Of the interpolated policy candidates, 25% is the only plausible upper bound for further
+discussion. It adds about one percentage point to the LN 30-60% cohort and 0.71 points to
+the LN >=60% cohort while returning only 0.24 points to EZ, but it already introduces one
+outlier and weakens fit-quality gates. If feedback supports a slightly stronger LN
+correction, test the 10-20% interval rather than moving directly to 50% or independently
+hand-tuning the three physical parameters. If only specific LN patterns remain
+underweighted, inspect missing state mechanisms or compact-bin loss instead of raising a
+global recovery curve.

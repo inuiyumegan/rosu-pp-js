@@ -5318,6 +5318,22 @@ mod tests {
         let dir = std::path::Path::new("target/surface");
         std::fs::create_dir_all(dir).unwrap();
 
+        let env = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
+        let clock_rate = env("SURFACE_CLOCK_RATE")
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(1.0);
+
+        // A real map supplies the slice difficulty, judgement-unit population, and
+        // actual NM/EZ/HR windows. With no map, preserve the reproducible synthetic
+        // Decoy slice used by the original visualiser.
+        let map_slice = env("SURFACE_MAP").map(|path| {
+            let map = parse(&path).unwrap_or_else(|| panic!("cannot parse {path}"));
+            let attrs = calculate(&map, &GameMods::default(), clock_rate, Some(true), None)
+                .unwrap_or_else(|| panic!("{path} is not a mania map"));
+
+            (path, map, attrs)
+        });
+
         // Log-spaced in both axes: skill spans orders of magnitude and difficulty is
         // multiplicative in `sigma`, so a linear grid would waste most of its rows.
         let geom = |low: f64, high: f64, steps: usize| -> Vec<f64> {
@@ -5350,14 +5366,32 @@ mod tests {
 
         std::fs::write(dir.join("grid.csv"), grid).unwrap();
 
-        // One difficulty, chosen to be the Decoy score's so the plots line up with the
-        // pricing reports.
-        let difficulty = 13.774;
+        let difficulty = map_slice
+            .as_ref()
+            .map_or(13.774, |(_, _, attrs)| attrs.stars);
+        let source = map_slice
+            .as_ref()
+            .map_or("default (Decoy DT)", |(path, _, _)| path.as_str());
+        let units = map_slice
+            .as_ref()
+            .map(|(_, _, attrs)| judgement_units(attrs, 1.0, &model, true))
+            .unwrap_or_else(|| vec![JudgementUnit::new(difficulty)]);
+
+        std::fs::write(
+            dir.join("surface_2d_meta.csv"),
+            format!(
+                "difficulty,clock_rate,source\n{difficulty},{clock_rate},{source}\n"
+            ),
+        )
+        .unwrap();
+
         let mut bands = String::from("skill,sigma,n320,n300,n200,n100,n50,miss,accuracy\n");
 
         for &skill in &skills {
-            let units = [JudgementUnit::new(difficulty)];
-            let expected = expected_counts(&units, &REFERENCE_WINDOWS, &model, skill);
+            let windows = map_slice
+                .as_ref()
+                .map_or(REFERENCE_WINDOWS, |(_, _, attrs)| attrs.hit_windows);
+            let expected = expected_counts(&units, &windows, &model, skill);
             let total = expected.total();
             let share = |judgement| expected.get(judgement) / total;
 
@@ -5380,24 +5414,41 @@ mod tests {
 
         // The same slice under different windows. Named by GREAT window since that is
         // the single parameter the rest are derived from.
-        let window_sets = [
-            ("HR OD7 DT", 30.5_f64),
-            ("reference OD8", 40.5),
-            ("OD7 DT", 43.0),
-            ("EZ OD7 DT", 60.3),
-        ];
+        let window_sets = if let Some((_, map, attrs)) = &map_slice {
+            let mut hr = GameMods::default();
+            single_mod(&mut hr, GameMod::HardRockMania(Default::default()));
+            let mut ez = GameMods::default();
+            single_mod(&mut ez, GameMod::EasyMania(Default::default()));
+            let hr_attrs = calculate(map, &hr, clock_rate, Some(true), None).unwrap();
+            let ez_attrs = calculate(map, &ez, clock_rate, Some(true), None).unwrap();
+
+            vec![
+                ("HR", hr_attrs.hit_windows.great),
+                ("natural", attrs.map_windows.great),
+                ("NM", attrs.hit_windows.great),
+                ("EZ", ez_attrs.hit_windows.great),
+            ]
+        } else {
+            vec![
+                ("HR OD7 DT", 30.5_f64),
+                ("reference OD8", 40.5),
+                ("OD7 DT", 43.0),
+                ("EZ OD7 DT", 60.3),
+            ]
+        };
 
         let mut windows_csv = String::from("label,great,skill,accuracy\n");
 
         for (label, great) in window_sets {
-            let windows = if (great - 40.5).abs() < 1e-9 {
+            let windows = if label == "natural" {
+                map_slice.as_ref().unwrap().2.map_windows
+            } else if (great - 40.5).abs() < 1e-9 {
                 REFERENCE_WINDOWS
             } else {
                 windows_from_great(great)
             };
 
             for &skill in &skills {
-                let units = [JudgementUnit::new(difficulty)];
                 let accuracy = expected_counts(&units, &windows, &model, skill).custom_accuracy();
                 writeln!(windows_csv, "{label},{great},{skill},{accuracy}").unwrap();
             }
@@ -5406,10 +5457,12 @@ mod tests {
         std::fs::write(dir.join("windows.csv"), windows_csv).unwrap();
 
         println!(
-            "wrote {} (grid {} x {})",
+            "wrote {} (grid {} x {}, slice {:.3} stars from {})",
             dir.display(),
             difficulties.len(),
-            skills.len()
+            skills.len(),
+            difficulty,
+            source,
         );
     }
 

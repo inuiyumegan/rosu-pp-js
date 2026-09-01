@@ -21,7 +21,7 @@ Panels:
 Usage
 -----
     tools/mania_surface_2d.py
-    tools/mania_surface_2d.py --no-dump --out /tmp/surface.png
+    tools/mania_surface_2d.py --map path/to.osu --out /tmp/surface.png
 
 Requires `matplotlib` and `numpy`. Data comes from the `surface_dump` test in
 `src/sunny.rs`, which this script invokes via `cargo test`.
@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import subprocess
 import sys
 from collections import defaultdict
@@ -56,6 +57,10 @@ BANDS = [
 ]
 
 WINDOW_COLORS = {
+    "HR": "#ff6b81",
+    "natural": "#e6e8ee",
+    "NM": "#8fe3ff",
+    "EZ": "#7cffb2",
     "HR OD7 DT": "#ff6b81",
     "reference OD8": "#e6e8ee",
     "OD7 DT": "#8fe3ff",
@@ -80,7 +85,7 @@ def read(name: str) -> list[dict]:
         return list(csv.DictReader(handle))
 
 
-def dump() -> None:
+def dump(args: argparse.Namespace) -> None:
     # `--exact`: the bare name also substring-matches `od_surface_dump`, which would
     # clobber that tool's CSV with a default-parameter dump as a side effect.
     command = [
@@ -88,7 +93,11 @@ def dump() -> None:
         "--", "--ignored", "--exact", "--nocapture",
     ]
     print("$", " ".join(command))
-    result = subprocess.run(command, cwd=ROOT, check=False)
+    env = dict(os.environ)
+    if args.map:
+        env["SURFACE_MAP"] = str(args.map)
+    env["SURFACE_CLOCK_RATE"] = str(args.clock_rate)
+    result = subprocess.run(command, cwd=ROOT, env=env, check=False)
 
     if result.returncode != 0:
         sys.exit(f"cargo test failed with status {result.returncode}")
@@ -298,9 +307,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--out", type=Path, default=DATA / "mania_surface_2d.png")
-    parser.add_argument("--difficulty", type=float, default=13.774,
-                        help="difficulty the bands/windows panels are taken at, for "
-                             "labelling only (must match the Rust dump)")
+    parser.add_argument("--map", type=Path,
+                        help="real beatmap supplying difficulty, windows, and note units")
+    parser.add_argument("--clock-rate", type=float, default=1.0,
+                        help="clock rate used to rate the map (default 1.0)")
     parser.add_argument("--fit-skill", type=float, default=None,
                         help="mark this skill on the composition panel")
     parser.add_argument("--target-accuracy", type=float, default=None,
@@ -310,7 +320,17 @@ def main() -> None:
     args = parser.parse_args()
 
     if not args.no_dump:
-        dump()
+        dump(args)
+
+    difficulty = 13.774
+    source = "default synthetic slice"
+    meta_path = DATA / "surface_2d_meta.csv"
+    if meta_path.exists():
+        with meta_path.open() as handle:
+            meta = next(csv.DictReader(handle), None)
+        if meta:
+            difficulty = float(meta["difficulty"])
+            source = Path(meta["source"]).stem
 
     acc, miss, diffs, skills = load_grid()
     X, Y = np.meshgrid(diffs, skills)
@@ -319,13 +339,12 @@ def main() -> None:
     grid = figure.add_gridspec(2, 2, hspace=0.30, wspace=0.24)
 
     panel_shortfall(figure, figure.add_subplot(grid[0, 0]), acc, diffs, skills, X, Y)
-    panel_bands(figure.add_subplot(grid[0, 1]), args.difficulty, args.fit_skill)
+    panel_bands(figure.add_subplot(grid[0, 1]), difficulty, args.fit_skill)
     panel_windows(figure.add_subplot(grid[1, 0]), args.target_accuracy)
     panel_misses(figure, figure.add_subplot(grid[1, 1]), miss, diffs, skills, X, Y)
 
     figure.suptitle(
-        "osu!mania accuracy surface  —  sigma_ref 18.0, skill_exponent 1.7, "
-        "lapse 3.4% at 4.4x",
+        f"osu!mania hit result surface  —  {source}  —  {difficulty:.2f} stars",
         color=FG, fontsize=14, y=0.965,
     )
 
