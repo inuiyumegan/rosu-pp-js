@@ -549,3 +549,49 @@ accuracy, but is not one mechanism: the worst rows also include high-accuracy ri
 Future fit work should inspect signed or per-band residuals for those rows and validate a
 specific mechanism against the axis it claims to model. Raising the `g < 30` share or
 lowering pooled `g_timing` is not an optimization target on its own.
+
+## Reproducible replay refit (2026-09-02)
+
+The original exponential fitting step existed only in a temporary Claude session file.
+`tools/input_state.py` now owns the full deterministic procedure: for each fixed
+same-column gap bin it takes the median within-score timing offset, weights that point by
+its paired-note count, and minimizes weighted squared error for
+`amplitude * exp(-gap / tau) + plateau` using the original bounded six-stage grid search.
+`tools/test_input_state.py` records the ten historical bin points and reproduces
+`73.12 / 72.40 / -3.19` and the `0.73 ms` weighted RMSE.
+
+The current local replay pool was refitted with:
+
+```sh
+tools/input_state.py --batch local-fixtures/multiuser.tsv \
+  local-fixtures/cohorts/2253-2020Q3.tsv \
+  local-fixtures/cohorts/2324-2021Q1.tsv \
+  local-fixtures/cohorts/4211-2021Q4.tsv \
+  local-fixtures/cohorts/4393-2023Q2.tsv \
+  local-fixtures/cohorts/4704-2023Q1.tsv
+```
+
+Inputs are deduplicated by score ID. The completed run used 3,780 scores and 7,510,117
+paired notes across all ten bins and produced:
+
+```text
+offset(gap) = 20.425 * exp(-gap / 116.68) - 2.517 ms
+weighted RMSE = 0.4363 ms
+```
+
+The experiment now uses the expanded-pool `20.425 / 116.68 / -2.517` calibration. The
+historical `73.12 / 72.40 / -3.19` points and amplitude sweep remain above as an audit
+trail rather than the active defaults. Because applying the refit is a model change, its
+pp movement must pass the same multi-user, EZ, and significant-mover gates as the rest of
+the input-state surface.
+
+The compact multi-user A/B against the no-input-state control passed those gates:
+
+- all 1,204 scores: `+0.51%` summed pp, median `+0.32%`;
+- EZ: `+0.05%` summed pp and `62.3%` of live pp, retaining a `37.7%` reduction;
+- deterministic held-out fold: `+0.58%` summed pp;
+- largest individual mover: `+12.10%`, with no score crossing the 20% review threshold.
+
+The timing-fit diagnostic moved modestly (`g_timing` median `19.0 -> 19.5` on the
+no-window-mod cohort) and remains supplemental. The calibration changes only the recovery
+curve parameters; accuracy multipliers were identical on the reported compositions.

@@ -198,3 +198,16 @@ like a 2-star map at skill 2; that is the thing new data needs to test.
 
 Local difficulty is also still uniform: every note carries the map's whole star
 rating, which is why the mod response barely varies between maps.
+
+`input_state.py` measures the same-column recovery curve and now performs the complete
+deterministic fit used by `ErrorModel`: median within-score offsets in fixed gap bins are
+fit to `amplitude * exp(-gap / tau) + plateau` by note-count-weighted least squares.
+To refit against every locally indexed replay, deduplicating score IDs across inputs:
+
+```sh
+tools/input_state.py --batch local-fixtures/multiuser.tsv local-fixtures/cohorts/*.tsv
+```
+
+The report prints the fitted parameters, weighted RMSE, score count, paired-note count,
+populated-bin count, and input TSV paths. `python3 tools/test_input_state.py` reproduces
+the historical 285-replay fit from its recorded bin inputs.

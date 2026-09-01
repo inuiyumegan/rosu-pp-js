@@ -21,6 +21,7 @@ bound rather than as the effect.
 
 Usage:
     tools/input_state.py --batch local-fixtures/batch.tsv
+    tools/input_state.py --batch local-fixtures/multiuser.tsv local-fixtures/cohorts/*.tsv
     tools/input_state.py --batch local-fixtures/ladder.tsv --json out.json
 """
 from __future__ import annotations
@@ -59,6 +60,12 @@ LIFTED_MS = 150.0
 # and so is its difficulty. Comparing states only within a stratum holds that roughly
 # fixed.
 GAP_EDGES = (0.0, 60.0, 100.0, 160.0, 250.0, 400.0, 700.0, float("inf"))
+
+# Bins used to measure and fit the recovery curve. They intentionally start at 100 ms
+# and exclude notes whose predecessor is still inside the replay pairing window.
+RECOVERY_EDGES = (
+    100.0, 130.0, 160.0, 190.0, 230.0, 280.0, 340.0, 420.0, 520.0, 650.0, 850.0,
+)
 
 
 def gap_stratum(gap: float) -> int:
@@ -324,6 +331,78 @@ class Bucket:
         return offsets
 
 
+def recovery_fit_points(
+    recovery: dict[int, Bucket], baseline: dict[int, list[float]]
+) -> list[tuple[float, float, int]]:
+    """Return `(bin centre, median per-score offset, note count)` fit points."""
+    points = []
+
+    for idx in range(len(RECOVERY_EDGES) - 1):
+        bucket = recovery.get(idx)
+        if not bucket:
+            continue
+
+        offsets = bucket.offset_stats(baseline)
+        if offsets:
+            centre = (RECOVERY_EDGES[idx] + RECOVERY_EDGES[idx + 1]) / 2.0
+            points.append((centre, median(offsets), len(bucket.pooled)))
+
+    return points
+
+
+def fit_recovery_curve(
+    points: list[tuple[float, float, int]], refinements: int = 6
+) -> tuple[float, float, float, float]:
+    """Fit `amplitude * exp(-gap / tau) + plateau` by weighted least squares.
+
+    This is the original fitter that produced 73.12/72.40/-3.19, moved from its
+    temporary session file into the repository. Note count is the weight of each bin;
+    the measured value is its median within-score offset. The bounded grid and fixed
+    refinement schedule make the result deterministic without a scipy dependency.
+    """
+    if len(points) < 3:
+        raise ValueError("recovery fit requires at least three populated bins")
+    if any(weight <= 0 for _, _, weight in points):
+        raise ValueError("recovery fit weights must be positive")
+
+    def wsse(amplitude: float, tau: float, plateau: float) -> float:
+        return sum(
+            weight
+            * (amplitude * math.exp(-gap / tau) + plateau - measured) ** 2
+            for gap, measured, weight in points
+        )
+
+    amp_lo, amp_hi = 5.0, 400.0
+    tau_lo, tau_hi = 20.0, 300.0
+    base_lo, base_hi = -8.0, 2.0
+    best = (float("inf"), 0.0, 0.0, 0.0)
+
+    for _ in range(refinements):
+        current = (float("inf"), 0.0, 0.0, 0.0)
+        for i in range(40):
+            amplitude = amp_lo + (amp_hi - amp_lo) * i / 39
+            for j in range(40):
+                tau = tau_lo + (tau_hi - tau_lo) * j / 39
+                for k in range(40):
+                    plateau = base_lo + (base_hi - base_lo) * k / 39
+                    error = wsse(amplitude, tau, plateau)
+                    if error < current[0]:
+                        current = (error, amplitude, tau, plateau)
+
+        best = current
+        _, amplitude, tau, plateau = current
+        amp_span = (amp_hi - amp_lo) / 8
+        tau_span = (tau_hi - tau_lo) / 8
+        base_span = (base_hi - base_lo) / 8
+        amp_lo, amp_hi = amplitude - amp_span, amplitude + amp_span
+        tau_lo, tau_hi = max(1.0, tau - tau_span), tau + tau_span
+        base_lo, base_hi = plateau - base_span, plateau + base_span
+
+    error, amplitude, tau, plateau = best
+    total_weight = sum(weight for _, _, weight in points)
+    return amplitude, tau, plateau, math.sqrt(error / total_weight)
+
+
 def report_group(label: str, bucket: Bucket, baseline: dict[int, list[float]]) -> None:
     pooled = bucket.pooled
 
@@ -361,8 +440,9 @@ def main() -> int:
     ap.add_argument(
         "--batch",
         type=Path,
+        nargs="+",
         required=True,
-        help="a TSV with id/mapid columns, as fetch_batch.sh or fetch_cohorts.sh writes",
+        help="one or more TSVs with id/mapid columns; duplicate score IDs are ignored",
     )
     ap.add_argument("--replays", type=Path, default=Path("local-fixtures/replays"))
     ap.add_argument("--maps", type=Path, default=Path("local-fixtures/maps"))
@@ -376,25 +456,35 @@ def main() -> int:
     args = ap.parse_args()
 
     rows = []
-    header: list[str] = []
+    seen_score_ids = set()
 
-    for line_no, line in enumerate(args.batch.read_text().splitlines()):
-        fields = line.split("\t")
-        if not header:
-            if "id" in fields and ("mapid" in fields or "mapId" in fields):
-                header = fields
+    for batch in args.batch:
+        header: list[str] = []
+        for line_no, line in enumerate(batch.read_text().splitlines()):
+            fields = line.split("\t")
+            if not header:
+                if "id" in fields and ("mapid" in fields or "mapId" in fields):
+                    header = fields
+                    continue
+
+                # `local-fixtures/multiuser.tsv` is the compact, headerless report input:
+                # uid, score id, map id, ... . Only these identifiers are needed here.
+                if len(fields) >= 3 and all(field.isdigit() for field in fields[:3]):
+                    header = ["userid", "id", "mapid"]
+                else:
+                    print(
+                        f"unrecognized batch layout in {batch} on line {line_no + 1}",
+                        file=sys.stderr,
+                    )
+                    return 1
+            if len(fields) < len(header):
                 continue
 
-            # `local-fixtures/multiuser.tsv` is the compact, headerless report input:
-            # uid, score id, map id, ... . Only these identifiers are needed here.
-            if len(fields) >= 3 and all(field.isdigit() for field in fields[:3]):
-                header = ["userid", "id", "mapid"]
-            else:
-                print(f"unrecognized batch layout on line {line_no + 1}", file=sys.stderr)
-                return 1
-        if len(fields) < len(header):
-            continue
-        rows.append(dict(zip(header, fields[: len(header)])))
+            row = dict(zip(header, fields[: len(header)]))
+            score_id = row.get("id") or row.get("scoreId")
+            if score_id and score_id not in seen_score_ids:
+                rows.append(row)
+                seen_score_ids.add(score_id)
 
     if not rows:
         print(f"no rows in {args.batch}", file=sys.stderr)
@@ -439,9 +529,6 @@ def main() -> int:
     #
     # Restricted to unambiguous notes throughout, and the boundary moves with the clock
     # rate, so the first bins are thin under DT and are reported with their counts.
-    RECOVERY_EDGES = (
-        100.0, 130.0, 160.0, 190.0, 230.0, 280.0, 340.0, 420.0, 520.0, 650.0, 850.0,
-    )
     recovery: dict[int, Bucket] = {}
 
     baseline: dict[int, list[float]] = {}
@@ -653,6 +740,24 @@ def main() -> int:
             continue
         lo, hi = RECOVERY_EDGES[idx], RECOVERY_EDGES[idx + 1]
         report_group(f"{lo:.0f}-{hi:.0f} ms", recovery[idx], baseline)
+
+    points = recovery_fit_points(recovery, baseline)
+    try:
+        amplitude, tau, plateau, rmse = fit_recovery_curve(points)
+    except ValueError as exc:
+        print(f"\nRECOVERY FIT unavailable: {exc}")
+    else:
+        print(
+            "\nRECOVERY FIT (note-count-weighted least squares over median "
+            "within-score offsets)"
+        )
+        print(
+            f"  offset(gap) = {amplitude:.3f} * exp(-gap / {tau:.2f}) "
+            f"{plateau:+.3f} ms"
+        )
+        print(f"  weighted RMSE = {rmse:.4f} ms")
+        print(f"  inputs = {scored} scores, {total} paired notes, {len(points)} bins")
+        print(f"  batches = {', '.join(str(batch) for batch in args.batch)}")
 
     if args.json:
         args.json.write_text(json.dumps(records))

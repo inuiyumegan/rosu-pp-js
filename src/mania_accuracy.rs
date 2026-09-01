@@ -475,19 +475,21 @@ pub struct ErrorModel {
     /// [`Self::anticipation_offset`]. Zero disables the whole mechanism.
     ///
     /// The second mean-offset channel, and the one that is *measured* rather than
-    /// guessed. `tools/input_state.py` paired 285 replays into 629,418 notes and grouped
-    /// their timing errors by the state the note's column was in. Per-score offsets — each
-    /// group's mean against that same score's own mean, so the player and the map divide
-    /// out — trace a clean curve against same-column gap:
+    /// guessed. The historical calibration paired 285 replays into 629,418 notes and
+    /// grouped their timing errors by the state the note's column was in. Per-score
+    /// offsets — each group's mean against that same score's own mean, so the player and
+    /// the map divide out — trace a clean curve against same-column gap:
     ///
     /// | gap ms | 115 | 145 | 175 | 210 | 255 | 310 | 380 | 470 | 585 | 750 |
     /// |---|---|---|---|---|---|---|---|---|---|---|
     /// | offset | +13.5 | +5.5 | +3.6 | +1.1 | +0.1 | −2.8 | −3.1 | −3.0 | −3.3 | −3.0 |
     ///
-    /// `73.12 * exp(-gap / 72.40) - 3.19` fits that to a weighted RMSE of 0.73 ms over a
-    /// 16.5 ms range. Two regimes, both physical: a finger that must lift and re-press
-    /// lands **late** when rushed, and one with time to spare **anticipates** and lands
-    /// early. Zero crossing at 227 ms.
+    /// `73.12 * exp(-gap / 72.40) - 3.19` is that historical fit, with a weighted RMSE
+    /// of 0.73 ms over a 16.5 ms range. `tools/input_state.py` now contains the complete
+    /// deterministic fitting step and its regression fixture; the expanded-pool result
+    /// is recorded in `docs/input-state-surface-plan.md`. Two regimes, both physical: a
+    /// finger that must lift and re-press lands **late** when rushed, and one with time to
+    /// spare **anticipates** and lands early. Historical zero crossing at 227 ms.
     ///
     /// **Why a mean and not a width.** The same measurement finds width effects too, but
     /// they mostly vanish once each score is compared against itself, and what survives is
@@ -507,22 +509,24 @@ pub struct ErrorModel {
     /// causing it, and the curve keeps decaying smoothly to 850 ms — an order of magnitude
     /// past a boundary fixed at 100–140 ms.
     ///
-    /// The fitted amplitude is enabled by default. The map-side builder centers these
-    /// per-score-relative offsets before fitting, so the curve changes the distribution
-    /// between input states without introducing an absolute clock shift.
+    /// The expanded-pool fitted curve is enabled by default on this experiment branch.
+    /// The map-side builder centers these per-score-relative offsets before fitting, so
+    /// the curve changes the distribution between input states without introducing an
+    /// absolute clock shift. Updating the accepted model constants from a later replay
+    /// calibration is a model change and must be checked through the pp A/B gates.
     pub recovery_offset: f64,
     /// The gap in ms over which [`Self::recovery_offset`] decays, `e`-folding.
     ///
-    /// 72.4 ms as fitted. Physically the lift-and-repress cycle time, which is why the
-    /// value is plausible rather than merely convenient: it is the same order as the
-    /// fastest sustained same-column tapping in these maps.
+    /// 116.68 ms in the expanded-pool fit. Physically the lift-and-repress cycle time,
+    /// which is why the value is plausible rather than merely convenient: it is the same
+    /// order as the fastest sustained same-column tapping in those maps.
     pub recovery_tau: f64,
     /// Where [`Self::recovery_offset`] decays *to*, in ms, at long gaps. Negative is early.
     ///
-    /// −3.19 ms as fitted, and it is not a nuisance term: with a whole beat of warning
-    /// players consistently press early, and the plateau is flat from 280 ms out to 850 ms
-    /// across 240k notes. Applies to every press with a predecessor, so on a sparse map it
-    /// is the only part of this mechanism that acts.
+    /// −2.517 ms in the expanded-pool fit, and it is not a nuisance term: with a whole beat
+    /// of warning players consistently press early, and the plateau is flat from 280 ms
+    /// out to 850 ms across 240k notes. Applies to every press with a predecessor, so on
+    /// a sparse map it is the only part of this mechanism that acts.
     pub anticipation_offset: f64,
 }
 
@@ -542,9 +546,9 @@ impl Default for ErrorModel {
             short_hold_scale: 120.0,
             slip_rate: 0.0,
             release_mean_offset: 8.0,
-            recovery_offset: 73.12,
-            recovery_tau: 72.40,
-            anticipation_offset: -3.19,
+            recovery_offset: 20.425,
+            recovery_tau: 116.68,
+            anticipation_offset: -2.517,
         }
     }
 }
@@ -554,8 +558,8 @@ impl ErrorModel {
     /// earlier. Positive is late.
     ///
     /// `recovery_offset * exp(-gap / recovery_tau) + anticipation_offset`, the curve
-    /// measured on 629,418 paired replay notes — see [`Self::recovery_offset`] for the
-    /// data, the fit, and the artefact controls.
+    /// measured on replay notes — see [`Self::recovery_offset`] for the historical and
+    /// expanded-pool data, fit, and artefact controls.
     ///
     /// A non-finite or negative gap returns the long-gap plateau rather than extrapolating,
     /// and an infinite gap (a column's first note, which has no predecessor to recover
@@ -1838,17 +1842,19 @@ mod tests {
     fn recovery_offset_uses_the_fitted_curve_by_default() {
         let model = ErrorModel::default();
 
-        assert_eq!(model.recovery_offset, 73.12);
+        assert_eq!(model.recovery_offset, 20.425);
+        assert_eq!(model.recovery_tau, 116.68);
+        assert_eq!(model.anticipation_offset, -2.517);
         assert!(model.recovery_mean_offset(50.0) > 0.0);
-        assert!((model.recovery_mean_offset(850.0) - model.anticipation_offset).abs() < 0.001);
+        assert!((model.recovery_mean_offset(850.0) - model.anticipation_offset).abs() < 0.02);
     }
 
     #[test]
     fn recovery_offset_follows_the_fitted_gap_curve() {
         let model = ErrorModel {
-            recovery_offset: 73.12,
-            recovery_tau: 72.40,
-            anticipation_offset: -3.19,
+            recovery_offset: 20.425,
+            recovery_tau: 116.68,
+            anticipation_offset: -2.517,
             ..ErrorModel::default()
         };
 
@@ -1856,9 +1862,9 @@ mod tests {
         let at_tau = model.recovery_mean_offset(model.recovery_tau);
         let long_gap = model.recovery_mean_offset(850.0);
 
-        assert!((at_zero - 69.93).abs() < 1e-10);
-        assert!((at_tau - (73.12_f64 / std::f64::consts::E - 3.19)).abs() < 1e-10);
-        assert!((long_gap + 3.19).abs() < 0.01);
+        assert!((at_zero - 17.908).abs() < 1e-10);
+        assert!((at_tau - (20.425_f64 / std::f64::consts::E - 2.517)).abs() < 1e-10);
+        assert!((long_gap + 2.517).abs() < 0.02);
         assert!(at_zero > at_tau);
         assert!(at_tau > long_gap);
     }
