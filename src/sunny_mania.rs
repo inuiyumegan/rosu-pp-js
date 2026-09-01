@@ -233,7 +233,7 @@ pub struct JsSunnyManiaPerformanceAttributes {
     /// Fitted timing skill through actual windows (with mods and input-state).
     #[wasm_bindgen(js_name = "timingSkillPlayed", readonly)]
     pub timing_skill_played: f64,
-    /// Fitted timing skill through natural windows (no mods, no input-state).
+    /// Fitted timing skill through natural windows with input-state recovery disabled.
     #[wasm_bindgen(js_name = "timingSkillBaseline", readonly)]
     pub timing_skill_baseline: f64,
 }

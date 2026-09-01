@@ -73,7 +73,7 @@ Run the invariant tests before cohort measurement:
 ```bash
 cargo test --lib sunny::tests::ez_is_priced_by_the_windows_not_a_multiplier
 cargo test --lib sunny::tests::hr_is_rewarded_by_the_same_mechanism
-cargo test --lib sunny::tests::input_state_surface_is_neutral_by_default_and_effective_when_enabled
+cargo test --lib sunny::tests::input_state_surface_is_effective_by_default_and_can_be_disabled
 ```
 
 Then run the fixture report with production defaults:
@@ -82,6 +82,8 @@ Then run the fixture report with production defaults:
 cargo test --release multiuser_report -- --ignored --nocapture
 ```
 
-Set `SUNNY_INPUT_STATE=1` only for the experimental recovery A/B. That path is not
-the shipped default because aggregate score counts do not yet identify how each
-input-state bin was judged.
+The experiment branch enables the replay-fitted input-state recovery curve by
+default. Its offsets are centered over each map's press population because the
+replay analysis measured every state relative to the score's own mean error. This
+keeps the per-note state distribution in the fit without turning map composition
+into a global clock offset. Use the baseline branch for the A/B control.

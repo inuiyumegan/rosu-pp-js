@@ -507,13 +507,9 @@ pub struct ErrorModel {
     /// causing it, and the curve keeps decaying smoothly to 850 ms — an order of magnitude
     /// past a boundary fixed at 100–140 ms.
     ///
-    /// **Defaults to 0.0, i.e. off.** Enabling it changes what every score is worth, and
-    /// [`Self::release_mean_offset`]'s own note records why an offset must not be
-    /// calibrated while pp reads a ratio of two fits: that sweep's entire gain landed in
-    /// the denominator and *lowered* pp on the maps it was meant to raise. This channel is
-    /// not obviously subject to the same artefact, since it applies to every note rather
-    /// than only to long notes and so cannot be diluted away on the played side — but that
-    /// is a prediction, and it ships off until measured.
+    /// The fitted amplitude is enabled by default. The map-side builder centers these
+    /// per-score-relative offsets before fitting, so the curve changes the distribution
+    /// between input states without introducing an absolute clock shift.
     pub recovery_offset: f64,
     /// The gap in ms over which [`Self::recovery_offset`] decays, `e`-folding.
     ///
@@ -546,11 +542,7 @@ impl Default for ErrorModel {
             short_hold_scale: 120.0,
             slip_rate: 0.0,
             release_mean_offset: 8.0,
-            // Off, so the shipped model is unchanged until the pp effect is measured. The
-            // other two carry their fitted values so that enabling this is a one-field
-            // change and cannot accidentally combine a real amplitude with a placeholder
-            // shape.
-            recovery_offset: 0.0,
+            recovery_offset: 73.12,
             recovery_tau: 72.40,
             anticipation_offset: -3.19,
         }
@@ -1843,14 +1835,12 @@ mod tests {
     }
 
     #[test]
-    fn recovery_offset_is_disabled_by_default() {
+    fn recovery_offset_uses_the_fitted_curve_by_default() {
         let model = ErrorModel::default();
 
-        assert_eq!(model.recovery_offset, 0.0);
-        // The fitted long-gap anticipation plateau is retained, while the
-        // short-gap recovery amplitude remains disabled.
-        assert_eq!(model.recovery_mean_offset(50.0), model.anticipation_offset);
-        assert_eq!(model.recovery_mean_offset(500.0), model.anticipation_offset);
+        assert_eq!(model.recovery_offset, 73.12);
+        assert!(model.recovery_mean_offset(50.0) > 0.0);
+        assert!((model.recovery_mean_offset(850.0) - model.anticipation_offset).abs() < 0.001);
     }
 
     #[test]

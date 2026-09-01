@@ -648,7 +648,7 @@ pub struct SunnyManiaPerformanceAttributes {
     pub pp_timing: f64,
     /// Fitted timing skill through actual windows (with mods and input-state).
     pub timing_skill_played: f64,
-    /// Fitted timing skill through natural windows (no mods, no input-state).
+    /// Fitted timing skill through natural windows with input-state recovery disabled.
     pub timing_skill_baseline: f64,
 }
 
@@ -1000,8 +1000,8 @@ fn judgement_units(
 ) -> Vec<JudgementUnit> {
     let uniform = vec![JudgementUnit::repeated(attrs.stars, total)];
 
-    // The recovery amplitude is the deliberate feature switch. Its shipped value is
-    // zero, so merely calculating or caching input-state metadata cannot change pp.
+    // A zero recovery amplitude is the explicit control path used by the natural
+    // baseline and A/B tests. The experiment branch enables the measured curve.
     if model.recovery_offset != 0.0 {
         if let Some(bins) = attrs.input_state_bins {
             let units = units_from_input_state_bins(&bins, attrs, total, model);
@@ -1098,17 +1098,37 @@ fn units_from_input_state_bins(
     let per_operation = total / f64::from(binned);
     let mut units = Vec::with_capacity(INPUT_STATE_BINS * 2);
 
+    // The recovery curve was measured as each state group's mean error relative to
+    // that score's own mean error. Preserve that gauge here: a map's state mixture
+    // may redistribute timing error between notes, but it must not manufacture a
+    // global clock offset that the replay measurement explicitly divided out.
+    //
+    // Releases are excluded because the measured recovery curve covers presses;
+    // their independent release offset remains untouched below.
+    let (recovery_sum, press_count) = bins
+        .iter()
+        .filter(|bin| bin.count > 0 && bin.class != InputClass::Release)
+        .fold((0.0, 0_u32), |(sum, count), bin| {
+            let offset = input_state_recovery_offset(bin, model);
+
+            (
+                sum + offset * f64::from(bin.count),
+                count.saturating_add(bin.count),
+            )
+        });
+    let recovery_center = if press_count > 0 {
+        recovery_sum / f64::from(press_count)
+    } else {
+        0.0
+    };
+
     for bin in bins.iter().filter(|bin| {
         bin.count > 0 && !(attrs.ln_judged_as_one && bin.class == InputClass::Release)
     }) {
         let class_offset = match bin.class {
             InputClass::Release if !attrs.ln_judged_as_one => model.release_mean_offset,
             InputClass::Release => 0.0,
-            _ if bin.predecessor_count > 0 => {
-                model.recovery_mean_offset(bin.mean_gap_ms) * f64::from(bin.predecessor_count)
-                    / f64::from(bin.count)
-            }
-            _ => 0.0,
+            _ => input_state_recovery_offset(bin, model) - recovery_center,
         };
         let long_count = if attrs.ln_judged_as_one {
             bin.long_count
@@ -1139,6 +1159,15 @@ fn units_from_input_state_bins(
     }
 
     units
+}
+
+fn input_state_recovery_offset(bin: &InputStateBin, model: &ErrorModel) -> f64 {
+    if bin.count == 0 || bin.predecessor_count == 0 {
+        return 0.0;
+    }
+
+    model.recovery_mean_offset(bin.mean_gap_ms) * f64::from(bin.predecessor_count)
+        / f64::from(bin.count)
 }
 
 /// Turn a map's per-note difficulty distribution into judgement units.
@@ -1265,6 +1294,7 @@ fn window_scalar_with_model(
     let played = fit_with_quality(&counts, &units, &attrs.hit_windows, model);
     let baseline_model = ErrorModel {
         recovery_offset: 0.0,
+        anticipation_offset: 0.0,
         ..*model
     };
     let baseline_units = attrs
@@ -1309,7 +1339,7 @@ struct TimingPpResult {
 ///
 /// This separates timing precision from pattern difficulty, measuring:
 /// 1. Demonstrated timing skill through actual windows (with mods and input-state)
-/// 2. Expected timing skill through natural windows (no mods, no input-state)
+/// 2. Expected timing skill through natural windows with recovery disabled
 /// The caller combines their ratio with Sunny's provisional absolute-accuracy
 /// reward; this function does not manufacture a separate timing pp value.
 fn compute_timing_pp(
@@ -1342,9 +1372,10 @@ fn compute_timing_pp(
     // Fit skill through actual windows (with mods and input-state)
     let played = fit_with_quality(&counts, &units, &attrs.hit_windows, model);
 
-    // Fit skill through natural windows (no mods, no input-state)
+    // Fit skill through natural windows with input-state recovery disabled
     let baseline_model = ErrorModel {
         recovery_offset: 0.0,
+        anticipation_offset: 0.0,
         ..*model
     };
     // Compare like with like: input-state bins describe the note population on
@@ -3078,23 +3109,24 @@ mod tests {
     }
 
     #[test]
-    fn input_state_surface_is_neutral_by_default_and_effective_when_enabled() {
+    fn input_state_surface_is_effective_by_default_and_can_be_disabled() {
         let map = synthetic_map(8.0, 400, 90.0);
         let attrs = calculate(&map, &GameMods::default(), 1.0, Some(true), None).unwrap();
         let without_bins = SunnyManiaDifficultyAttributes {
             input_state_bins: None,
             ..attrs
         };
-        let default = ErrorModel::default();
-        let with_default = judgement_units(&attrs, 400.0, &default, true);
-        let without_default = judgement_units(&without_bins, 400.0, &default, true);
-
-        assert_eq!(with_default, without_default);
-
-        let enabled = ErrorModel {
-            recovery_offset: 73.12,
-            ..default
+        let enabled = ErrorModel::default();
+        let disabled = ErrorModel {
+            recovery_offset: 0.0,
+            anticipation_offset: 0.0,
+            ..enabled
         };
+        let with_disabled = judgement_units(&attrs, 400.0, &disabled, true);
+        let without_disabled = judgement_units(&without_bins, 400.0, &disabled, true);
+
+        assert_eq!(with_disabled, without_disabled);
+
         let with_enabled = judgement_units(&attrs, 400.0, &enabled, true);
         let without_enabled = judgement_units(&without_bins, 400.0, &enabled, true);
         let expected_with = crate::mania_accuracy::expected_counts(
@@ -3111,6 +3143,16 @@ mod tests {
         );
 
         assert_ne!(expected_with.as_array(), expected_without.as_array());
+
+        let weighted_recovery_mean: f64 = with_enabled
+            .iter()
+            .map(|unit| unit.weight * unit.fading_mean_offset)
+            .sum::<f64>()
+            / with_enabled.iter().map(|unit| unit.weight).sum::<f64>();
+        assert!(
+            weighted_recovery_mean.abs() < 1e-12,
+            "per-score-relative recovery offsets must not introduce a global shift: {weighted_recovery_mean} ms"
+        );
 
         let ss_ceiling = crate::mania_accuracy::expected_counts(
             &with_enabled,
@@ -3443,13 +3485,11 @@ mod tests {
         }
     }
 
-    /// Attributes without a per-note distribution keep working.
+    /// Attributes without either per-note distribution keep working.
     ///
-    /// A JS round-trip drops it (`serde(skip)`: `wasm_bindgen` cannot carry a fixed-size
-    /// array), and it is deliberately *not* reconstructed there, unlike
-    /// [`ln_duration_buckets`] — a stand-in would be inventing a difficulty spread the
-    /// attributes carry no trace of. So the fallback is load-bearing on a shipping path,
-    /// not just in tests.
+    /// Older cached JS attributes can lack both distributions, and inventing either one
+    /// would fabricate map structure they carry no trace of. The uniform fallback is
+    /// therefore load-bearing on a shipping path, not just in tests.
     #[test]
     fn a_missing_per_note_distribution_falls_back_to_the_uniform_list() {
         let map = synthetic_map(8.0, 400, 120.0);
@@ -3458,6 +3498,7 @@ mod tests {
 
         let stripped = SunnyManiaDifficultyAttributes {
             note_difficulty_bins: None,
+            input_state_bins: None,
             ..attrs
         };
 
@@ -6016,29 +6057,8 @@ mod tests {
         after_acc_multiplier: f64,
     }
 
-    const INPUT_STATE_RECOVERY_OFFSET: f64 = 73.12;
-
-    /// Whether fixture-backed reports should price the current input-state candidate.
-    fn input_state_calculation_enabled() -> bool {
-        std::env::var("SUNNY_INPUT_STATE")
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false)
-    }
-
     fn report_error_model() -> ErrorModel {
-        if input_state_calculation_enabled() {
-            ErrorModel {
-                recovery_offset: INPUT_STATE_RECOVERY_OFFSET,
-                ..ErrorModel::default()
-            }
-        } else {
-            ErrorModel::default()
-        }
+        ErrorModel::default()
     }
 
     fn composition_from_units(
@@ -6059,6 +6079,7 @@ mod tests {
         let played = fit_with_quality(&counts, units, &attrs.hit_windows, model);
         let baseline_model = ErrorModel {
             recovery_offset: 0.0,
+            anticipation_offset: 0.0,
             ..*model
         };
         let baseline_units =
@@ -6338,31 +6359,21 @@ mod tests {
         // 0.00% everywhere. That is the harness's own control: a non-zero delta there
         // would mean the two columns differ by something other than the model.
         let null_run = std::env::var_os("MODEL_AB_NULL").is_some();
-        let input_state_run = input_state_calculation_enabled();
-
-        let before = ErrorModel::default();
+        let before = ErrorModel {
+            recovery_offset: 0.0,
+            anticipation_offset: 0.0,
+            ..ErrorModel::default()
+        };
         let after = if null_run {
-            ErrorModel::default()
-        } else if input_state_run {
-            ErrorModel {
-                recovery_offset: INPUT_STATE_RECOVERY_OFFSET,
-                ..ErrorModel::default()
-            }
+            before
         } else {
-            // Refit on the 1204-score set by `calibrate_lapse_on_multiuser`:
-            // mean g_timing 42.29 -> 38.16, at an interior optimum rather than a
-            // grid corner.
-            ErrorModel {
-                lapse_weight: 0.0296,
-                lapse_ratio: 3.339,
-                ..ErrorModel::default()
-            }
+            ErrorModel::default()
         };
 
         if null_run {
             println!("NULL RUN: both sides are the shipped default; all deltas must be 0.00%");
-        } else if input_state_run {
-            println!("INPUT-STATE RUN: enabling the measured same-column recovery curve");
+        } else {
+            println!("INPUT-STATE RUN: enabling the centered same-column recovery curve");
         }
 
         println!(
@@ -6760,10 +6771,6 @@ mod tests {
     /// surface alone, with the live column left in as a cross-check on how far the
     /// two sunny versions have otherwise moved.
     ///
-    /// Usage:
-    /// `SUNNY_INPUT_STATE=1` prices the current input-state candidate against fixture
-    /// live pp. Without it, this report prices the shipped/default model.
-    ///
     /// `cargo test --release multiuser_report -- --ignored --nocapture --exact
     /// sunny::tests::multiuser_report`
     #[test]
@@ -6771,14 +6778,7 @@ mod tests {
     fn multiuser_report() {
         use std::collections::BTreeMap;
 
-        println!(
-            "calculation: {}",
-            if input_state_calculation_enabled() {
-                "input-state candidate (SUNNY_INPUT_STATE)"
-            } else {
-                "shipped/default"
-            }
-        );
+        println!("calculation: centered input-state model");
 
         let scores = load_multiuser();
         if scores.is_empty() {
@@ -12704,7 +12704,7 @@ mod tests {
     /// to any implementation. Reports cohort-level impact to verify that the formula
     /// separates low-OD LN from low-OD rice patterns.
     ///
-    /// Run with: `SUNNY_INPUT_STATE=1 cargo test transition_oracle_experiments -- --ignored --nocapture`
+    /// Run with: `cargo test transition_oracle_experiments -- --ignored --nocapture`
     #[test]
     #[ignore = "reads gitignored fixtures; expensive calibration research"]
     fn transition_oracle_experiments() {
@@ -12717,7 +12717,6 @@ mod tests {
         };
 
         let baseline = ErrorModel {
-            recovery_offset: INPUT_STATE_RECOVERY_OFFSET,
             recovery_tau: 72.40,
             anticipation_offset: -3.19,
             ..ErrorModel::default()
