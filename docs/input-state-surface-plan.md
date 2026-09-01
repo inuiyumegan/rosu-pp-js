@@ -491,3 +491,61 @@ Reproducibility artifacts are generated outside the fixture tree:
 `SUNNY_INPUT_STATE=1` is the calculation switch for fixture-backed reports. It is named
 for the calculation it enables and is independent of whether the selected report is an
 A/B comparison or an absolute comparison against live fixture pp.
+
+## Amplitude and fit-quality follow-up (2026-09-02)
+
+The August decision above is historical. The centered input-state path is now enabled
+on the experiment branch at the replay-fitted curve
+`73.12 * exp(-gap / 72.40) - 3.19`; this follow-up evaluates whether aggregate score
+counts justify replacing that amplitude.
+
+The first `0/10/20/73.12 ms` count sweep was not a valid amplitude sweep. It held the
+`-3.19 ms` long-gap plateau fixed while reducing only the positive term, which moved the
+zero crossing and changed the curve's shape. The corrected exact per-note oracle scales
+both terms together and evaluates `0/5/10/15/20/30/50/73.12 ms` over all 1,204 scores.
+Every positive amplitude is worse than the zero control on aggregate timing-band counts:
+
+| amplitude | median g_timing | mean g_timing | p90 g_timing | better / worse than zero |
+|---:|---:|---:|---:|---:|
+| 0 ms | 19.40 | 38.63 | 92.63 | - |
+| 5 ms | 19.41 | 38.87 | 93.47 | 499 / 704 |
+| 10 ms | 19.49 | 39.13 | 94.53 | 500 / 703 |
+| 15 ms | 19.64 | 39.42 | 96.18 | 509 / 694 |
+| 20 ms | 19.91 | 39.75 | 96.48 | 501 / 702 |
+| 30 ms | 20.22 | 40.59 | 100.66 | 502 / 701 |
+| 50 ms | 21.14 | 44.33 | 111.54 | 480 / 723 |
+| 73.12 ms | 23.92 | 54.48 | 141.54 | 447 / 756 |
+
+This does **not** provide a count-fitted replacement amplitude below 25 ms. It selects
+zero monotonically. That result is supplemental rather than a reason to disable the
+feature: aggregate judgement counts no longer contain the association between a note's
+same-column gap and that note's signed timing error. They see only the widened marginal
+mixture, while the replay fit retains the pairing that identified the late-to-early
+curve. Consequently `g_timing` can falsify a gross aggregate shape but cannot identify
+the recovery amplitude by itself. The production candidate remains replay-calibrated;
+no pp parameter was changed from this sweep.
+
+The compact-path A/B points the same way but also changes representation from per-note
+difficulty bins to joint input-state bins, so it cannot isolate amplitude: median
+`g_timing` moves `19.4 -> 20.1`, mean `38.2 -> 40.5`, and the count below the loose
+`g < 30` diagnostic threshold moves `770 -> 759`. At the same time pp rises for 1,170
+scores and falls for 19, demonstrating why fit quality and pricing must be reported
+separately.
+
+The expanded multi-user diagnostics locate poor aggregate fits instead of treating the
+overall `759/1204` plausible count as ground truth:
+
+| cohort | n | median g_timing | p90 g_timing | g < 30 |
+|---|---:|---:|---:|---:|
+| all | 1,204 | 20.1 | 101.4 | 759 |
+| EZ | 57 | 55.7 | 202.9 | 24 |
+| OD < 7 | 98 | 33.8 | 177.8 | 44 |
+| LN 30-60% | 333 | 31.3 | 149.2 | 162 |
+| LN >= 60% | 131 | 28.5 | 161.1 | 68 |
+| accuracy < 95% | 176 | 42.6 | 140.3 | 69 |
+
+The tail is concentrated in wider windows, low OD, long-note-heavy maps, and low
+accuracy, but is not one mechanism: the worst rows also include high-accuracy rice maps.
+Future fit work should inspect signed or per-band residuals for those rows and validate a
+specific mechanism against the axis it claims to model. Raising the `g < 30` share or
+lowering pooled `g_timing` is not an optimization target on its own.

@@ -7162,6 +7162,142 @@ mod tests {
             all.iter().filter(|r| r.plausible).count(),
             all.len()
         );
+
+        // Fit quality is supplemental evidence, not a pricing gate. Report the full
+        // distribution and threshold sensitivity so the arbitrary `g < 30` label does
+        // not get mistaken for ground truth, then split it along axes the model actually
+        // sees. This is specifically diagnostic: none of these cohorts feed pp.
+        let report_fit = |label: &str, rows: &[&MultiPriced]| {
+            if rows.is_empty() {
+                return;
+            }
+
+            let mut values: Vec<f64> = rows
+                .iter()
+                .map(|row| row.g_timing)
+                .filter(|value| value.is_finite())
+                .collect();
+            values.sort_by(f64::total_cmp);
+
+            if values.is_empty() {
+                return;
+            }
+
+            let below = |threshold: f64| values.partition_point(|value| *value < threshold);
+            println!(
+                "  {label:<22} n={:<4} p50 {:>7.1} p75 {:>7.1} p90 {:>7.1}  \
+                 g<15 {:>4}  g<30 {:>4}  g<60 {:>4}",
+                values.len(),
+                values[values.len() / 2],
+                values[values.len() * 3 / 4],
+                values[values.len() * 9 / 10],
+                below(15.0),
+                below(30.0),
+                below(60.0),
+            );
+        };
+
+        println!("\nfit-quality diagnostics (supplemental; lower g_timing is better):");
+        report_fit("all", &all);
+
+        println!("  by score/window mode:");
+        for (label, pred) in [
+            ("EZ", (|r: &&MultiPriced| r.row.mods.contains("EZ")) as Pred),
+            ("HR", |r: &&MultiPriced| r.row.mods.contains("HR")),
+            ("stable V2", |r: &&MultiPriced| r.row.mods.contains("V2")),
+            ("stable V1", |r: &&MultiPriced| !r.row.mods.contains("V2")),
+            ("DT/NC", |r: &&MultiPriced| {
+                r.row.mods.contains("DT") || r.row.mods.contains("NC")
+            }),
+            ("NM/rate 1", |r: &&MultiPriced| {
+                !r.row.mods.contains("DT")
+                    && !r.row.mods.contains("NC")
+                    && !r.row.mods.contains("HT")
+                    && !r.row.mods.contains("EZ")
+                    && !r.row.mods.contains("HR")
+            }),
+        ] {
+            report_fit(label, &all.iter().copied().filter(pred).collect::<Vec<_>>());
+        }
+
+        println!("  by structural and performance bands:");
+        for keys in [4_u32, 6, 7] {
+            report_fit(
+                &format!("{keys}K"),
+                &all.iter()
+                    .copied()
+                    .filter(|row| row.row.keys == keys)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        for (label, lo, hi) in [
+            ("OD <7", 0.0, 7.0),
+            ("OD 7-8", 7.0, 8.0),
+            ("OD >=8", 8.0, f64::INFINITY),
+        ] {
+            report_fit(
+                label,
+                &all.iter()
+                    .copied()
+                    .filter(|row| f64::from(row.od) >= lo && f64::from(row.od) < hi)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        for (label, lo, hi) in [
+            ("LN <5%", 0.0, 0.05),
+            ("LN 5-30%", 0.05, 0.30),
+            ("LN 30-60%", 0.30, 0.60),
+            ("LN >=60%", 0.60, 1.01),
+            ("acc <95%", 0.0, 95.0),
+            ("acc 95-98%", 95.0, 98.0),
+            ("acc >=98%", 98.0, f64::INFINITY),
+            ("skill <7", 0.0, 7.0),
+            ("skill 7-9", 7.0, 9.0),
+            ("skill >=9", 9.0, f64::INFINITY),
+        ] {
+            report_fit(
+                label,
+                &all.iter()
+                    .copied()
+                    .filter(|row| {
+                        let value = if label.starts_with("LN") {
+                            row.ln_fraction
+                        } else if label.starts_with("acc") {
+                            row.row.acc
+                        } else {
+                            row.skill
+                        };
+                        value >= lo && value < hi
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        let mut worst = all.clone();
+        worst.sort_by(|a, b| b.g_timing.total_cmp(&a.g_timing));
+        println!("\nworst 20 timing-shape fits (diagnostic only):");
+        println!(
+            "  {:>6} {:>8} {:>9} {:>2} {:>4} {:>5} {:>6} {:>6} {:>8}",
+            "uid", "map", "mods", "k", "od", "LN%", "acc%", "skill", "g_timing"
+        );
+        for row in worst.into_iter().take(20) {
+            println!(
+                "  {:>6} {:>8} {:>9} {:>2} {:>4.1} {:>5.0} {:>6.2} {:>6.2} {:>8.1}",
+                row.row.uid,
+                row.row.map_id,
+                if row.row.mods.is_empty() {
+                    "NM"
+                } else {
+                    &row.row.mods
+                },
+                row.row.keys,
+                row.od,
+                row.ln_fraction * 100.0,
+                row.row.acc,
+                row.skill,
+                row.g_timing,
+            );
+        }
     }
 
     /// Reports how [`ErrorModel::release_mean_offset`] moves pricing under the fixed
@@ -12023,13 +12159,22 @@ mod tests {
             return;
         };
 
-        // Sweep the amplitude to find what the count data actually supports.
-        // tau fixed at the replay-fitted 72.40.
+        // Sweep the amplitude to find what the count data actually supports. Keep the
+        // replay-fitted tau fixed and scale the long-gap plateau with the amplitude:
+        // holding -3.19 ms fixed while shrinking only the positive term moves the zero
+        // crossing and tests a different curve shape, not a smaller version of the
+        // measured recovery bias.
+        const FITTED_AMPLITUDE: f64 = 73.12;
+        const FITTED_PLATEAU: f64 = -3.19;
         let candidates = [
-            ("off (shipped)", 0.0, 0.0),
-            ("A = 10 ms", 10.0, -3.19),
-            ("A = 20 ms", 20.0, -3.19),
-            ("A = 73.12 ms", 73.12, -3.19),
+            ("off (control)", 0.0, 0.0),
+            ("A = 5 ms", 5.0, FITTED_PLATEAU * 5.0 / FITTED_AMPLITUDE),
+            ("A = 10 ms", 10.0, FITTED_PLATEAU * 10.0 / FITTED_AMPLITUDE),
+            ("A = 15 ms", 15.0, FITTED_PLATEAU * 15.0 / FITTED_AMPLITUDE),
+            ("A = 20 ms", 20.0, FITTED_PLATEAU * 20.0 / FITTED_AMPLITUDE),
+            ("A = 30 ms", 30.0, FITTED_PLATEAU * 30.0 / FITTED_AMPLITUDE),
+            ("A = 50 ms", 50.0, FITTED_PLATEAU * 50.0 / FITTED_AMPLITUDE),
+            ("A = 73.12 ms", FITTED_AMPLITUDE, FITTED_PLATEAU),
         ];
 
         struct Row {
@@ -12227,6 +12372,18 @@ mod tests {
             finite.iter().sum::<f64>() / finite.len() as f64
         }
 
+        fn percentile(values: &[f64], numerator: usize, denominator: usize) -> f64 {
+            let mut finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+
+            if finite.is_empty() {
+                return f64::NAN;
+            }
+
+            finite.sort_by(f64::total_cmp);
+
+            finite[finite.len().saturating_sub(1) * numerator / denominator]
+        }
+
         let column =
             |extract: &dyn Fn(&Row) -> f64| -> Vec<f64> { rows.iter().map(extract).collect() };
 
@@ -12260,9 +12417,34 @@ mod tests {
             );
         }
 
+        println!("\nCOUNT-FIT SENSITIVITY (played side; paired against off)");
         println!(
-            "\n  All medians over scores. 'pp %' is the median scalar against the shipped \
-             row's,\n  which is what a score's pp is multiplied by."
+            "  {:<16} {:>9} {:>9} {:>9} {:>8} {:>8}",
+            "candidate", "g median", "g mean", "g p90", "better", "worse"
+        );
+        for (index, (label, _, _)) in candidates.iter().enumerate() {
+            let played = column(&|row| row.played_g[index]);
+            let better = rows
+                .iter()
+                .filter(|row| row.played_g[index] + 1e-9 < row.played_g[0])
+                .count();
+            let worse = rows
+                .iter()
+                .filter(|row| row.played_g[index] > row.played_g[0] + 1e-9)
+                .count();
+            println!(
+                "  {label:<16} {:>9.2} {:>9.2} {:>9.2} {:>8} {:>8}",
+                median(&played),
+                mean(&played),
+                percentile(&played, 9, 10),
+                better,
+                worse,
+            );
+        }
+
+        println!(
+            "\n  All medians over scores. 'pp %' is the median scalar against the zero \
+             control row's,\n  which is what a score's pp is multiplied by."
         );
 
         // Per-score pp deltas for the fitted curve, since a median of medians can hide a
