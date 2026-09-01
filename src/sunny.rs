@@ -6843,16 +6843,56 @@ mod tests {
             );
         }
 
-        fn report_composition(label: &str, mut rows: Vec<&MultiPriced>) {
+        // Surface movement is multiplicative, so its cohort center is a geometric
+        // mean. Dividing by it removes a broad level shift and leaves the scores whose
+        // movement differs from everybody else's, which is the useful anomaly signal.
+        let mean_surface_multiplier = (all
+            .iter()
+            .map(|r| r.surface_multiplier.max(f64::MIN_POSITIVE).ln())
+            .sum::<f64>()
+            / all.len() as f64)
+            .exp();
+        println!(
+            "\nsurface pp multiplier: geometric mean {mean_surface_multiplier:.4} ({:+.2}%)",
+            (mean_surface_multiplier - 1.0) * 100.0
+        );
+
+        println!("surface-transfer sensitivity (relative to each exponent's cohort mean):");
+        println!(
+            "  {:>8} {:>9} {:>9} {:>9} {:>9}",
+            "exponent", "p10", "p90", ">+20%", "<-5%"
+        );
+        for exponent in [0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.20] {
+            let center = (all
+                .iter()
+                .map(|r| r.scalar.max(f64::MIN_POSITIVE).ln() * exponent)
+                .sum::<f64>()
+                / all.len() as f64)
+                .exp();
+            let mut relative: Vec<f64> = all
+                .iter()
+                .map(|r| r.scalar.max(0.0).powf(exponent) / center)
+                .collect();
+            relative.sort_by(f64::total_cmp);
+            let high = relative.iter().filter(|&&value| value > 1.20).count();
+            let low = relative.iter().filter(|&&value| value < 0.95).count();
+            println!(
+                "  {exponent:>8.2} {:+8.2}% {:+8.2}% {high:>9} {low:>9}",
+                (relative[relative.len() / 10] - 1.0) * 100.0,
+                (relative[relative.len() * 9 / 10] - 1.0) * 100.0,
+            );
+        }
+
+        let report_composition = |label: &str, mut rows: Vec<&MultiPriced>| {
             rows.sort_by(|a, b| {
-                let a_delta = a.current_pp / a.neutral_pp - 1.0;
-                let b_delta = b.current_pp / b.neutral_pp - 1.0;
+                let a_delta = a.surface_multiplier / mean_surface_multiplier - 1.0;
+                let b_delta = b.surface_multiplier / mean_surface_multiplier - 1.0;
                 b_delta.total_cmp(&a_delta)
             });
 
             println!("\n{label} ({} scores; at most 40 shown)", rows.len());
             println!(
-                "{:>6} {:>8} {:>9} {:>4} {:>5} {:>6} {:>8} {:>8}  {:>8} x {:>7} x {:>6} = {:>8}  x {:>6} x {:>6} x {:>6}",
+                "{:>6} {:>8} {:>9} {:>4} {:>5} {:>6} {:>8} {:>8} {:>8}  {:>8} x {:>7} x {:>6} = {:>8}  x {:>6} x {:>6} x {:>6}",
                 "uid",
                 "map",
                 "mods",
@@ -6860,6 +6900,7 @@ mod tests {
                 "LN%",
                 "acc%",
                 "surface%",
+                "relative%",
                 "live%",
                 "baseDPP",
                 "accProp",
@@ -6872,11 +6913,12 @@ mod tests {
 
             for r in rows.into_iter().take(40) {
                 let surface_delta = (r.current_pp / r.neutral_pp - 1.0) * 100.0;
+                let relative_delta = (r.surface_multiplier / mean_surface_multiplier - 1.0) * 100.0;
                 let live_delta = (r.current_pp / r.row.live_pp - 1.0) * 100.0;
                 let difficulty_pp =
                     r.base_difficulty_pp * r.accuracy_proportion * r.surface_multiplier;
                 println!(
-                    "{:>6} {:>8} {:>9} {:>4.1} {:>5.0} {:>6.2} {:+8.2} {:+8.2}  {:>8.1} x {:>7.4} x {:>6.3} = {:>8.1}  x {:>6.3} x {:>6.3} x {:>6.3}",
+                    "{:>6} {:>8} {:>9} {:>4.1} {:>5.0} {:>6.2} {:+8.2} {:+8.2} {:+8.2}  {:>8.1} x {:>7.4} x {:>6.3} = {:>8.1}  x {:>6.3} x {:>6.3} x {:>6.3}",
                     r.row.uid,
                     r.row.map_id,
                     r.row.mods,
@@ -6884,6 +6926,7 @@ mod tests {
                     100.0 * r.ln_fraction,
                     r.row.acc,
                     surface_delta,
+                    relative_delta,
                     live_delta,
                     r.base_difficulty_pp,
                     r.accuracy_proportion,
@@ -6894,29 +6937,33 @@ mod tests {
                     r.length_multiplier,
                 );
             }
-        }
+        };
 
         report_composition(
-            "surface gains above 20%",
+            "surface gains above 20% relative to cohort mean",
             all.iter()
                 .copied()
-                .filter(|r| r.current_pp / r.neutral_pp > 1.20)
+                .filter(|r| r.surface_multiplier / mean_surface_multiplier > 1.20)
                 .collect(),
         );
         report_composition(
-            "non-EZ surface losses below -5%",
+            "non-EZ surface losses below -5% relative to cohort mean",
             all.iter()
                 .copied()
-                .filter(|r| !r.row.mods.contains("EZ") && r.current_pp / r.neutral_pp < 0.95)
+                .filter(|r| {
+                    !r.row.mods.contains("EZ")
+                        && r.surface_multiplier / mean_surface_multiplier < 0.95
+                })
                 .collect(),
         );
         report_composition(
-            "uid 3110: low OD or absolute surface movement above 10%",
+            "uid 3110: low OD or cohort-relative surface movement above 10%",
             all.iter()
                 .copied()
                 .filter(|r| {
                     r.row.uid == "3110"
-                        && (r.od < 7.0 || (r.current_pp / r.neutral_pp - 1.0).abs() > 0.10)
+                        && (r.od < 7.0
+                            || (r.surface_multiplier / mean_surface_multiplier - 1.0).abs() > 0.10)
                 })
                 .collect(),
         );

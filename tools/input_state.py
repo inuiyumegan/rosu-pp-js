@@ -378,14 +378,23 @@ def main() -> int:
     rows = []
     header: list[str] = []
 
-    for line in args.batch.read_text().splitlines():
+    for line_no, line in enumerate(args.batch.read_text().splitlines()):
         fields = line.split("\t")
         if not header:
-            header = fields
-            continue
+            if "id" in fields and ("mapid" in fields or "mapId" in fields):
+                header = fields
+                continue
+
+            # `local-fixtures/multiuser.tsv` is the compact, headerless report input:
+            # uid, score id, map id, ... . Only these identifiers are needed here.
+            if len(fields) >= 3 and all(field.isdigit() for field in fields[:3]):
+                header = ["userid", "id", "mapid"]
+            else:
+                print(f"unrecognized batch layout on line {line_no + 1}", file=sys.stderr)
+                return 1
         if len(fields) < len(header):
             continue
-        rows.append(dict(zip(header, fields)))
+        rows.append(dict(zip(header, fields[: len(header)])))
 
     if not rows:
         print(f"no rows in {args.batch}", file=sys.stderr)
@@ -654,4 +663,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
