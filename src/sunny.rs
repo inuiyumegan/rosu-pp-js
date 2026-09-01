@@ -591,10 +591,10 @@ pub struct SunnyManiaDifficultyAttributes {
     /// median and 22.05% at p90 — a *map-dependent* error, so unlike every width parameter
     /// in [`ErrorModel`] the per-score `skill` cannot absorb it.
     ///
-    /// `None` when the distribution was unavailable, which happens on a JS round-trip
-    /// (`serde(skip)`, since `wasm_bindgen` cannot carry a fixed-size array) and for
-    /// hand-built attributes in tests. [`judgement_units`] then falls back to the uniform
-    /// list, so this is a refinement of a working path rather than a new requirement.
+    /// `None` when the distribution was unavailable, for example for hand-built
+    /// attributes in tests or legacy cached JS attributes. Current JS attributes carry
+    /// a flattened representation across the round-trip. [`judgement_units`] falls back
+    /// to the uniform list when it is absent.
     ///
     /// Raw map structure, carrying no [`ErrorModel`] parameter, because these attributes
     /// are cached per map while the model is a calibration-time choice. Subsumes

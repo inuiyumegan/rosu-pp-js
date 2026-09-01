@@ -12,7 +12,7 @@ use crate::{
     args::performance::{JsPerformanceArgs, PerformanceArgs},
     beatmap::JsBeatmap,
     sunny::{
-        self, INPUT_STATE_BINS, InputClass, InputStateBin, NOTE_DIFFICULTY_BINS,
+        self, INPUT_STATE_BINS, InputClass, InputStateBin, NOTE_DIFFICULTY_BINS, NoteDifficultyBin,
         SunnyManiaDifficultyAttributes, SunnyScoreState,
     },
     util,
@@ -61,24 +61,37 @@ pub struct JsSunnyManiaDifficultyAttributes {
     /// Versioned flattened input-state bins retained by cached JS attributes.
     #[serde(default)]
     pub(crate) input_state_bins: Vec<f64>,
+    /// Exact played judgement windows retained by cached JS attributes.
+    #[serde(default, rename = "hitWindows")]
+    pub(crate) serialized_hit_windows: Vec<f64>,
+    /// Exact natural judgement windows retained by cached JS attributes.
+    #[serde(default, rename = "mapWindows")]
+    pub(crate) serialized_map_windows: Vec<f64>,
+    /// Exact long-note duration histogram retained by cached JS attributes.
+    #[serde(default, rename = "lnDurationBuckets")]
+    pub(crate) serialized_ln_duration_buckets: Vec<f64>,
+    /// Exact per-note difficulty bins retained by cached JS attributes.
+    #[serde(default, rename = "noteDifficultyBins")]
+    pub(crate) serialized_note_difficulty_bins: Vec<f64>,
+    /// Explicit scoring mode retained by cached JS attributes.
+    #[serde(default)]
+    pub(crate) ln_judged_as_one: Option<bool>,
     /// The long-note duration histogram, kept for the performance calc.
     ///
-    /// Not exposed to JS for the same reason as [`Self::hit_windows`]: it is an
-    /// implementation detail of how long notes are priced, and `wasm_bindgen` cannot
-    /// carry a fixed-size array as a field anyway. Reconstructed when absent — see the
-    /// performance path, which explains what that costs.
+    /// The exact Rust-side copy. JS receives the flattened
+    /// `serialized_ln_duration_buckets` payload because `wasm_bindgen` cannot carry a
+    /// fixed-size array as a field.
     #[serde(skip)]
     pub(crate) ln_duration_buckets: [usize; crate::mania_accuracy::LN_DURATION_BUCKETS],
     /// The mods used for the calculation, kept for the performance calc.
     #[serde(skip)]
     pub(crate) mods: rosu_mods::GameMods,
     /// The judgement windows the score will be graded against, kept for the
-    /// performance calc. Not exposed to JS: it is an implementation detail of how
-    /// mods are priced, and it is recomputed when absent.
+    /// performance calc. JS receives the flattened `serialized_hit_windows` payload.
     #[serde(skip)]
     pub(crate) hit_windows: crate::mania_windows::ManiaHitWindows,
-    /// The map's windows with mods stripped, kept for the performance calc. Not exposed
-    /// for the same reason as [`Self::hit_windows`], and reconstructed the same way.
+    /// The map's windows with mods stripped, kept for the performance calc. JS receives
+    /// the flattened `serialized_map_windows` payload.
     #[serde(skip)]
     pub(crate) map_windows: crate::mania_windows::ManiaHitWindows,
 }
@@ -96,6 +109,13 @@ impl From<SunnyManiaDifficultyAttributes> for JsSunnyManiaDifficultyAttributes {
             n_objects: attrs.n_objects as u32,
             n_long_notes: attrs.n_long_notes as u32,
             input_state_bins: encode_input_state_bins(attrs.input_state_bins.as_ref()),
+            serialized_hit_windows: encode_windows(attrs.hit_windows),
+            serialized_map_windows: encode_windows(attrs.map_windows),
+            serialized_ln_duration_buckets: encode_ln_duration_buckets(attrs.ln_duration_buckets),
+            serialized_note_difficulty_bins: encode_note_difficulty_bins(
+                attrs.note_difficulty_bins.as_ref(),
+            ),
+            ln_judged_as_one: Some(attrs.ln_judged_as_one),
             ln_duration_buckets: attrs.ln_duration_buckets,
             mods: GameMods::default(),
             hit_windows: attrs.hit_windows,
@@ -111,6 +131,127 @@ impl JsSunnyManiaDifficultyAttributes {
     pub fn input_state_bins(&self) -> Box<[f64]> {
         self.input_state_bins.clone().into_boxed_slice()
     }
+
+    #[wasm_bindgen(getter = hitWindows)]
+    pub fn hit_windows(&self) -> Box<[f64]> {
+        self.serialized_hit_windows.clone().into_boxed_slice()
+    }
+
+    #[wasm_bindgen(getter = mapWindows)]
+    pub fn map_windows(&self) -> Box<[f64]> {
+        self.serialized_map_windows.clone().into_boxed_slice()
+    }
+
+    #[wasm_bindgen(getter = lnDurationBuckets)]
+    pub fn ln_duration_buckets(&self) -> Box<[f64]> {
+        self.serialized_ln_duration_buckets
+            .clone()
+            .into_boxed_slice()
+    }
+
+    #[wasm_bindgen(getter = noteDifficultyBins)]
+    pub fn note_difficulty_bins(&self) -> Box<[f64]> {
+        self.serialized_note_difficulty_bins
+            .clone()
+            .into_boxed_slice()
+    }
+
+    #[wasm_bindgen(getter = lnJudgedAsOne)]
+    pub fn ln_judged_as_one(&self) -> Option<bool> {
+        self.ln_judged_as_one
+    }
+}
+
+fn encode_windows(windows: crate::mania_windows::ManiaHitWindows) -> Vec<f64> {
+    vec![
+        windows.perfect,
+        windows.great,
+        windows.good,
+        windows.ok,
+        windows.meh,
+        windows.miss,
+    ]
+}
+
+fn decode_windows(encoded: &[f64]) -> Option<crate::mania_windows::ManiaHitWindows> {
+    (encoded.len() == 6
+        && encoded
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0))
+    .then(|| crate::mania_windows::ManiaHitWindows {
+        perfect: encoded[0],
+        great: encoded[1],
+        good: encoded[2],
+        ok: encoded[3],
+        meh: encoded[4],
+        miss: encoded[5],
+    })
+}
+
+fn encode_ln_duration_buckets(
+    buckets: [usize; crate::mania_accuracy::LN_DURATION_BUCKETS],
+) -> Vec<f64> {
+    buckets.into_iter().map(|count| count as f64).collect()
+}
+
+fn decode_ln_duration_buckets(
+    encoded: &[f64],
+) -> Option<[usize; crate::mania_accuracy::LN_DURATION_BUCKETS]> {
+    if encoded.len() != crate::mania_accuracy::LN_DURATION_BUCKETS
+        || encoded
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0 || value.fract() != 0.0)
+    {
+        return None;
+    }
+
+    Some(std::array::from_fn(|idx| encoded[idx] as usize))
+}
+
+const NOTE_DIFFICULTY_FIELDS_PER_BIN: usize = 4;
+
+fn encode_note_difficulty_bins(
+    bins: Option<&[NoteDifficultyBin; NOTE_DIFFICULTY_BINS]>,
+) -> Vec<f64> {
+    let Some(bins) = bins else {
+        return Vec::new();
+    };
+
+    let mut encoded = Vec::with_capacity(NOTE_DIFFICULTY_BINS * NOTE_DIFFICULTY_FIELDS_PER_BIN);
+    for bin in bins {
+        encoded.extend([
+            bin.difficulty,
+            f64::from(bin.rice),
+            f64::from(bin.long),
+            bin.mean_duration,
+        ]);
+    }
+
+    encoded
+}
+
+fn decode_note_difficulty_bins(
+    encoded: &[f64],
+) -> Option<[NoteDifficultyBin; NOTE_DIFFICULTY_BINS]> {
+    if encoded.len() != NOTE_DIFFICULTY_BINS * NOTE_DIFFICULTY_FIELDS_PER_BIN
+        || encoded.iter().any(|value| !value.is_finite())
+    {
+        return None;
+    }
+
+    let bins = std::array::from_fn(|idx| {
+        let offset = idx * NOTE_DIFFICULTY_FIELDS_PER_BIN;
+        NoteDifficultyBin {
+            difficulty: encoded[offset],
+            rice: encoded[offset + 1].clamp(0.0, f64::from(u32::MAX)) as u32,
+            long: encoded[offset + 2].clamp(0.0, f64::from(u32::MAX)) as u32,
+            mean_duration: encoded[offset + 3],
+        }
+    });
+
+    bins.iter()
+        .all(|bin| bin.difficulty >= 0.0 && bin.mean_duration >= 0.0)
+        .then_some(bins)
 }
 
 const INPUT_STATE_SERIAL_VERSION: f64 = 2.0;
@@ -374,75 +515,12 @@ impl JsSunnyManiaPerformance {
     ) -> JsResult<(SunnyManiaDifficultyAttributes, rosu_mods::GameMods)> {
         if let Ok(js_attrs) = util::from_value::<JsSunnyManiaDifficultyAttributes>(value) {
             let mods = if !js_attrs.mods.is_empty() {
-                js_attrs.mods
+                js_attrs.mods.clone()
             } else {
                 self.args.mods.clone()
             };
 
-            // Attributes that came back through JS lose the window set, since it is
-            // not part of the public shape. Rebuild it from the OD-equivalent of the
-            // GREAT window that *is* carried, so a cached-attributes call prices mods
-            // the same as a from-beatmap one.
-            let hit_windows = if js_attrs.hit_windows == Default::default() {
-                crate::mania_windows::windows_from_great(js_attrs.great_hit_window)
-            } else {
-                js_attrs.hit_windows
-            };
-
-            // Likewise the mod-stripped window set, which is what the score is priced
-            // *against*, so getting it wrong misprices mods rather than merely blurring
-            // them. `great_hit_window` already has the multiplier folded in, and
-            // `hit_windows` folds it in by *dividing*, so undo it by multiplying:
-            // `EZ`'s 1/1.4 multiplied the played window by 1.4, and multiplying by 1/1.4
-            // takes it back. Dividing here instead would widen an already-widened window
-            // and hand `EZ` a bonus.
-            // Pinned by `stripping_the_mod_multiplier_recovers_the_maps_own_window`.
-            let map_windows = if js_attrs.map_windows == Default::default() {
-                let unmodded =
-                    js_attrs.great_hit_window * crate::mania_windows::difficulty_multiplier(&mods);
-                crate::mania_windows::windows_from_great(unmodded)
-            } else {
-                js_attrs.map_windows
-            };
-
-            let attrs = SunnyManiaDifficultyAttributes {
-                stars: js_attrs.stars,
-                variety: js_attrs.variety,
-                acc_scalar: js_attrs.acc_scalar,
-                spikiness: js_attrs.spikiness,
-                switches: js_attrs.switches,
-                great_hit_window: js_attrs.great_hit_window,
-                hit_windows,
-                map_windows,
-                max_combo: js_attrs.max_combo,
-                n_objects: js_attrs.n_objects as usize,
-                n_long_notes: js_attrs.n_long_notes as usize,
-                // The histogram survives a Rust-side clone but not a JS round-trip,
-                // where it is `serde(skip)` and comes back zeroed. An all-zero
-                // histogram on a map that has long notes means "lost", not "no long
-                // notes", so fall back to the modal bucket rather than dropping the LN
-                // population: the count is the first-order term, and a wrong bucket
-                // costs less than pricing a 90% LN map as pure rice. A caller that
-                // wants the exact figure should pass the beatmap.
-                ln_duration_buckets: if js_attrs.ln_duration_buckets.iter().sum::<usize>() > 0 {
-                    js_attrs.ln_duration_buckets
-                } else {
-                    sunny::modal_ln_duration_histogram(js_attrs.n_long_notes as usize)
-                },
-                // Lost on a JS round-trip for the same reason as the histogram, and *not*
-                // reconstructed: unlike the LN buckets there is no defensible stand-in,
-                // since the whole content of this field is how per-note difficulty spreads
-                // around `stars` and a round-tripped attribute set carries no trace of it.
-                // Inventing a spread would price maps on a guess. `None` falls back to the
-                // uniform list, which is what this path already did.
-                note_difficulty_bins: None,
-                input_state_bins: decode_input_state_bins(&js_attrs.input_state_bins),
-                // Not carried through JS: it is a property of how the score was
-                // played, not of the map, so it is re-derived from the mods that
-                // came back with the attributes. `lazer` is not part of the shape
-                // either, so this follows the same default the difficulty calc uses.
-                ln_judged_as_one: sunny::is_classic(None, &mods),
-            };
+            let attrs = reconstruct_attributes(js_attrs, &mods);
 
             return Ok((attrs, mods));
         }
@@ -569,6 +647,62 @@ impl JsSunnyManiaPerformance {
     }
 }
 
+fn reconstruct_attributes(
+    js_attrs: JsSunnyManiaDifficultyAttributes,
+    mods: &GameMods,
+) -> SunnyManiaDifficultyAttributes {
+    // New cached attributes carry exact values. The reconstruction branches remain for
+    // objects cached by older package versions, which only exposed `greatHitWindow`.
+    let hit_windows = decode_windows(&js_attrs.serialized_hit_windows).unwrap_or_else(|| {
+        if js_attrs.hit_windows == Default::default() {
+            crate::mania_windows::windows_from_great(js_attrs.great_hit_window)
+        } else {
+            js_attrs.hit_windows
+        }
+    });
+    let map_windows = decode_windows(&js_attrs.serialized_map_windows).unwrap_or_else(|| {
+        if js_attrs.map_windows == Default::default() {
+            let unmodded =
+                js_attrs.great_hit_window * crate::mania_windows::difficulty_multiplier(mods);
+            crate::mania_windows::windows_from_great(unmodded)
+        } else {
+            js_attrs.map_windows
+        }
+    });
+    let ln_duration_buckets = decode_ln_duration_buckets(&js_attrs.serialized_ln_duration_buckets)
+        .filter(|buckets| buckets.iter().sum::<usize>() == js_attrs.n_long_notes as usize)
+        .or_else(|| {
+            (js_attrs.ln_duration_buckets.iter().sum::<usize>() > 0)
+                .then_some(js_attrs.ln_duration_buckets)
+        })
+        .unwrap_or_else(|| sunny::modal_ln_duration_histogram(js_attrs.n_long_notes as usize));
+
+    SunnyManiaDifficultyAttributes {
+        stars: js_attrs.stars,
+        variety: js_attrs.variety,
+        acc_scalar: js_attrs.acc_scalar,
+        spikiness: js_attrs.spikiness,
+        switches: js_attrs.switches,
+        great_hit_window: js_attrs.great_hit_window,
+        hit_windows,
+        map_windows,
+        max_combo: js_attrs.max_combo,
+        n_objects: js_attrs.n_objects as usize,
+        n_long_notes: js_attrs.n_long_notes as usize,
+        ln_duration_buckets,
+        note_difficulty_bins: decode_note_difficulty_bins(
+            &js_attrs.serialized_note_difficulty_bins,
+        ),
+        input_state_bins: decode_input_state_bins(&js_attrs.input_state_bins),
+        // Missing means an old cached object. Preserve its historical fallback while
+        // ensuring every newly produced object carries the difficulty calculation's
+        // explicit stable/lazer decision.
+        ln_judged_as_one: js_attrs
+            .ln_judged_as_one
+            .unwrap_or_else(|| sunny::is_classic(None, mods)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -628,6 +762,7 @@ fn clock_rate(args: &DifficultyArgs) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rosu_mods::{GameMod, GameMods};
 
     #[test]
     fn input_state_bins_round_trip_and_old_attributes_fall_back() {
@@ -664,5 +799,164 @@ mod tests {
         let mut malformed = encoded;
         malformed[0] = 99.0;
         assert_eq!(decode_input_state_bins(&malformed), None);
+    }
+
+    fn ln_heavy_map() -> Beatmap {
+        Beatmap::from_bytes(
+            br#"osu file format v14
+
+[General]
+Mode: 3
+
+[Difficulty]
+CircleSize: 4
+OverallDifficulty: 7.6
+SliderMultiplier: 1.4
+SliderTickRate: 1
+
+[TimingPoints]
+0,500,4,2,1,100,1,0
+
+[HitObjects]
+64,192,1000,128,0,1180:0:0:0:0:
+192,192,1120,128,0,1400:0:0:0:0:
+320,192,1260,128,0,1710:0:0:0:0:
+448,192,1430,128,0,1510:0:0:0:0:
+64,192,1600,128,0,2050:0:0:0:0:
+192,192,1760,128,0,1940:0:0:0:0:
+320,192,1910,128,0,2190:0:0:0:0:
+448,192,2080,128,0,2530:0:0:0:0:
+"#,
+        )
+        .expect("inline mania map must parse")
+    }
+
+    fn mods(gamemods: impl IntoIterator<Item = GameMod>) -> GameMods {
+        gamemods.into_iter().collect()
+    }
+
+    fn assert_close(label: &str, direct: f64, cached: f64) {
+        let tolerance = 1e-12 * direct.abs().max(cached.abs()).max(1.0);
+        assert!(
+            (direct - cached).abs() <= tolerance,
+            "{label}: direct={direct:?}, cached={cached:?}"
+        );
+    }
+
+    #[test]
+    fn cached_attributes_preserve_scoring_windows_and_pp() {
+        let map = ln_heavy_map();
+        let cases = [
+            ("v1 nm", GameMods::default(), Some(false), 1.0),
+            (
+                "v1 ez custom rate",
+                mods([GameMod::EasyMania(Default::default())]),
+                Some(false),
+                1.17,
+            ),
+            (
+                "v1 hr",
+                mods([GameMod::HardRockMania(Default::default())]),
+                Some(false),
+                1.0,
+            ),
+            (
+                "stable sv2 nm",
+                mods([GameMod::ScoreV2Mania(Default::default())]),
+                Some(false),
+                1.0,
+            ),
+            (
+                "stable sv2 ez",
+                mods([
+                    GameMod::ScoreV2Mania(Default::default()),
+                    GameMod::EasyMania(Default::default()),
+                ]),
+                Some(false),
+                1.0,
+            ),
+            (
+                "stable sv2 hr custom rate",
+                mods([
+                    GameMod::ScoreV2Mania(Default::default()),
+                    GameMod::HardRockMania(Default::default()),
+                ]),
+                Some(false),
+                0.91,
+            ),
+        ];
+
+        for (label, mods, lazer, clock_rate) in cases {
+            let direct = sunny::calculate(&map, &mods, clock_rate, lazer, None)
+                .unwrap_or_else(|| panic!("{label}: difficulty calculation failed"));
+            let mut cached = JsSunnyManiaDifficultyAttributes::from(direct);
+
+            // Model a plain JS object: serde-visible getter payloads survive while the
+            // Rust-only fields and attached mods do not.
+            cached.hit_windows = Default::default();
+            cached.map_windows = Default::default();
+            cached.ln_duration_buckets = Default::default();
+            cached.mods = Default::default();
+
+            let round_tripped = reconstruct_attributes(cached, &mods);
+            assert_eq!(direct.hit_windows, round_tripped.hit_windows, "{label}");
+            assert_eq!(direct.map_windows, round_tripped.map_windows, "{label}");
+            assert_eq!(
+                direct.ln_judged_as_one, round_tripped.ln_judged_as_one,
+                "{label}"
+            );
+            assert_eq!(
+                direct.ln_duration_buckets, round_tripped.ln_duration_buckets,
+                "{label}"
+            );
+            assert_eq!(
+                direct.note_difficulty_bins, round_tripped.note_difficulty_bins,
+                "{label}"
+            );
+            assert_eq!(
+                direct.input_state_bins, round_tripped.input_state_bins,
+                "{label}"
+            );
+
+            let total = if direct.ln_judged_as_one { 8 } else { 16 };
+            let state = SunnyScoreState {
+                n320: total - 5,
+                n300: 2,
+                n200: 1,
+                n100: 1,
+                n50: 0,
+                misses: 1,
+            };
+            let direct_pp = sunny::calculate_performance(&direct, &mods, state);
+            let cached_pp = sunny::calculate_performance(&round_tripped, &mods, state);
+
+            for (field, direct, cached) in [
+                (
+                    "timing_skill_played",
+                    direct_pp.timing_skill_played,
+                    cached_pp.timing_skill_played,
+                ),
+                (
+                    "timing_skill_baseline",
+                    direct_pp.timing_skill_baseline,
+                    cached_pp.timing_skill_baseline,
+                ),
+                (
+                    "window_scalar",
+                    direct_pp.window_scalar,
+                    cached_pp.window_scalar,
+                ),
+                ("pp_pattern", direct_pp.pp_pattern, cached_pp.pp_pattern),
+                ("pp_timing", direct_pp.pp_timing, cached_pp.pp_timing),
+                (
+                    "pp_difficulty",
+                    direct_pp.pp_difficulty,
+                    cached_pp.pp_difficulty,
+                ),
+                ("pp", direct_pp.pp, cached_pp.pp),
+            ] {
+                assert_close(&format!("{label} {field}"), direct, cached);
+            }
+        }
     }
 }
