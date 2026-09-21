@@ -43,3 +43,28 @@ Register two mania-only algorithms, keeping their score PP rows distinct:
 The existing GitHub workflow creates release assets only on tags. After this
 tag is pushed and the NodeJS tarball is available, update `osu-server-ts` to
 consume that artifact.
+
+## Release artifact requirement
+
+A Git tag and GitHub source archive contain this Rust source only; neither is a
+NodeJS package that `pnpm` can install. The server requires the NodeJS
+`wasm-pack` output, published as the release asset
+`rosu_pp_js_nodejs.tar.gz`.
+
+To publish the existing immutable tag, dispatch the `CI` workflow with
+`v2026.9.22-mania-surface.1` selected as the ref. The `build (nodejs)` job runs
+`wasm-pack build --release --target nodejs --out-dir pkg`, archives `pkg` as
+`rosu_pp_js_nodejs.tar.gz`, and the `release` job attaches it to the matching
+GitHub Release. The first run can spend several minutes installing
+`wasm-bindgen`; wait for every job to finish before checking the release page.
+
+Do not move or recreate the existing tag merely to retry publication. A
+workflow dispatch against that tag preserves the immutable source/version
+mapping while giving the release job `refs/tags/v2026.9.22-mania-surface.1`.
+
+## Server algorithm identifiers
+
+The corresponding immutable test-release algorithm IDs in `osu-server-ts` are:
+
+- `sunny-od8-deref@2026.9.22.1`
+- `sunny-surface@2026.9.22.1`
