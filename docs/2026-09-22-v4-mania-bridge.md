@@ -37,8 +37,8 @@ v3 package cannot cross into this module.
 
 Register two mania-only algorithms, keeping their score PP rows distinct:
 
-- `sb-mania-rebirth@2026.9.22-mania-surface.1`
-- `sunnyxxy-mania@2026.9.22-mania-surface.1`
+- `sunny-od8-deref@2026.9.22.1`
+- `sunny-surface@2026.9.22.1`
 
 The existing GitHub workflow creates release assets only on tags. After this
 tag is pushed and the NodeJS tarball is available, update `osu-server-ts` to
