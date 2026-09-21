@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "rosu-pp-js-v4-mania"
-version = "2026.9.22-mania-surface.1"
+version = "2026.9.22-mania-surface.2"
 dependencies = [
  "js-sys",
  "rosu-pp",
