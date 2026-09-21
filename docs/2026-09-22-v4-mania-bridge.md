@@ -80,3 +80,11 @@ corresponding wasm-opt feature flags: --enable-bulk-memory and
 The pinned rosu-pp revision and all bridge calculation code are unchanged. This
 is a packaging retry only, so osu-server-ts continues to use the immutable
 algorithm IDs ending in @2026.9.22.1.
+
+## Release permission retry: .3
+
+The .2 workflow built and uploaded all three artifacts successfully, but its
+release job could not create a GitHub Release because the default Actions token
+lacked contents write permission. The .3 workflow sets contents: write at the
+workflow level for the release action. It keeps the same bridge implementation,
+rosu-pp revision, and wasm-opt feature configuration.

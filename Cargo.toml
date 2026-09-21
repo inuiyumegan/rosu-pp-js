@@ -1,6 +1,6 @@
 [package]
 name = "rosu-pp-js-v4-mania"
-version = "2026.9.22-mania-surface.2"
+version = "2026.9.22-mania-surface.3"
 edition = "2024"
 license = "MIT"
 description = "Public rosu-pp v4 bindings for osu!mania Rebirth and Sunny"
