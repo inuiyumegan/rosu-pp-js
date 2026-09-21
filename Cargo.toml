@@ -1,6 +1,6 @@
 [package]
 name = "rosu-pp-js-v4-mania"
-version = "2026.9.22-mania-surface.1"
+version = "2026.9.22-mania-surface.2"
 edition = "2024"
 license = "MIT"
 description = "Public rosu-pp v4 bindings for osu!mania Rebirth and Sunny"
@@ -18,3 +18,6 @@ lto = true
 panic = "abort"
 codegen-units = 1
 strip = true
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]

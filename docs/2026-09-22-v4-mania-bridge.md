@@ -68,3 +68,15 @@ The corresponding immutable test-release algorithm IDs in `osu-server-ts` are:
 
 - `sunny-od8-deref@2026.9.22.1`
 - `sunny-surface@2026.9.22.1`
+
+## Packaging retry: .2
+
+The .1 release build reached wasm-opt but its default feature set rejected
+bulk-memory and non-trapping float-to-int instructions emitted by the current
+Rust toolchain. The .2 package keeps wasm optimization enabled and passes the
+corresponding wasm-opt feature flags: --enable-bulk-memory and
+--enable-nontrapping-float-to-int.
+
+The pinned rosu-pp revision and all bridge calculation code are unchanged. This
+is a packaging retry only, so osu-server-ts continues to use the immutable
+algorithm IDs ending in @2026.9.22.1.
